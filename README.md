@@ -24,11 +24,6 @@
 - 🖥️ **Sleek Web Interface**: Fully responsive, dark-mode real-time dashboard to manage server filters, thresholds, and view history.
 - 🐳 **Docker-Native**: Built precisely for Docker, with embedded `wg-quick` policy routing that isolates test payloads.
 
-## 📸 Dashboard Preview
-*(Add your beautiful Glassmorphism UI screenshots here!)*
-
-> Need to see it to believe it? Direct users to the integrated `landing_page.html` for a full portfolio view of the capabilities.
-
 ## 🚀 Quick Start (Docker)
 
 AirBL is designed to run isolated inside a container with `wg-quick` routing correctly sequestered via policy routing.
