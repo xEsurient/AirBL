@@ -1,0 +1,556 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>AirBL - Advanced AirVPN Blocklist Scanner</title>
+  <meta name="description"
+    content="AirBL is a comprehensive tool to scan AirVPN server infrastructure against the DroneBL blocklist, complete with ping testing, speedtest integration, and a real-time web dashboard.">
+  <link rel="icon"
+    href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🌐</text></svg>">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link
+    href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=Outfit:wght@500;700&display=swap"
+    rel="stylesheet">
+  <style>
+    :root {
+      --bg-dark: #050511;
+      --glass-bg: rgba(255, 255, 255, 0.03);
+      --glass-border: rgba(255, 255, 255, 0.08);
+      --primary: #4A00E0;
+      --secondary: #8E2DE2;
+      --accent-glow: rgba(142, 45, 226, 0.5);
+      --text-main: #f8f9fa;
+      --text-muted: #a1a1aa;
+    }
+
+    * {
+      margin: 0;
+      padding: 0;
+      box-sizing: border-box;
+    }
+
+    body {
+      font-family: 'Inter', sans-serif;
+      background-color: var(--bg-dark);
+      color: var(--text-main);
+      overflow-x: hidden;
+      line-height: 1.6;
+    }
+
+    /* Animated Background */
+    .bg-blobs {
+      position: fixed;
+      top: 0;
+      left: 0;
+      width: 100vw;
+      height: 100vh;
+      z-index: -1;
+      overflow: hidden;
+      pointer-events: none;
+    }
+
+    .blob {
+      position: absolute;
+      border-radius: 50%;
+      filter: blur(100px);
+      opacity: 0.6;
+      animation: float 20s infinite ease-in-out alternate;
+    }
+
+    .blob-1 {
+      top: -10%;
+      left: -10%;
+      width: 50vw;
+      height: 50vw;
+      background: radial-gradient(circle, var(--secondary) 0%, transparent 70%);
+      animation-delay: 0s;
+    }
+
+    .blob-2 {
+      bottom: -20%;
+      right: -10%;
+      width: 60vw;
+      height: 60vw;
+      background: radial-gradient(circle, #0f172a 0%, var(--primary) 40%, transparent 70%);
+      animation-delay: -5s;
+    }
+
+    @keyframes float {
+      0% {
+        transform: translate(0, 0) scale(1);
+      }
+
+      50% {
+        transform: translate(5%, 10%) scale(1.05);
+      }
+
+      100% {
+        transform: translate(-5%, -5%) scale(0.95);
+      }
+    }
+
+    /* Container */
+    .container {
+      max-width: 1200px;
+      margin: 0 auto;
+      padding: 0 2rem;
+    }
+
+    /* Navbar */
+    header {
+      padding: 2rem 0;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      animation: fadeInDown 1s ease-out forwards;
+    }
+
+    .logo {
+      font-family: 'Outfit', sans-serif;
+      font-size: 1.5rem;
+      font-weight: 700;
+      background: linear-gradient(135deg, #fff 0%, #a1a1aa 100%);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+      display: flex;
+      align-items: center;
+      gap: 0.5rem;
+    }
+
+    .logo span {
+      background: linear-gradient(135deg, var(--secondary) 0%, var(--primary) 100%);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+    }
+
+    .nav-links {
+      display: flex;
+      gap: 2rem;
+    }
+
+    .nav-links a {
+      color: var(--text-muted);
+      text-decoration: none;
+      font-weight: 500;
+      transition: color 0.3s ease;
+    }
+
+    .nav-links a:hover {
+      color: var(--text-main);
+    }
+
+    /* Hero Section */
+    .hero {
+      text-align: center;
+      padding: 8rem 0 4rem;
+      animation: fadeInUp 1s ease-out 0.2s forwards;
+      opacity: 0;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+    }
+
+    h1 {
+      font-family: 'Outfit', sans-serif;
+      font-size: clamp(3rem, 6vw, 5rem);
+      font-weight: 800;
+      line-height: 1.1;
+      margin-bottom: 1.5rem;
+      letter-spacing: -0.02em;
+    }
+
+    .text-gradient {
+      background: linear-gradient(to right, #4facfe 0%, #00f2fe 100%);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+    }
+
+    .hero p {
+      font-size: 1.25rem;
+      color: var(--text-muted);
+      max-width: 600px;
+      margin: 0 auto 3rem;
+    }
+
+    .cta-group {
+      display: flex;
+      gap: 1.5rem;
+      justify-content: center;
+      margin-bottom: 5rem;
+    }
+
+    .btn {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      padding: 0.875rem 2rem;
+      border-radius: 9999px;
+      font-weight: 600;
+      text-decoration: none;
+      transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+      cursor: pointer;
+    }
+
+    .btn-primary {
+      background: linear-gradient(135deg, var(--secondary) 0%, var(--primary) 100%);
+      color: white;
+      box-shadow: 0 0 20px var(--accent-glow);
+      border: 1px solid rgba(255, 255, 255, 0.1);
+    }
+
+    .btn-primary:hover {
+      box-shadow: 0 0 30px var(--accent-glow);
+      transform: translateY(-2px);
+      filter: brightness(1.1);
+    }
+
+    .btn-secondary {
+      background: var(--glass-bg);
+      color: white;
+      border: 1px solid var(--glass-border);
+      backdrop-filter: blur(10px);
+    }
+
+    .btn-secondary:hover {
+      background: rgba(255, 255, 255, 0.08);
+      transform: translateY(-2px);
+    }
+
+    /* Placeholder UI Showcase */
+    .showcase-wrapper {
+      position: relative;
+      max-width: 1000px;
+      width: 100%;
+      margin: 0 auto;
+      border-radius: 24px;
+      padding: 1rem;
+      background: linear-gradient(to bottom, rgba(255, 255, 255, 0.1), rgba(255, 255, 255, 0.02));
+      box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.5);
+      animation: float-slow 6s ease-in-out infinite;
+    }
+
+    @keyframes float-slow {
+      0% {
+        transform: translateY(0);
+      }
+
+      50% {
+        transform: translateY(-15px);
+      }
+
+      100% {
+        transform: translateY(0);
+      }
+    }
+
+    .showcase-inner {
+      border-radius: 16px;
+      background: #0a0a0f;
+      border: 1px solid var(--glass-border);
+      aspect-ratio: 16/9;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      flex-direction: column;
+      overflow: hidden;
+      position: relative;
+    }
+
+    .showcase-inner::before {
+      content: '';
+      position: absolute;
+      top: 0;
+      left: 0;
+      right: 0;
+      height: 40px;
+      background: #111116;
+      border-bottom: 1px solid var(--glass-border);
+      display: flex;
+      align-items: center;
+      padding: 0 1rem;
+      box-shadow: 0 2px 10px rgba(0, 0, 0, 0.2);
+    }
+
+    .window-dots {
+      position: absolute;
+      top: 15px;
+      left: 15px;
+      display: flex;
+      gap: 6px;
+    }
+
+    .window-dots span {
+      width: 10px;
+      height: 10px;
+      border-radius: 50%;
+      background: #333;
+    }
+
+    .window-dots span:nth-child(1) {
+      background: #ff5f56;
+    }
+
+    .window-dots skip span:nth-child(2) {
+      background: #ffbd2e;
+    }
+
+    .window-dots skip span:nth-child(3) {
+      background: #27c93f;
+    }
+
+    .showcase-placeholder-text {
+      color: var(--text-muted);
+      font-size: 1.1rem;
+      text-align: center;
+      z-index: 10;
+    }
+
+    .showcase-placeholder-text i {
+      display: block;
+      font-size: 3rem;
+      margin-bottom: 1rem;
+      opacity: 0.5;
+    }
+
+    /* Features Grid */
+    .features {
+      padding: 8rem 0;
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+      gap: 2rem;
+    }
+
+    .feature-card {
+      background: var(--glass-bg);
+      border: 1px solid var(--glass-border);
+      border-radius: 20px;
+      padding: 2.5rem;
+      backdrop-filter: blur(12px);
+      transition: all 0.3s ease;
+      position: relative;
+      overflow: hidden;
+    }
+
+    .feature-card::before {
+      content: '';
+      position: absolute;
+      top: 0;
+      left: 0;
+      width: 100%;
+      height: 100%;
+      background: linear-gradient(45deg, transparent, rgba(255, 255, 255, 0.05), transparent);
+      transform: translateX(-100%);
+      transition: 0.6s;
+    }
+
+    .feature-card:hover {
+      transform: translateY(-5px);
+      border-color: rgba(255, 255, 255, 0.15);
+      background: rgba(255, 255, 255, 0.05);
+    }
+
+    .feature-card:hover::before {
+      transform: translateX(100%);
+    }
+
+    .feature-icon {
+      width: 50px;
+      height: 50px;
+      border-radius: 12px;
+      background: linear-gradient(135deg, rgba(142, 45, 226, 0.2) 0%, rgba(74, 0, 224, 0.2) 100%);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      margin-bottom: 1.5rem;
+      color: #a78bfa;
+      font-size: 1.5rem;
+      border: 1px solid rgba(167, 139, 250, 0.2);
+    }
+
+    .feature-card h3 {
+      font-family: 'Outfit', sans-serif;
+      font-size: 1.25rem;
+      margin-bottom: 1rem;
+      font-weight: 600;
+    }
+
+    .feature-card p {
+      color: var(--text-muted);
+      font-size: 0.95rem;
+    }
+
+    /* Footer */
+    footer {
+      border-top: 1px solid var(--glass-border);
+      padding: 3rem 0;
+      text-align: center;
+      color: var(--text-muted);
+      font-size: 0.9rem;
+    }
+
+    /* Animations */
+    @keyframes fadeInUp {
+      from {
+        opacity: 0;
+        transform: translateY(20px);
+      }
+
+      to {
+        opacity: 1;
+        transform: translateY(0);
+      }
+    }
+
+    @keyframes fadeInDown {
+      from {
+        opacity: 0;
+        transform: translateY(-20px);
+      }
+
+      to {
+        opacity: 1;
+        transform: translateY(0);
+      }
+    }
+  </style>
+  <!-- Optional Icons -->
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+</head>
+
+<body>
+  <div class="bg-blobs">
+    <div class="blob blob-1"></div>
+    <div class="blob blob-2"></div>
+  </div>
+
+  <div class="container">
+    <header>
+      <div class="logo">
+        <i class="fa-solid fa-server"></i>
+        Air<span>BL</span>
+      </div>
+      <div class="nav-links">
+        <a href="#features">Features</a>
+        <a href="https://github.com/esurient/AirBL" target="_blank">GitHub</a>
+      </div>
+    </header>
+
+    <main>
+      <section class="hero">
+        <h1>VPN Blocklist Prevention <br> <span class="text-gradient">Redefined.</span></h1>
+        <p>A comprehensive tracking tool to continuously verify AirVPN infrastructure against DroneBL, automate ping
+          tests, and power-steer your safe traffic via Gluetun.</p>
+
+        <div class="cta-group">
+          <a href="https://github.com/esurient/AirBL" class="btn btn-primary" target="_blank">
+            <i class="fa-brands fa-github" style="margin-right: 8px;"></i> View on GitHub
+          </a>
+          <a href="#features" class="btn btn-secondary">Explore Features</a>
+        </div>
+
+        <div class="showcase-wrapper">
+          <div class="showcase-inner">
+            <div class="window-dots">
+              <span></span><span></span><span></span>
+            </div>
+            <img src="https://raw.githubusercontent.com/esurient/AirBL/main/assets/dashboard.png"
+              alt="AirBL Dashboard UI"
+              style="width: 100%; height: 100%; object-fit: cover; border-bottom-left-radius: 16px; border-bottom-right-radius: 16px; margin-top: 40px;">
+          </div>
+        </div>
+      </section>
+
+      <section id="features" class="features">
+        <div class="feature-card">
+          <div class="feature-icon">
+            <i class="fa-solid fa-network-wired"></i>
+          </div>
+          <h3>DNS-Guided Endpoints</h3>
+          <p>Uses direct DNS polling and rapid ICMP sampling to map accurate Entry and Exit IP pairs instantly without
+            generating aggressive legacy subnet noise.</p>
+        </div>
+
+        <div class="feature-card">
+          <div class="feature-icon">
+            <i class="fa-solid fa-shield-halved"></i>
+          </div>
+          <h3>DroneBL Verification</h3>
+          <p>Query every responsive server directly against the DroneBL blocklist using DNS to confirm its cleanliness
+            before risking your traffic.</p>
+        </div>
+
+        <div class="feature-card">
+          <div class="feature-icon">
+            <i class="fa-solid fa-gauge-high"></i>
+          </div>
+          <h3>Encapsulated Speedtests</h3>
+          <p>Seamlessly benchmark connection limits through isolated policy-routed containers without compromising the
+            host network or exposing raw IP data.</p>
+        </div>
+
+        <div class="feature-card">
+          <div class="feature-icon">
+            <i class="fa-solid fa-wand-magic-sparkles"></i>
+          </div>
+          <h3>Gluetun REST Integration</h3>
+          <p>Automatically rebuild the optimal <code>servers.json</code> layout for Gluetun and issue live rolling
+            restarts via REST directly to your download stack.</p>
+        </div>
+
+        <div class="feature-card">
+          <div class="feature-icon">
+            <i class="fa-solid fa-chart-line"></i>
+          </div>
+          <h3>Dynamic Dashboard</h3>
+          <p>Supervise scan history and system health metrics from a sleek, self-hosted web interface tracking
+            connection anomalies and historical ban rates.</p>
+        </div>
+
+        <div class="feature-card">
+          <div class="feature-icon">
+            <i class="fa-brands fa-docker"></i>
+          </div>
+          <h3>Built for Docker</h3>
+          <p>Deploys locally effortlessly. Mount your AirVPN configurations, set your environment limits, and bring up
+            the full stack natively via Compose.</p>
+        </div>
+
+        <div class="feature-card">
+          <div class="feature-icon">
+            <i class="fa-solid fa-route"></i>
+          </div>
+          <h3>RFC1918 Policy Routing</h3>
+          <p>Intelligent Docker bridge bypassing routes UI traffic cleanly over the host while aggressive benchmark
+            speedtests are seamlessly encapsulated via advanced local iptables.</p>
+        </div>
+
+        <div class="feature-card">
+          <div class="feature-icon">
+            <i class="fa-solid fa-microscope"></i>
+          </div>
+          <h3>Multi-Day Discovery</h3>
+          <p>Automatically cycle sequential protocol combinations (1637, 47107) and map Entry endpoints over 7 days to
+            scientifically guarantee the fastest localized VPN route structure.</p>
+        </div>
+
+        <div class="feature-card">
+          <div class="feature-icon">
+            <i class="fa-solid fa-chart-pie"></i>
+          </div>
+          <h3>Advanced Telemetry</h3>
+          <p>Isolate overarching topological drops natively via long-term Metric dashboards tracking global DroneBL
+            strikes, granular Entry Ping delays, and total historical Ban aggregations.</p>
+        </div>
+      </section>
+    </main>
+
+    <footer>
+      <p>&copy; 2026 AirBL Project. GPL-3.0 Licensed. Integrates with AirVPN.</p>
+    </footer>
+  </div>
+</body>
+
+</html>
