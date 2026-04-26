@@ -1,0 +1,15 @@
+{
+  "regions": {
+    "mode": "manual",
+    "countries": ["DE", "GB", "NL", "IE", "CZ", "CH", "NO"]
+  },
+  "cities": {
+    "GB": ["London"],
+    "DE": ["Frankfurt", "Berlin"],
+    "NL": ["Amsterdam", "Alblasserdam"],
+    "IE": ["Dublin"],
+    "CZ": ["Prague"],
+    "CH": ["Zurich"],
+    "NO": ["Oslo"]
+  }
+}

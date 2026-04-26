@@ -1,0 +1,93 @@
+{% extends "base.html" %}
+
+{% block body_class %}servers-page{% endblock %}
+
+{% block page_title %}AirVPN Servers{% endblock %}
+
+{% block content %}
+<!-- Filter Bar -->
+<div class="filter-bar">
+    <div class="filter-group">
+        <label>Country:</label>
+        <select id="filterCountry" onchange="applyFilters()">
+            <option value="">All Countries</option>
+        </select>
+    </div>
+    <div class="filter-group">
+        <label>Status:</label>
+        <select id="filterStatus" onchange="applyFilters()">
+            <option value="clean" selected>Clean</option>
+            <option value="">All</option>
+            <option value="blocked">Banned</option>
+        </select>
+    </div>
+    <div class="filter-group">
+        <label>Max Load:</label>
+        <input type="number" id="filterMaxLoad" placeholder="%" min="0" max="100" onchange="applyFilters()">
+    </div>
+    <div class="filter-group">
+        <label>Max Ping:</label>
+        <input type="number" id="filterMaxPing" placeholder="ms" min="0" max="1000" onchange="applyFilters()">
+    </div>
+    <div class="filter-group">
+        <label>Min Down:</label>
+        <input type="number" id="filterMinDownload" placeholder="Mbps" min="0" step="1" onchange="applyFilters()">
+    </div>
+    <div class="filter-group">
+        <label>Min Up:</label>
+        <input type="number" id="filterMinUpload" placeholder="Mbps" min="0" step="1" onchange="applyFilters()">
+    </div>
+    <div class="filter-group">
+        <label>Min Score:</label>
+        <input type="number" id="filterMinScore" placeholder="0" min="0" max="100" step="0.1" onchange="applyFilters()">
+    </div>
+    <div class="filter-group">
+        <label>Min Dev:</label>
+        <input type="number" id="filterMinDev" placeholder="0" min="0" max="200" step="0.1" onchange="applyFilters()">
+    </div>
+    <button class="btn btn-secondary btn-reset" onclick="resetFilters()">Reset</button>
+</div>
+
+<div id="resultsContainer">
+    <div class="empty-state">
+        <h2>No Scan Results</h2>
+        <p>Run a scan from the Overview tab to populate servers.</p>
+    </div>
+</div>
+
+<!-- Server Details Modal -->
+<div id="serverModal" class="modal-overlay" style="display: none;" onclick="if(event.target === this) closeModal()">
+    <div class="modal-content">
+        <div class="modal-header">
+            <h2 id="modalServerName">Server Name</h2>
+            <button class="modal-close" onclick="closeModal()">&times;</button>
+        </div>
+        <div class="modal-body">
+            <div class="modal-section">
+                <h3>Server Info</h3>
+                <div class="info-grid" id="modalServerInfo"></div>
+            </div>
+            <div class="modal-section">
+                <h3>Performance</h3>
+                <div class="info-grid" id="modalPerformance"></div>
+            </div>
+            <div class="modal-section">
+                <h3>Speedtest Results</h3>
+                <div class="info-grid" id="modalSpeedtest"></div>
+            </div>
+            <div class="modal-section">
+                <h3>IP Addresses</h3>
+                <div id="modalIPs" class="ip-list"></div>
+            </div>
+        </div>
+        <div class="modal-footer">
+            <button class="btn btn-secondary" onclick="closeModal()">Close</button>
+            <button class="btn" id="modalSpeedtestBtn" onclick="runServerSpeedtest()">Run Speedtest</button>
+        </div>
+    </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script src="/static/js/app.js"></script>
+{% endblock %}

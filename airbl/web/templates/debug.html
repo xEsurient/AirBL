@@ -1,0 +1,455 @@
+{% extends "base.html" %}
+
+{% block title %}Debug - AirBL{% endblock %}
+{% block page_title %}Debug Logs{% endblock %}
+
+{% block head %}
+<style>
+    .log-container {
+        font-family: 'SF Mono', 'Fira Code', 'Consolas', monospace;
+        background: #0a0e1a;
+        color: #cbd5e1;
+        padding: 0;
+        border-radius: 8px;
+        height: 72vh;
+        overflow-y: auto;
+        border: 1px solid var(--border);
+        font-size: 12.5px;
+        line-height: 1.6;
+        box-shadow: inset 0 2px 6px rgba(0, 0, 0, 0.4);
+    }
+
+    .log-entry {
+        display: grid;
+        grid-template-columns: 90px 58px 110px 1fr;
+        gap: 8px;
+        padding: 3px 12px;
+        border-bottom: 1px solid rgba(255,255,255,0.03);
+        align-items: baseline;
+        transition: background 0.1s;
+    }
+
+    .log-entry:hover {
+        background: rgba(255,255,255,0.04);
+    }
+
+    .log-entry:nth-child(even) {
+        background: rgba(255,255,255,0.015);
+    }
+    .log-entry:nth-child(even):hover {
+        background: rgba(255,255,255,0.05);
+    }
+
+    .log-time {
+        color: #64748b;
+        white-space: nowrap;
+        font-size: 11px;
+        letter-spacing: 0.02em;
+    }
+
+    .log-level {
+        font-weight: 700;
+        font-size: 10px;
+        text-transform: uppercase;
+        letter-spacing: 0.05em;
+        padding: 1px 5px;
+        border-radius: 3px;
+        text-align: center;
+        line-height: 1.6;
+    }
+
+    .log-module {
+        color: #7c8caa;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        font-size: 11.5px;
+    }
+
+    .log-msg {
+        color: #e2e8f0;
+        white-space: pre-wrap;
+        word-break: break-word;
+    }
+
+    /* Level colors */
+    .log-debug .log-level { color: #64748b; background: rgba(100,116,139,0.15); }
+    .log-debug .log-msg { color: #94a3b8; }
+
+    .log-info .log-level { color: #38bdf8; background: rgba(56,189,248,0.12); }
+
+    .log-warning .log-level { color: #fbbf24; background: rgba(251,191,36,0.15); }
+    .log-warning { background: rgba(251,191,36,0.03) !important; }
+
+    .log-error .log-level { color: #f87171; background: rgba(248,113,113,0.18); }
+    .log-error { background: rgba(248,113,113,0.04) !important; }
+    .log-error .log-msg { color: #fca5a5; }
+
+    .log-critical .log-level { color: #fff; background: #dc2626; }
+    .log-critical { background: rgba(220,38,38,0.08) !important; }
+    .log-critical .log-msg { color: #fca5a5; font-weight: 600; }
+
+    /* Syntax highlights inside messages */
+    .log-msg .hl-ip { color: #a78bfa; }
+    .log-msg .hl-num { color: #34d399; }
+    .log-msg .hl-path { color: #fbbf24; }
+    .log-msg .hl-server { color: #38bdf8; }
+    .log-msg .hl-key { color: #f472b6; }
+
+    /* Long messages */
+    .log-msg.truncated {
+        max-height: 1.6em;
+        overflow: hidden;
+        cursor: pointer;
+        position: relative;
+    }
+    .log-msg.truncated::after {
+        content: '…';
+        color: #64748b;
+    }
+    .log-msg.expanded {
+        max-height: none;
+    }
+
+    /* Controls */
+    .debug-controls {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        gap: 12px;
+        margin-bottom: 12px;
+        background: var(--bg-card);
+        padding: 10px 14px;
+        border-radius: 8px;
+        border: 1px solid var(--border);
+        flex-wrap: wrap;
+    }
+
+    .control-group {
+        display: flex;
+        gap: 6px;
+        align-items: center;
+    }
+
+    .control-group.right {
+        margin-left: auto;
+    }
+
+    .form-control {
+        background: var(--bg-secondary);
+        border: 1px solid var(--border);
+        color: var(--text-primary);
+        padding: 6px 12px;
+        border-radius: 6px;
+        font-size: 0.85rem;
+        min-width: 220px;
+        font-family: inherit;
+    }
+
+    .form-control:focus {
+        outline: none;
+        border-color: var(--accent);
+        box-shadow: 0 0 0 2px rgba(56,189,248,0.15);
+    }
+
+    .btn-sm {
+        padding: 4px 10px;
+        font-size: 0.8rem;
+        border-radius: 5px;
+    }
+
+    /* Level filter pills */
+    .level-pills {
+        display: flex;
+        gap: 3px;
+    }
+
+    .level-pill {
+        padding: 3px 10px;
+        font-size: 10px;
+        font-weight: 700;
+        letter-spacing: 0.05em;
+        text-transform: uppercase;
+        border: 1px solid transparent;
+        border-radius: 4px;
+        cursor: pointer;
+        background: rgba(255,255,255,0.05);
+        color: var(--text-secondary);
+        transition: all 0.15s;
+        user-select: none;
+    }
+
+    .level-pill:hover {
+        background: rgba(255,255,255,0.1);
+    }
+
+    .level-pill.active {
+        border-color: currentColor;
+    }
+
+    .level-pill[data-level="DEBUG"].active { color: #94a3b8; background: rgba(100,116,139,0.2); }
+    .level-pill[data-level="INFO"].active { color: #38bdf8; background: rgba(56,189,248,0.15); }
+    .level-pill[data-level="WARNING"].active { color: #fbbf24; background: rgba(251,191,36,0.15); }
+    .level-pill[data-level="ERROR"].active { color: #f87171; background: rgba(248,113,113,0.15); }
+
+    /* Status bar */
+    .log-status {
+        display: flex;
+        align-items: center;
+        gap: 12px;
+        font-size: 0.78rem;
+        color: var(--text-secondary);
+    }
+
+    .log-count {
+        font-variant-numeric: tabular-nums;
+    }
+
+    .log-status .live-dot {
+        width: 7px;
+        height: 7px;
+        border-radius: 50%;
+        background: #22c55e;
+        display: inline-block;
+        animation: pulse 2s infinite;
+    }
+
+    .log-status .live-dot.paused {
+        background: #eab308;
+        animation: none;
+    }
+
+    @keyframes pulse {
+        0%, 100% { opacity: 1; }
+        50% { opacity: 0.3; }
+    }
+
+    .kbd {
+        font-size: 10px;
+        padding: 1px 5px;
+        border: 1px solid var(--border);
+        border-radius: 3px;
+        color: var(--text-secondary);
+        background: rgba(255,255,255,0.05);
+        font-family: inherit;
+    }
+</style>
+{% endblock %}
+
+{% block content %}
+<div class="debug-controls">
+    <div class="control-group">
+        <input type="text" id="logFilter" class="form-control" placeholder="Search logs... (/ to focus)"
+            oninput="renderLogs()">
+    </div>
+    <div class="level-pills">
+        <button class="level-pill active" data-level="DEBUG" onclick="toggleLevel(this)">Debug</button>
+        <button class="level-pill active" data-level="INFO" onclick="toggleLevel(this)">Info</button>
+        <button class="level-pill active" data-level="WARNING" onclick="toggleLevel(this)">Warn</button>
+        <button class="level-pill active" data-level="ERROR" onclick="toggleLevel(this)">Error</button>
+    </div>
+    <div class="control-group">
+        <button class="btn btn-sm btn-secondary" onclick="setFilter('hummingbird')">VPN</button>
+        <button class="btn btn-sm btn-secondary" onclick="setFilter('speedtest')">Speed</button>
+        <button class="btn btn-sm btn-secondary" onclick="setFilter('dronebl')">DroneBL</button>
+        <button class="btn btn-sm btn-secondary" onclick="setFilter('')">Clear</button>
+    </div>
+    <div class="control-group right">
+        <div class="log-status">
+            <span class="live-dot" id="liveDot"></span>
+            <span class="log-count" id="logCount">0 / 0</span>
+        </div>
+        <button id="pauseDebugBtn" class="btn btn-sm btn-secondary" onclick="togglePause()">Pause</button>
+        <button class="btn btn-sm btn-secondary" onclick="fetchLogs()">↻</button>
+        <button class="btn btn-sm btn-danger" onclick="clearLogs()">Clear</button>
+    </div>
+</div>
+
+<div id="logContainer" class="log-container">
+    <div class="log-entry log-info">
+        <span class="log-time">--:--:--</span>
+        <span class="log-level">SYS</span>
+        <span class="log-module">system</span>
+        <span class="log-msg">Loading logs…</span>
+    </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+    let isPaused = false;
+    let allLogs = [];
+    let enabledLevels = new Set(['DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL']);
+
+    async function fetchLogs() {
+        if (isPaused) return;
+
+        try {
+            const response = await fetch('/api/debug/logs');
+            const data = await response.json();
+            allLogs = data;
+            renderLogs();
+        } catch (e) {
+            console.error('Failed to fetch logs:', e);
+        }
+    }
+
+    function renderLogs() {
+        const container = document.getElementById('logContainer');
+        const filterText = document.getElementById('logFilter').value.toLowerCase();
+
+        // Filter logs by level and search text
+        const filtered = allLogs.filter(entry => {
+            const level = (entry.level || 'INFO').toUpperCase();
+
+            // Level filter
+            if (!enabledLevels.has(level) && !enabledLevels.has('CRITICAL')) return false;
+            if (level === 'CRITICAL' && !enabledLevels.has('ERROR')) return false;
+            if (!enabledLevels.has(level)) return false;
+
+            // Text filter
+            if (!filterText) return true;
+
+            const terms = filterText.split(' ').filter(t => t.length > 0);
+            const msg = (entry.message || '').toLowerCase();
+            const module = (entry.module || '').toLowerCase();
+            const func = (entry.funcName || '').toLowerCase();
+
+            return terms.every(term =>
+                msg.includes(term) ||
+                level.toLowerCase().includes(term) ||
+                module.includes(term) ||
+                func.includes(term)
+            );
+        });
+
+        // Track scroll position
+        const wasAtBottom = container.scrollHeight - container.scrollTop <= container.clientHeight + 50;
+
+        container.innerHTML = filtered.map(formatLog).join('');
+
+        // Update count
+        document.getElementById('logCount').textContent = `${filtered.length} / ${allLogs.length}`;
+
+        if (wasAtBottom && !isPaused) {
+            container.scrollTop = container.scrollHeight;
+        }
+    }
+
+    function formatLog(entry) {
+        let time = '';
+        if (entry.timestamp) {
+            const date = new Date(entry.timestamp);
+            time = date.toLocaleTimeString('en-GB', { hour12: false }) +
+                   '.' + String(date.getMilliseconds()).padStart(3, '0');
+        }
+
+        const rawMsg = entry.message || '';
+        const level = (entry.level || 'INFO').toUpperCase();
+        const module = entry.module || '';
+        const isLong = rawMsg.length > 300 || rawMsg.includes('\n');
+
+        let cls = 'log-info';
+        if (level === 'DEBUG') cls = 'log-debug';
+        else if (level === 'WARNING') cls = 'log-warning';
+        else if (level === 'ERROR') cls = 'log-error';
+        else if (level === 'CRITICAL') cls = 'log-critical';
+
+        const msgClass = isLong ? 'log-msg truncated' : 'log-msg';
+        const clickHandler = isLong ? ' onclick="this.classList.toggle(\'truncated\');this.classList.toggle(\'expanded\')"' : '';
+
+        return `<div class="log-entry ${cls}">
+            <span class="log-time" title="${entry.timestamp || ''}">${time}</span>
+            <span class="log-level">${level}</span>
+            <span class="log-module" title="${module}${entry.funcName ? '.' + entry.funcName : ''}:${entry.lineno || ''}">${module}</span>
+            <span class="${msgClass}"${clickHandler}>${highlightMsg(escapeHtml(rawMsg))}</span>
+        </div>`;
+    }
+
+    function highlightMsg(text) {
+        // Highlight key=value patterns MUST run before others to avoid matching class= inside generated span tags
+        text = text.replace(/\b(\w+)=/g,
+            '<span class="hl-key">$1</span>=');
+
+        // Highlight IP addresses
+        text = text.replace(/\b(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})(:\d+)?\b/g,
+            '<span class="hl-ip">$1$2</span>');
+
+        // Highlight file paths
+        text = text.replace(/(\/[\w\-.\/]+\.\w+)/g,
+            '<span class="hl-path">$1</span>');
+
+        // Highlight standalone numbers with units (e.g., 120s, 50.1%, 1637)
+        text = text.replace(/\b(\d+\.?\d*)\s*(ms|Mbps|s|%|MB|KB|GB)\b/g,
+            '<span class="hl-num">$1 $2</span>');
+
+        return text;
+    }
+
+    function setFilter(text) {
+        document.getElementById('logFilter').value = text;
+        renderLogs();
+    }
+
+    function toggleLevel(btn) {
+        const level = btn.dataset.level;
+        btn.classList.toggle('active');
+
+        if (btn.classList.contains('active')) {
+            enabledLevels.add(level);
+        } else {
+            enabledLevels.delete(level);
+        }
+        renderLogs();
+    }
+
+    function escapeHtml(text) {
+        if (!text) return '';
+        return text
+            .replace(/&/g, "&amp;")
+            .replace(/</g, "&lt;")
+            .replace(/>/g, "&gt;")
+            .replace(/"/g, "&quot;")
+            .replace(/'/g, "&#039;");
+    }
+
+    async function togglePause() {
+        const btn = document.getElementById('pauseDebugBtn');
+        const dot = document.getElementById('liveDot');
+        try {
+            const response = await fetch('/api/debug/pause', { method: 'POST' });
+            const data = await response.json();
+            isPaused = data.paused;
+            btn.textContent = isPaused ? 'Resume' : 'Pause';
+            btn.classList.toggle('btn-warning', isPaused);
+            btn.classList.toggle('btn-secondary', !isPaused);
+            dot.classList.toggle('paused', isPaused);
+        } catch (e) {
+            console.error('Failed to toggle pause:', e);
+        }
+    }
+
+    async function clearLogs() {
+        try {
+            await fetch('/api/debug/clear', { method: 'POST' });
+            allLogs = [];
+            renderLogs();
+        } catch (e) { console.error('Failed to clear logs:', e); }
+    }
+
+    // Keyboard shortcut: / to focus search
+    document.addEventListener('keydown', (e) => {
+        if (e.key === '/' && document.activeElement.tagName !== 'INPUT') {
+            e.preventDefault();
+            document.getElementById('logFilter').focus();
+        }
+        if (e.key === 'Escape') {
+            document.getElementById('logFilter').blur();
+        }
+    });
+
+    // Poll every second
+    setInterval(fetchLogs, 1000);
+    fetchLogs();
+</script>
+{% endblock %}

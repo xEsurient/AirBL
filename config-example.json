@@ -1,0 +1,11 @@
+{
+  "regions": {
+    "mode": "manual",
+    "countries": ["DE", "GB", "US"]
+  },
+  "servers": ["Norma", "Segin", "Lupus"],
+  "cities": {
+    "GB": ["London"],
+    "DE": ["Frankfurt", "Berlin"]
+  }
+}

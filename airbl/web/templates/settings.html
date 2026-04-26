@@ -1,0 +1,1829 @@
+{% extends "base.html" %}
+
+{% block title %}Settings - AirBL{% endblock %}
+{% block page_title %}Settings{% endblock %}
+
+{% block content %}
+<div class="category-tabs" id="settingsTabs">
+    <button class="tab-btn active" onclick="filterCategory('all')">ALL</button>
+    <button class="tab-btn" onclick="filterCategory('general')">GENERAL</button>
+    <button class="tab-btn" onclick="filterCategory('discovery')">DISCOVERY</button>
+    <button class="tab-btn" onclick="filterCategory('performance')">PERFORMANCE</button>
+    <button class="tab-btn" onclick="filterCategory('gluetun')">GLUETUN</button>
+    <button class="tab-btn" onclick="filterCategory('wireguard')">WIREGUARD</button>
+    <button class="tab-btn" onclick="filterCategory('targets')">TARGETS</button>
+</div>
+
+<!-- Scan Settings -->
+<div class="settings-section" data-category="general">
+    <h2 onclick="toggleSection(this)">📊 Scan Settings</h2>
+    <div class="section-content">
+
+        <div class="setting-row">
+            <div class="setting-info">
+                <div class="setting-label">Auto-Scan</div>
+                <div class="setting-description">Automatically run scans at regular intervals</div>
+            </div>
+            <div class="setting-control">
+                <label class="toggle" for="autoScan">
+                    <input type="checkbox" id="autoScan" onchange="markChanged()">
+                    <span class="toggle-slider"></span>
+                </label>
+            </div>
+        </div>
+
+        <div class="setting-row">
+            <div class="setting-info">
+                <div class="setting-label">Scan Interval</div>
+                <div class="setting-description">Time between automatic scans (minutes)</div>
+            </div>
+            <div class="setting-control">
+                <input type="number" id="scanInterval" min="5" max="1440" value="120" onchange="markChanged()">
+            </div>
+        </div>
+
+        <div class="setting-row">
+            <div class="setting-info">
+                <div class="setting-label">Speedtest After Scan</div>
+                <div class="setting-description">Run speedtest on clean servers after scan completes</div>
+            </div>
+            <div class="setting-control">
+                <label class="toggle" for="speedtestEnabled">
+                    <input type="checkbox" id="speedtestEnabled" onchange="markChanged()">
+                    <span class="toggle-slider"></span>
+                </label>
+            </div>
+        </div>
+
+        <div class="setting-row">
+            <div class="setting-info">
+                <div class="setting-label">VPN Cooldown</div>
+                <div class="setting-description">Wait time between server speedtests to avoid rate limiting and ensure
+                    clean disconnects</div>
+            </div>
+            <div class="setting-control">
+                <select id="postServerWait" onchange="markChanged()" style="padding: 6px 10px;">
+                    <option value="120">Safe (120s)</option>
+                    <option value="180">Safest (180s)</option>
+                </select>
+            </div>
+        </div>
+
+    </div>
+</div>
+
+<!-- Port/Entry Discovery -->
+<div class="settings-section" data-category="discovery">
+    <h2 onclick="toggleSection(this)">🔍 Port & Entry Discovery</h2>
+    <div class="section-content">
+        <p class="setting-description" style="margin-bottom: 15px;">
+            Tests all port × entry IP combinations on the highest-scored server during each scan.
+            Runs for a configurable number of days to gather consistent data across varying network conditions,
+            then auto-selects the fastest combo.
+        </p>
+
+        <div class="setting-row">
+            <div class="setting-info">
+                <div class="setting-label">Enable Discovery</div>
+                <div class="setting-description">Run discovery tests during each scan cycle</div>
+            </div>
+            <div class="setting-control">
+                <label class="toggle" for="portDiscoveryEnabled">
+                    <input type="checkbox" id="portDiscoveryEnabled" onchange="markChanged()">
+                    <span class="toggle-slider"></span>
+                </label>
+            </div>
+        </div>
+
+        <div class="setting-row">
+            <div class="setting-info">
+                <div class="setting-label">Discovery Duration</div>
+                <div class="setting-description">Number of days to run discovery before auto-selecting the best combo
+                </div>
+            </div>
+            <div class="setting-control">
+                <select id="discoveryDurationDays" onchange="markChanged()" style="padding: 6px 10px;">
+                    <option value="3">3 days</option>
+                    <option value="5">5 days</option>
+                    <option value="7">7 days</option>
+                </select>
+            </div>
+        </div>
+
+        <div class="setting-row">
+            <div class="setting-info">
+                <div class="setting-label">Entry Filter</div>
+                <div class="setting-description">Which entry points to include in discovery testing</div>
+            </div>
+            <div class="setting-control">
+                <select id="discoveryEntryFilter" onchange="markChanged()" style="padding: 6px 10px;">
+                    <option value="ALL">All Entries (E1 + E3)</option>
+                    <option value="ENTRY1">Entry 1 Only</option>
+                    <option value="ENTRY3">Entry 3 Only</option>
+                </select>
+            </div>
+        </div>
+
+        <div class="setting-row">
+            <div class="setting-info">
+                <div class="setting-label">Tests Per Combo</div>
+                <div class="setting-description">Number of speedtests to run and average for each port×entry combo per
+                    scan</div>
+            </div>
+            <div class="setting-control">
+                <input type="number" id="discoveryTestCount" min="1" max="10" value="3" onchange="markChanged()"
+                    style="width: 70px;">
+            </div>
+        </div>
+
+        <!-- Discovery Status -->
+        <div id="discoveryStatusBox"
+            style="background: var(--bg-secondary); border: 1px solid var(--border); border-radius: 8px; padding: 12px 16px; margin-top: 15px; display: none;">
+            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">
+                <span style="font-weight: 600; color: var(--accent);">📡 Discovery Status</span>
+                <span id="discoveryStatusLabel"
+                    style="font-size: 0.8rem; padding: 2px 8px; border-radius: 4px; background: rgba(56,189,248,0.15); color: #38bdf8;">Active</span>
+            </div>
+            <div id="discoveryStatusDetails" style="font-size: 0.85rem; color: var(--text-secondary);"></div>
+        </div>
+
+        <hr style="border-color: var(--border); margin: 18px 0;">
+
+        <div class="setting-row">
+            <div class="setting-info">
+                <div class="setting-label">Preferred Port</div>
+                <div class="setting-description">Currently selected port (auto-set by discovery or manual override)
+                </div>
+            </div>
+            <div class="setting-control">
+                <select id="preferredPort" onchange="markChanged()" style="padding: 6px 10px;">
+                    <option value="1637">1637 (AirVPN Default)</option>
+                    <option value="47107">47107</option>
+                    <option value="51820">51820 (WG Standard)</option>
+                </select>
+            </div>
+        </div>
+
+        <div class="setting-row">
+            <div class="setting-info">
+                <div class="setting-label">Preferred Entry IP</div>
+                <div class="setting-description">Entry server to use for VPN connections</div>
+            </div>
+            <div class="setting-control">
+                <select id="preferredEntryIp" onchange="markChanged()" style="padding: 6px 10px;">
+                    <option value="ENTRY1">Entry 1</option>
+                    <option value="ENTRY3">Entry 3</option>
+                    <option value="AUTO">Auto (Lowest Latency)</option>
+                </select>
+            </div>
+        </div>
+
+        <div class="setting-row">
+            <div class="setting-info">
+                <div class="setting-label">Interface MTU</div>
+                <div class="setting-description">Default Maximum Transmission Unit for all generated routing config
+                    payloads</div>
+            </div>
+            <div class="setting-control" style="display: flex; gap: 8px; align-items: center;">
+                <select id="preferredMtu" onchange="toggleMtuInput(); markChanged()" style="padding: 6px 10px;">
+                    <option value="1320">1320 (AirVPN Minimum)</option>
+                    <option value="1420">1420 (WG Default)</option>
+                    <option value="manual">Manual</option>
+                </select>
+                <input type="number" id="preferredMtuManual" min="1280" max="1500" placeholder="e.g. 1360"
+                    onchange="markChanged()" style="padding: 6px 10px; width: 100px; display: none;">
+            </div>
+        </div>
+
+        <div id="discoveryResultsContainer" style="margin-top: 15px; display: none;">
+            <h4 style="color: var(--accent); margin-bottom: 10px;">📊 Discovery Results</h4>
+            <div id="discoveryResults"
+                style="display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 10px;">
+                <!-- Rendered by JS -->
+            </div>
+        </div>
+
+        <div style="margin-top: 18px; display: flex; gap: 10px;">
+            <button class="btn btn-secondary" onclick="restartDiscovery()" style="font-size: 0.85rem;">
+                🔄 Force Restart Discovery
+            </button>
+        </div>
+
+    </div>
+</div>
+
+<!-- Performance Settings -->
+<div class="settings-section" data-category="performance">
+    <h2 onclick="toggleSection(this)">⚡ Performance Settings</h2>
+    <div class="section-content">
+        <p class="setting-description" style="margin-bottom: 15px;">
+            Configure automatic server disabling based on speedtest performance. Servers that consistently underperform
+            will
+            be automatically disabled.
+        </p>
+
+        <div class="setting-row">
+            <div class="setting-info">
+                <div class="setting-label">Download Threshold (Mbps)</div>
+                <div class="setting-description">Minimum download speed required. Servers below this will be disabled
+                    after
+                    consecutive failures.</div>
+            </div>
+            <div class="setting-control">
+                <input type="number" id="performanceThresholdDownload" min="1" max="1000" step="0.1" value="50"
+                    onchange="markChanged()">
+            </div>
+        </div>
+
+        <div class="setting-row">
+            <div class="setting-info">
+                <div class="setting-label">Upload Threshold (Mbps)</div>
+                <div class="setting-description">Minimum upload speed required. Servers below this will be disabled
+                    after
+                    consecutive failures.</div>
+            </div>
+            <div class="setting-control">
+                <input type="number" id="performanceThresholdUpload" min="1" max="1000" step="0.1" value="50"
+                    onchange="markChanged()">
+            </div>
+        </div>
+
+        <div class="setting-row">
+            <div class="setting-info">
+                <div class="setting-label">Check Count</div>
+                <div class="setting-description">Number of consecutive speedtests below threshold before disabling a
+                    server
+                    (1-10).</div>
+            </div>
+            <div class="setting-control">
+                <input type="number" id="performanceCheckCount" min="1" max="10" value="3" onchange="markChanged()">
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Speedtest Server Blacklist Settings -->
+<div class="settings-section" data-category="performance">
+    <h2 onclick="toggleSection(this)">🔄 Speedtest Server Settings</h2>
+    <div class="section-content">
+        <p class="setting-description" style="margin-bottom: 15px;">
+            Configure how speedtest.net servers are managed. Failing speedtest servers are temporarily blacklisted to
+            use
+            alternatives.
+        </p>
+
+        <div class="setting-row">
+            <div class="setting-info">
+                <div class="setting-label">Blacklist Duration (days)</div>
+                <div class="setting-description">How many days a server stays blacklisted after failing speed
+                    thresholds.</div>
+            </div>
+            <div class="setting-control">
+                <input type="number" id="speedtestBlacklistDuration" min="1" max="365" value="2"
+                    onchange="markChanged()">
+            </div>
+        </div>
+
+        <div class="setting-row">
+            <div class="setting-info">
+                <div class="setting-label">Max Failures Before Blacklist</div>
+                <div class="setting-description">Consecutive speedtest failures before temporarily blacklisting a
+                    speedtest.net server (1-10).</div>
+            </div>
+            <div class="setting-control">
+                <input type="number" id="speedtestMaxBlacklistFailures" min="1" max="10" value="3"
+                    onchange="markChanged()">
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Auto-Disabled Servers -->
+<div class="settings-section" data-category="performance">
+    <h2 onclick="toggleSection(this)">🚫 Auto-Disabled Servers</h2>
+    <div class="section-content">
+        <p class="setting-description" style="margin-bottom: 15px;">
+            Servers that have been automatically disabled due to consistent underperformance. You can re-enable them
+            manually.
+        </p>
+
+        <div id="disabledServersList" style="margin-top: 15px;">
+            <p class="setting-description" id="disabledServersEmpty"
+                style="padding: 20px; text-align: center; color: var(--text-secondary);">
+                No servers have been auto-disabled.
+            </p>
+        </div>
+    </div>
+</div>
+
+<!-- Gluetun Integration -->
+<div class="settings-section" data-category="gluetun">
+    <h2 onclick="toggleSection(this)">🔗 Gluetun Integration</h2>
+    <div class="section-content">
+        <p class="setting-description" style="margin-bottom: 15px;">
+            Automatically generate a <code>servers.json</code> file for Gluetun, containing custom settings per profile
+            such as endpoint routes, speed thresholds, and country filters.
+        </p>
+
+        <div class="setting-row">
+            <div class="setting-info">
+                <div class="setting-label">Force Update</div>
+                <div class="setting-description">After writing servers.json, cycle the Gluetun VPN via its control
+                    server API to apply changes immediately</div>
+            </div>
+            <div class="setting-control">
+                <label class="toggle" for="gluetunForceUpdate">
+                    <input type="checkbox" id="gluetunForceUpdate" onchange="markChanged()">
+                    <span class="toggle-slider"></span>
+                </label>
+            </div>
+        </div>
+
+        <div class="setting-row">
+            <div class="setting-info">
+                <div class="setting-label">Force Update Mode</div>
+                <div class="setting-description">Control when the VPN connection is cycled after updating servers.json
+                </div>
+            </div>
+            <div class="setting-control">
+                <select id="gluetunForceUpdateMode" onchange="markChanged()" style="padding: 6px 10px;">
+                    <option value="CLEAN_ONLY">Clean Only (stay if not banned)</option>
+                    <option value="NOT_TOP4">Reset if not Top 4</option>
+                    <option value="NOT_BEST">Reset if not Best</option>
+                    <option value="ALWAYS">Always Reset</option>
+                    <option value="DISABLED">Disable Reset</option>
+                </select>
+            </div>
+        </div>
+
+        <div class="setting-row">
+            <div class="setting-info">
+                <div class="setting-label">Control Server Host</div>
+                <div class="setting-description">IP address of the Gluetun control server</div>
+            </div>
+            <div class="setting-control">
+                <input type="text" id="gluetunControlHost" placeholder="127.0.0.1" onchange="markChanged()"
+                    style="width: 140px;">
+            </div>
+        </div>
+
+        <div class="setting-row">
+            <div class="setting-info">
+                <div class="setting-label">Control Server Port</div>
+                <div class="setting-description">Port of the Gluetun control server (default: 8000)</div>
+            </div>
+            <div class="setting-control">
+                <input type="number" id="gluetunControlPort" min="1" max="65535" value="8000" onchange="markChanged()"
+                    style="width: 100px;">
+            </div>
+        </div>
+
+        <hr style="border: 0; border-top: 1px solid var(--border); margin: 15px 0;">
+
+        <div id="gluetunProfilesContainer" style="display: flex; flex-direction: column; gap: 15px; margin-top: 20px;">
+            <!-- Profiles rendered here dynamically -->
+        </div>
+        <div style="margin-top: 15px;">
+            <button class="btn btn-secondary" onclick="window.addGluetunProfile()">+ Add Profile</button>
+        </div>
+
+        <hr style="border: 0; border-top: 1px solid var(--border); margin: 20px 0;">
+        <p class="setting-description" style="margin-bottom: 15px;">
+            Alternatively, you can export safe servers directly via API:
+        </p>
+        <div class="setting-row" style="flex-direction: column; align-items: flex-start; gap: 15px;">
+            <div class="setting-info" style="width: 100%;">
+                <div class="setting-label">Export All Clean Servers:</div>
+                <code
+                    style="background: var(--bg-primary); padding: 10px; border-radius: 4px; display: block; margin-top: 5px; color: var(--accent); user-select: all; cursor: pointer;"
+                    title="Double click to copy">curl -s http://localhost:5665/api/export/gluetun</code>
+            </div>
+
+            <div class="setting-info" style="width: 100%;">
+                <div class="setting-label">Export Clean Servers by Country (e.g., US):</div>
+                <code
+                    style="background: var(--bg-primary); padding: 10px; border-radius: 4px; display: block; margin-top: 5px; color: var(--accent); user-select: all; cursor: pointer;"
+                    title="Double click to copy">curl -s "http://localhost:5665/api/export/gluetun?country=US"</code>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- WireGuard Profile Generation -->
+<div class="settings-section" data-category="wireguard">
+    <h2 onclick="toggleSection(this)">🔒 WireGuard Profile Generation</h2>
+    <div class="section-content">
+        <p class="setting-description" style="margin-bottom: 15px;">
+            Generate WireGuard <code>.conf</code> files from scan data. Import keys from an exported AirVPN profile and
+            create per-server configs with custom settings.
+        </p>
+
+        <div id="wgProfilesContainer" style="display: flex; flex-direction: column; gap: 15px;">
+            <!-- WG Profiles rendered here dynamically -->
+        </div>
+        <div style="margin-top: 15px;">
+            <button class="btn btn-secondary" onclick="window.addWgProfile()">+ Add WG Profile</button>
+        </div>
+    </div>
+</div>
+
+<!-- Region Settings -->
+<div class="settings-section collapsed" data-category="targets">
+    <h2 onclick="toggleSection(this)">🌍 Scan Regions</h2>
+    <div class="section-content">
+        <p class="setting-description" style="margin-bottom: 15px;">
+            Select which countries to include in scans. Countries with config files are automatically enabled.
+        </p>
+
+        <div class="select-all-row">
+            <button class="btn btn-secondary" onclick="selectAllCountries()">Select All</button>
+            <button class="btn btn-secondary" onclick="deselectAllCountries()">Deselect All</button>
+            <button class="btn btn-secondary" onclick="selectConfigCountries()">Config Files Only</button>
+            <button class="btn btn-secondary" onclick="selectEurope()">Europe Only</button>
+        </div>
+
+        <div id="countryGrid" class="country-grid">
+            <!-- Countries will be populated here -->
+        </div>
+    </div>
+</div>
+
+<!-- City Selection -->
+<div class="settings-section collapsed" data-category="targets">
+    <h2 onclick="toggleSection(this)">🏙️ City Selection</h2>
+    <div class="section-content">
+        <p class="setting-description" style="margin-bottom: 15px;">
+            Select which cities to test within each country. Only servers in selected cities will be tested.
+        </p>
+
+        <div id="cityGrid" class="city-grid">
+            <!-- Cities will be populated here -->
+        </div>
+    </div>
+</div>
+
+<!-- Server Settings -->
+<div class="settings-section collapsed" data-category="targets">
+    <h2 onclick="toggleSection(this)">🖥️ Server Selection</h2>
+    <div class="section-content">
+        <p class="setting-description" style="margin-bottom: 15px;">
+            Select specific servers to scan. Only servers with config files are shown. Leave all unchecked to scan all
+            servers.
+        </p>
+
+        <div class="select-all-row">
+            <button class="btn btn-secondary" onclick="selectAllServers()">Select All</button>
+            <button class="btn btn-secondary" onclick="deselectAllServers()">Deselect All</button>
+        </div>
+
+        <div id="serverGrid" class="country-grid">
+            <!-- Servers will be populated here -->
+        </div>
+    </div>
+</div>
+
+<div id="saveBar" class="save-bar">
+    <button class="btn btn-secondary" onclick="resetChanges()">Reset</button>
+    <button class="btn btn-success" onclick="saveSettings()">Save Changes</button>
+</div>
+
+<div id="toast" class="toast">Settings saved!</div>
+{% endblock %}
+
+{% block footer %}
+<p>AirBL v1.0.0 | <a href="/" style="color: var(--accent)">Back to Dashboard</a></p>
+{% endblock %}
+
+{% block scripts %}
+<script>
+    let originalSettings = {};
+    let hasChanges = false;
+    let isLoadingSettings = true; // Flag to prevent change detection during initial load
+    let currentGluetunProfiles = [];
+
+    const europeCountries = ['AT', 'BE', 'BG', 'CH', 'CZ', 'DE', 'DK', 'ES', 'FI', 'FR', 'GB', 'UK', 'HU', 'IE', 'IT', 'LU', 'LV', 'LT', 'NL', 'NO', 'PL', 'PT', 'RO', 'RS', 'SE', 'SK', 'UA'];
+
+    function getFlagEmoji(countryCode) {
+        const codePoints = countryCode.toUpperCase().split('').map(char => 127397 + char.charCodeAt(0));
+        return String.fromCodePoint(...codePoints);
+    }
+
+    async function loadSettings() {
+        try {
+            isLoadingSettings = true; // Set flag to prevent change detection
+            const response = await fetch('/api/settings');
+            const data = await response.json();
+
+            originalSettings = JSON.parse(JSON.stringify(data));
+
+            // Fix toggle initialization - ensure boolean values and force update
+            const autoScanEl = document.getElementById('autoScan');
+            const speedtestEl = document.getElementById('speedtestEnabled');
+
+            autoScanEl.checked = Boolean(data.auto_scan_enabled);
+            autoScanEl.dispatchEvent(new Event('change')); // Trigger visual update
+
+            document.getElementById('scanInterval').value = data.scan_interval_minutes;
+
+            speedtestEl.checked = Boolean(data.speedtest_enabled);
+            speedtestEl.dispatchEvent(new Event('change')); // Trigger visual update
+
+            // Load port discovery settings
+            document.getElementById('portDiscoveryEnabled').checked = Boolean(data.port_discovery_enabled);
+            document.getElementById('discoveryDurationDays').value = data.discovery_duration_days || 3;
+            document.getElementById('discoveryEntryFilter').value = data.discovery_entry_filter || 'ALL';
+            document.getElementById('discoveryTestCount').value = data.discovery_test_count || 3;
+
+            // Handle Preferred Port Dropdown labels
+            const portSelect = document.getElementById('preferredPort');
+            Array.from(portSelect.options).forEach(opt => {
+                if (opt.value === '1637') opt.text = '1637 (AirVPN Default)';
+                if (opt.value === '47107') opt.text = '47107';
+                if (opt.value === '51820') opt.text = '51820 (WG Standard)';
+            });
+            if (data.discovery_auto_port) {
+                const opt = Array.from(portSelect.options).find(o => parseInt(o.value) === parseInt(data.discovery_auto_port));
+                if (opt) opt.text = `${opt.value} (Discovered)`;
+            }
+            document.getElementById('preferredPort').value = data.preferred_port || 1637;
+
+            // Handle Preferred Entry Dropdown labels
+            const entrySelect = document.getElementById('preferredEntryIp');
+            Array.from(entrySelect.options).forEach(opt => {
+                if (opt.value === 'ENTRY1') opt.text = 'Entry 1';
+                if (opt.value === 'ENTRY3') opt.text = 'Entry 3';
+            });
+            if (data.discovery_auto_entry) {
+                const opt = Array.from(entrySelect.options).find(o => o.value === data.discovery_auto_entry);
+                if (opt) opt.text = `${opt.text.replace(' (Discovered)', '')} (Discovered)`;
+            }
+            document.getElementById('preferredEntryIp').value = data.preferred_entry_ip || 'ENTRY3';
+
+            // Handle MTU dropdown
+            const mtuVal = data.preferred_mtu || 1320;
+            if (mtuVal === 1320 || mtuVal === 1420) {
+                document.getElementById('preferredMtu').value = mtuVal;
+                document.getElementById('preferredMtuManual').style.display = 'none';
+            } else {
+                document.getElementById('preferredMtu').value = 'manual';
+                document.getElementById('preferredMtuManual').value = mtuVal;
+                document.getElementById('preferredMtuManual').style.display = 'inline-block';
+            }
+
+            // Discovery Status Box
+            const statusBox = document.getElementById('discoveryStatusBox');
+            if (data.port_discovery_enabled) {
+                statusBox.style.display = 'block';
+                const label = document.getElementById('discoveryStatusLabel');
+                const details = document.getElementById('discoveryStatusDetails');
+
+                if (data.discovery_started_at) {
+                    const started = new Date(data.discovery_started_at);
+                    const now = new Date();
+                    const diffDays = (now - started) / (1000 * 60 * 60 * 24);
+                    const duration = data.discovery_duration_days || 3;
+                    const remaining = Math.max(0, duration - diffDays);
+
+                    label.textContent = "Active";
+                    label.style.background = "rgba(56,189,248,0.15)";
+                    label.style.color = "#38bdf8";
+
+                    let testsStr = "";
+                    if (data.port_discovery_results) {
+                        const count = Object.keys(data.port_discovery_results).length;
+                        if (count > 0) testsStr = ` — Tested ${count} combos`;
+                    }
+                    details.textContent = `Discovery is running during scans. Ends in ${remaining.toFixed(1)} days${testsStr}.`;
+                } else {
+                    label.textContent = "Waiting";
+                    label.style.background = "rgba(251,191,36,0.15)";
+                    label.style.color = "#fbbf24";
+                    details.textContent = "Waiting for next scan to begin discovery.";
+                }
+            } else if (data.discovery_auto_port && data.discovery_auto_entry) {
+                statusBox.style.display = 'block';
+                const label = document.getElementById('discoveryStatusLabel');
+                const details = document.getElementById('discoveryStatusDetails');
+                label.textContent = "Complete";
+                label.style.background = "rgba(74,222,128,0.15)";
+                label.style.color = "#4ade80";
+                details.textContent = `Optimal settings found and applied automatically.`;
+            } else {
+                statusBox.style.display = 'none';
+            }
+
+            // Load VPN cooldown
+            document.getElementById('postServerWait').value = data.post_server_wait || 120;
+
+            // Render discovery results if present
+            if (data.port_discovery_results && Object.keys(data.port_discovery_results).length > 0) {
+                window.currentDiscoveryResults = data.port_discovery_results;
+                const container = document.getElementById('discoveryResults');
+                const wrapper = document.getElementById('discoveryResultsContainer');
+                wrapper.style.display = '';
+                container.innerHTML = '';
+                for (const [combo, result] of Object.entries(data.port_discovery_results)) {
+                    const [port, entry] = combo.split('_');
+                    const isBest = parseInt(port) === parseInt(data.preferred_port) && entry === data.preferred_entry_ip && !data.port_discovery_enabled;
+                    container.innerHTML += `
+                        <div class="summary-card ${isBest ? 'success' : ''}" style="padding: 12px; text-align: center; cursor: pointer; transition: transform 0.2s;" onclick="showDiscoveryDetails('${combo}')" onmouseover="this.style.transform='scale(1.03)'" onmouseout="this.style.transform='scale(1)'">
+                            <div style="font-weight: 600; margin-bottom: 6px;">${entry} : ${port.replace('E', '')}</div>
+                            <div style="font-size: 0.85rem;">⬇ ${result.download_mbps?.toFixed(1) || '—'} Mbps</div>
+                            <div style="font-size: 0.85rem;">⬆ ${result.upload_mbps?.toFixed(1) || '—'} Mbps</div>
+                            <div style="font-size: 0.85rem;">🏓 ${result.ping_ms?.toFixed(1) || '—'} ms</div>
+                            <div style="font-size: 0.75rem; color: var(--text-secondary);">${result.tests || 0} tests</div>
+                            ${isBest ? '<div style="color: var(--success); font-size: 0.8rem; margin-top: 4px;">★ BEST</div>' : ''}
+                        </div>`;
+                }
+            }
+
+            // Load performance settings
+            if (data.performance_threshold_download !== undefined) {
+                document.getElementById('performanceThresholdDownload').value = data.performance_threshold_download;
+            }
+            if (data.performance_threshold_upload !== undefined) {
+                document.getElementById('performanceThresholdUpload').value = data.performance_threshold_upload;
+            }
+            if (data.performance_check_count !== undefined) {
+                document.getElementById('performanceCheckCount').value = data.performance_check_count;
+            }
+
+            // Load speedtest blacklist settings
+            if (data.speedtest_blacklist_duration_days !== undefined) {
+                document.getElementById('speedtestBlacklistDuration').value = data.speedtest_blacklist_duration_days;
+            }
+            if (data.speedtest_max_blacklist_failures !== undefined) {
+                document.getElementById('speedtestMaxBlacklistFailures').value = data.speedtest_max_blacklist_failures;
+            }
+
+            // Load Gluetun settings
+            window._allCountries = data.all_countries || {};
+            window._allCitiesByCountry = data.all_cities_by_country || {};
+
+            // Force update settings
+            document.getElementById('gluetunForceUpdate').checked = Boolean(data.gluetun_force_update);
+            document.getElementById('gluetunControlHost').value = data.gluetun_control_host || '127.0.0.1';
+            document.getElementById('gluetunControlPort').value = data.gluetun_control_port || 8000;
+            document.getElementById('gluetunForceUpdateMode').value = data.gluetun_force_update_mode || 'NOT_TOP4';
+
+            if (data.gluetun_profiles !== undefined) {
+                currentGluetunProfiles = data.gluetun_profiles || [];
+                renderGluetunProfiles();
+            }
+
+            // Load WireGuard profiles
+            if (data.wg_profiles !== undefined) {
+                currentWgProfiles = data.wg_profiles || [];
+                
+                // Auto-populate any empty private keys from the implicitly extracted backend key
+                if (data.extracted_private_key) {
+                    currentWgProfiles.forEach(p => {
+                        if (!p.private_key) p.private_key = data.extracted_private_key;
+                    });
+                }
+
+                renderWgProfiles();
+            }
+
+            // Render disabled servers
+            renderDisabledServers(data.disabled_servers || []);
+
+            // Render countries (all from API, but only enable those with configs)
+            renderCountryGrid(data.all_countries, data.countries_with_configs, data.enabled_countries);
+
+            // Render cities
+            renderCityGrid(data.cities_by_country || {}, data.enabled_cities || {}, data.all_countries || {});
+
+            // Render servers (exclude disabled servers from the grid)
+            renderServerGrid(data.all_servers, data.enabled_servers, data.disabled_servers || []);
+
+            // Reset change tracking after load completes
+            hasChanges = false;
+            document.getElementById('saveBar').classList.remove('visible');
+            isLoadingSettings = false; // Clear flag after loading is complete
+
+        } catch (e) {
+            console.error('Failed to load settings:', e);
+            isLoadingSettings = false;
+        }
+    }
+
+    function renderCountryGrid(allCountries, countriesWithConfigs, enabled) {
+        const grid = document.getElementById('countryGrid');
+        grid.innerHTML = '';
+
+        const countries = Object.entries(allCountries).sort((a, b) => a[1].localeCompare(b[1]));
+
+        for (const [code, name] of countries) {
+            const codeUpper = code.toUpperCase();
+            const isEnabled = enabled && enabled.length > 0
+                ? enabled.includes(codeUpper)
+                : true; // Default to checked if nothing explicitly set
+
+            const div = document.createElement('div');
+            div.className = 'country-checkbox';
+            div.innerHTML = `
+                <input type="checkbox" id="country_${code}" value="${code}" ${isEnabled ? 'checked' : ''} onchange="markChanged()">
+                <label for="country_${code}">
+                    ${getFlagEmoji(code)} ${name}
+                </label>
+            `;
+            grid.appendChild(div);
+        }
+    }
+
+    function renderServerGrid(allServers, enabled, disabledServers) {
+        const grid = document.getElementById('serverGrid');
+        grid.innerHTML = '';
+
+        if (!allServers || allServers.length === 0) {
+            grid.innerHTML = '<p style="color: var(--text-secondary); padding: 20px; text-align: center;">No active AirVPN servers discovered on API.</p>';
+            return;
+        }
+
+        // Create sets for case-insensitive comparison
+        const disabledSet = new Set((disabledServers || []).map(s => s.toLowerCase()));
+        const enabledSet = new Set((enabled || []).map(s => s.toLowerCase()));
+
+        // Filter out disabled servers from the list
+        const servers = Array.from(allServers)
+            .filter(server => !disabledSet.has(server.toLowerCase()))
+            .sort();
+
+        // If all servers are enabled (empty enabled array), all non-disabled servers should be checked
+        const allEnabled = enabled.length === 0;
+
+        for (const server of servers) {
+            const isEnabled = allEnabled || enabledSet.has(server.toLowerCase());
+
+            const div = document.createElement('div');
+            div.className = 'country-checkbox';
+            div.innerHTML = `
+                <input type="checkbox" id="server_${server.replace(/[^a-zA-Z0-9]/g, '_')}" value="${server}" ${isEnabled ? 'checked' : ''} onchange="markChanged()">
+                <label for="server_${server.replace(/[^a-zA-Z0-9]/g, '_')}">${server}</label>
+            `;
+            grid.appendChild(div);
+        }
+    }
+
+    function renderDisabledServers(disabledServers) {
+        const container = document.getElementById('disabledServersList');
+        const emptyMsg = document.getElementById('disabledServersEmpty');
+
+        if (!disabledServers || disabledServers.length === 0) {
+            emptyMsg.style.display = 'block';
+            container.innerHTML = '';
+            container.appendChild(emptyMsg);
+            return;
+        }
+
+        emptyMsg.style.display = 'none';
+        container.innerHTML = '';
+
+        const grid = document.createElement('div');
+        grid.className = 'country-grid';
+        grid.style.marginTop = '10px';
+
+        disabledServers.sort().forEach(server => {
+            const div = document.createElement('div');
+            div.className = 'country-checkbox';
+            div.style.opacity = '0.7';
+            div.innerHTML = `
+                <span style="flex: 1; display: flex; align-items: center; gap: 10px;">
+                    <span style="color: var(--danger);">🚫</span>
+                    <span>${server}</span>
+                    <span style="color: var(--text-secondary); font-size: 0.75rem; margin-left: auto;">(Auto-disabled)</span>
+                </span>
+                <button class="btn btn-secondary" style="margin-left: 10px; padding: 6px 12px; font-size: 0.85rem;" onclick="reEnableServer('${server}')">Re-enable</button>
+            `;
+            grid.appendChild(div);
+        });
+
+        container.appendChild(grid);
+    }
+
+    async function reEnableServer(serverName) {
+        if (!confirm(`Re-enable server "${serverName}"? It will be tested again in future scans.`)) {
+            return;
+        }
+
+        try {
+            // Get current enabled servers
+            const currentEnabled = getSelectedServers();
+
+            // If enabled_servers is empty, it means "all servers" are enabled
+            // In that case, we just need to remove the server from disabled list
+            // Otherwise, we add it to the enabled list
+            let newEnabled = currentEnabled;
+            if (currentEnabled.length > 0) {
+                // Some servers are explicitly enabled, add this one
+                newEnabled = [...new Set([...currentEnabled, serverName])];
+            }
+            // If currentEnabled is empty, we keep it empty (meaning "all servers")
+
+            // Unblock: Remove from disabled list
+            const currentDisabled = originalSettings.disabled_servers || [];
+            const newDisabled = currentDisabled.filter(s => s !== serverName);
+
+            const settings = {
+                auto_scan_enabled: document.getElementById('autoScan').checked,
+                scan_interval_minutes: parseInt(document.getElementById('scanInterval').value),
+                speedtest_enabled: document.getElementById('speedtestEnabled').checked,
+                enabled_countries: getSelectedCountries(),
+                enabled_cities: getSelectedCities(),
+                enabled_servers: newEnabled,
+                disabled_servers: newDisabled, // Explicitly update disabled list
+            };
+
+            const response = await fetch('/api/settings', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(settings),
+            });
+
+            const data = await response.json();
+
+            if (data.status) {
+                // Reload settings to refresh disabled servers list
+                await loadSettings();
+
+                // Show toast
+                const toast = document.getElementById('toast');
+                toast.textContent = `Server "${serverName}" re-enabled!`;
+                toast.classList.add('visible');
+                setTimeout(() => {
+                    toast.classList.remove('visible');
+                    toast.textContent = 'Settings saved!';
+                }, 3000);
+            }
+        } catch (e) {
+            alert('Failed to re-enable server: ' + e.message);
+        }
+    }
+
+    function getSelectedCountries() {
+        const checkboxes = document.querySelectorAll('#countryGrid input[type="checkbox"]:not(:disabled)');
+        return Array.from(checkboxes).filter(cb => cb.checked).map(cb => cb.value);
+    }
+
+    function getSelectedServers() {
+        const checkboxes = document.querySelectorAll('#serverGrid input[type="checkbox"]');
+        const selected = Array.from(checkboxes).filter(cb => cb.checked).map(cb => cb.value);
+        // Return empty array if all are selected (means "all servers")
+        return selected.length === checkboxes.length ? [] : selected;
+    }
+
+    function getSelectedCities() {
+        const result = {};
+        const countrySections = document.querySelectorAll('.city-country-section');
+
+        countrySections.forEach(section => {
+            const countryCode = section.dataset.country;
+            const checkboxes = section.querySelectorAll('.city-checkbox input[type="checkbox"]');
+            const selected = Array.from(checkboxes)
+                .filter(cb => cb.checked)
+                .map(cb => cb.value);
+
+            // Only include if there are selections (empty means all cities)
+            if (selected.length > 0 && selected.length < checkboxes.length) {
+                result[countryCode] = selected;
+            }
+        });
+
+        return result;
+    }
+
+    let allCountriesMap = {};
+
+    function renderCityGrid(citiesByCountry, enabledCities, allCountries) {
+        const grid = document.getElementById('cityGrid');
+        grid.innerHTML = '';
+
+        // Store allCountries for later use
+        if (allCountries) {
+            allCountriesMap = allCountries;
+        }
+
+        if (!citiesByCountry || Object.keys(citiesByCountry).length === 0) {
+            grid.innerHTML = '<p class="setting-description">No cities found in config files.</p>';
+            return;
+        }
+
+        // Sort countries by name
+        const countries = Object.entries(citiesByCountry).sort((a, b) => {
+            const nameA = allCountriesMap[a[0]] || a[0];
+            const nameB = allCountriesMap[b[0]] || b[0];
+            return nameA.localeCompare(nameB);
+        });
+
+        for (const [countryCode, cities] of countries) {
+            const countryName = allCountriesMap[countryCode] || countryCode;
+            const countrySection = document.createElement('div');
+            countrySection.className = 'city-country-section';
+            countrySection.dataset.country = countryCode.toUpperCase();
+
+            const header = document.createElement('h3');
+            header.style.marginBottom = '10px';
+            header.style.color = 'var(--text-primary)';
+            header.textContent = `${getFlagEmoji(countryCode)} ${countryName}`;
+            countrySection.appendChild(header);
+
+            const checkboxGroup = document.createElement('div');
+            checkboxGroup.className = 'city-checkbox-group';
+
+            const sortedCities = Array.from(cities).sort();
+            const enabledForCountry = enabledCities?.[countryCode.toUpperCase()] || [];
+
+            sortedCities.forEach(city => {
+                const cityLower = city.toLowerCase();
+                const isEnabled = enabledForCountry.length === 0 ||
+                    enabledForCountry.some(c => c.toLowerCase() === cityLower);
+
+                const checkboxDiv = document.createElement('div');
+                checkboxDiv.className = `city-checkbox ${isEnabled ? 'checked' : ''}`;
+
+                const checkbox = document.createElement('input');
+                checkbox.type = 'checkbox';
+                checkbox.value = city;
+                checkbox.checked = isEnabled;
+                checkbox.id = `city-${countryCode}-${city}`;
+                checkbox.addEventListener('change', () => {
+                    checkboxDiv.classList.toggle('checked', checkbox.checked);
+                    markChanged();
+                });
+
+                const label = document.createElement('span');
+                label.textContent = city;
+                label.setAttribute('for', checkbox.id);
+
+                checkboxDiv.appendChild(checkbox);
+                checkboxDiv.appendChild(label);
+                checkboxGroup.appendChild(checkboxDiv);
+            });
+
+            countrySection.appendChild(checkboxGroup);
+            grid.appendChild(countrySection);
+        }
+    }
+
+    function renderGluetunProfiles() {
+        const container = document.getElementById('gluetunProfilesContainer');
+        container.innerHTML = '';
+
+        currentGluetunProfiles.forEach((profile, index) => {
+            const card = document.createElement('div');
+            card.className = 'city-country-section';
+            card.style.cssText = 'margin-bottom: 10px; overflow: hidden; word-break: break-word;';
+
+            card.innerHTML = `
+                <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 15px;">
+                    <h3 style="margin: 0; color: var(--accent); display: flex; align-items: center; gap: 10px;">
+                        <button class="btn btn-secondary" style="padding: 2px 8px; color: var(--danger); border-color: var(--danger);" title="Remove Profile" onclick="window.removeGluetunProfile(${index})">X</button>
+                        <input type="text" id="gp_name_${index}" value="${profile.name}" onchange="markChanged()" style="background:transparent; border:none; color:inherit; font-size:inherit; font-weight:bold; outline:none; border-bottom: 1px dashed var(--border); width: 250px;">
+                    </h3>
+                    <div style="display: flex; align-items: center; gap: 10px;">
+                        <span class="setting-label" style="margin:0;">Enabled</span>
+                        <label class="toggle" for="gp_enabled_${index}">
+                            <input type="checkbox" id="gp_enabled_${index}" ${profile.enabled ? 'checked' : ''} onchange="markChanged()">
+                            <span class="toggle-slider"></span>
+                        </label>
+                    </div>
+                </div>
+                
+                <div class="setting-row" style="padding: 8px 0; border-bottom: 1px solid var(--border); flex-wrap: wrap;">
+                    <div class="setting-info" style="min-width: 0; flex-shrink: 1;">
+                        <div class="setting-label">Output Path</div>
+                        <div class="setting-description">Path to servers.json for this profile</div>
+                    </div>
+                    <div class="setting-control" style="flex: 1; max-width: 300px; margin-left: auto; min-width: 0;">
+                        <input type="text" id="gp_path_${index}" value="${profile.output_path}" style="width: 100%; box-sizing: border-box;" onchange="markChanged()">
+                    </div>
+                </div>
+
+                <div class="setting-row" style="padding: 8px 0; border-bottom: 1px solid var(--border); flex-wrap: wrap;">
+                    <div class="setting-info" style="min-width: 0; flex-shrink: 1;">
+                        <div class="setting-label">Endpoint Route Strategy</div>
+                        <div class="setting-description">Limit generated config to specific IP paths</div>
+                    </div>
+                    <div class="setting-control" style="flex: 1; max-width: 300px; margin-left: auto; min-width: 0;">
+                        <select id="gp_strategy_${index}" style="width: 100%; box-sizing: border-box;" onchange="markChanged()">
+                            <option value="ALL" ${profile.endpoint_strategy === 'ALL' || !profile.endpoint_strategy ? 'selected' : ''}>Export ALL Routes (1 & 3)</option>
+                            <option value="ENTRY1" ${profile.endpoint_strategy === 'ENTRY1' ? 'selected' : ''}>Strict: Entry 1 ONLY</option>
+                            <option value="ENTRY3" ${profile.endpoint_strategy === 'ENTRY3' ? 'selected' : ''}>Strict: Entry 3 ONLY</option>
+                            <option value="PING_PRIORITY" ${profile.endpoint_strategy === 'PING_PRIORITY' ? 'selected' : ''}>Ping Priority (Lowest latency route)</option>
+                        </select>
+                    </div>
+                </div>
+
+                <div class="setting-row" style="padding: 10px 0; border-bottom: 1px solid var(--border);">
+                    <div class="setting-info">
+                        <div class="setting-label">Min Download (Mbps)</div>
+                    </div>
+                    <div class="setting-control">
+                        <input type="number" id="gp_dl_${index}" min="0" step="1" value="${profile.min_download_mbps}" style="width: 100px;" onchange="markChanged()">
+                    </div>
+                </div>
+
+                <div class="setting-row" style="padding: 10px 0; border-bottom: 1px solid var(--border);">
+                    <div class="setting-info">
+                        <div class="setting-label">Min Upload (Mbps)</div>
+                    </div>
+                    <div class="setting-control">
+                        <input type="number" id="gp_ul_${index}" min="0" step="1" value="${profile.min_upload_mbps}" style="width: 100px;" onchange="markChanged()">
+                    </div>
+                </div>
+
+                <div class="setting-row" style="padding: 10px 0; border-bottom: 1px solid var(--border);">
+                    <div class="setting-info">
+                        <div class="setting-label">Require Clean</div>
+                        <div class="setting-description">Only include servers not blacklisted by DroneBL</div>
+                    </div>
+                    <div class="setting-control">
+                        <label class="toggle" for="gp_clean_${index}">
+                            <input type="checkbox" id="gp_clean_${index}" ${profile.require_clean ? 'checked' : ''} onchange="markChanged()">
+                            <span class="toggle-slider"></span>
+                        </label>
+                    </div>
+                </div>
+
+                <div class="setting-row" style="padding: 8px 0; border-bottom: 1px solid var(--border); flex-wrap: wrap;">
+                    <div class="setting-info" style="min-width: 0; flex-shrink: 1;">
+                        <div class="setting-label">Allowed Countries</div>
+                        <div class="setting-description">Click to open selector (empty = all)</div>
+                    </div>
+                    <div class="setting-control" style="flex: 1; max-width: 300px; margin-left: auto; min-width: 0;">
+                        <button class="btn btn-secondary" style="width: 100%; text-align: left;" onclick="window.openCountryPicker(${index})">
+                            <span id="gp_countries_label_${index}">${(profile.allowed_countries || []).length ? (profile.allowed_countries || []).join(', ') : 'All Countries'}</span>
+                        </button>
+                        <input type="hidden" id="gp_countries_${index}" value="${(profile.allowed_countries || []).join(',')}">
+                    </div>
+                </div>
+
+                <div class="setting-row" style="padding: 8px 0; flex-wrap: wrap;">
+                    <div class="setting-info" style="min-width: 0; flex-shrink: 1;">
+                        <div class="setting-label">Allowed Cities</div>
+                        <div class="setting-description">Click to open selector (empty = all)</div>
+                    </div>
+                    <div class="setting-control" style="flex: 1; max-width: 300px; margin-left: auto; min-width: 0;">
+                        <button class="btn btn-secondary" style="width: 100%; text-align: left;" onclick="window.openCityPicker(${index})">
+                            <span id="gp_cities_label_${index}">${(profile.allowed_cities || []).length ? (profile.allowed_cities || []).join(', ') : 'All Cities'}</span>
+                        </button>
+                        <input type="hidden" id="gp_cities_${index}" value="${(profile.allowed_cities || []).join(',')}">
+                    </div>
+                </div>
+            `;
+            container.appendChild(card);
+        });
+    }
+
+    // --- Popup Picker Modals ---
+    window.openCountryPicker = function (profileIndex) {
+        const existing = document.getElementById('pickerOverlay');
+        if (existing) existing.remove();
+
+        const hiddenInput = document.getElementById('gp_countries_' + profileIndex);
+        const selected = new Set((hiddenInput.value || '').split(',').filter(Boolean).map(c => c.toUpperCase()));
+
+        const overlay = document.createElement('div');
+        overlay.id = 'pickerOverlay';
+        overlay.style.cssText = 'position:fixed;top:0;left:0;width:100vw;height:100vh;background:rgba(0,0,0,0.7);z-index:2000;display:flex;align-items:center;justify-content:center;';
+
+        const modal = document.createElement('div');
+        modal.style.cssText = 'background:var(--bg-card);border:1px solid var(--border);border-radius:12px;padding:25px;max-width:500px;width:90%;max-height:70vh;overflow-y:auto;';
+
+        let html = '<h3 style="margin:0 0 15px;color:var(--accent);">Select Countries</h3>';
+        html += '<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:8px;">';
+
+        if (window._allCountries) {
+            const sorted = Object.entries(window._allCountries).sort((a, b) => a[1].localeCompare(b[1]));
+            sorted.forEach(([code, name]) => {
+                const checked = selected.has(code.toUpperCase()) ? 'checked' : '';
+                html += `<label class="country-checkbox" style="cursor:pointer;">
+                    <input type="checkbox" value="${code}" ${checked} style="accent-color:var(--success);">
+                    <span>${getFlagEmoji(code)} ${name}</span>
+                </label>`;
+            });
+        }
+        html += '</div>';
+        html += '<div style="display:flex;gap:10px;margin-top:20px;justify-content:flex-end;">';
+        html += '<button class="btn btn-secondary" id="pickerCancel">Cancel</button>';
+        html += '<button class="btn" style="background:var(--success);border-color:var(--success);color:#fff;" id="pickerSave">Save</button>';
+        html += '</div>';
+
+        modal.innerHTML = html;
+        overlay.appendChild(modal);
+        document.body.appendChild(overlay);
+
+        overlay.addEventListener('click', (e) => { if (e.target === overlay) overlay.remove(); });
+        document.getElementById('pickerCancel').addEventListener('click', () => overlay.remove());
+        document.getElementById('pickerSave').addEventListener('click', () => {
+            const checks = modal.querySelectorAll('input[type=checkbox]:checked');
+            const vals = Array.from(checks).map(c => c.value);
+            hiddenInput.value = vals.join(',');
+            const label = document.getElementById('gp_countries_label_' + profileIndex);
+            label.textContent = vals.length ? vals.join(', ') : 'All Countries';
+            markChanged();
+            overlay.remove();
+        });
+    };
+
+    window.openCityPicker = function (profileIndex) {
+        const existing = document.getElementById('pickerOverlay');
+        if (existing) existing.remove();
+
+        const hiddenInput = document.getElementById('gp_cities_' + profileIndex);
+        const selected = new Set((hiddenInput.value || '').split(',').filter(Boolean).map(c => c.toLowerCase()));
+
+        const overlay = document.createElement('div');
+        overlay.id = 'pickerOverlay';
+        overlay.style.cssText = 'position:fixed;top:0;left:0;width:100vw;height:100vh;background:rgba(0,0,0,0.7);z-index:2000;display:flex;align-items:center;justify-content:center;';
+
+        const modal = document.createElement('div');
+        modal.style.cssText = 'background:var(--bg-card);border:1px solid var(--border);border-radius:12px;padding:25px;max-width:500px;width:90%;max-height:70vh;overflow-y:auto;';
+
+        let html = '<h3 style="margin:0 0 15px;color:var(--accent);">Select Cities</h3>';
+
+        if (window._allCitiesByCountry) {
+            let cityMap = {};
+            Object.entries(window._allCitiesByCountry).forEach(([code, cities]) => {
+                cities.forEach(city => {
+                    if (!cityMap[city.toLowerCase()]) {
+                        cityMap[city.toLowerCase()] = { city, code };
+                    }
+                });
+            });
+            
+            let allCities = Object.values(cityMap).sort((a, b) => a.city.localeCompare(b.city));
+
+            html += '<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:8px;">';
+            allCities.forEach(c => {
+                const checked = selected.has(c.city.toLowerCase()) ? 'checked' : '';
+                html += `<label class="country-checkbox" style="cursor:pointer;">
+                    <input type="checkbox" value="${c.city}" ${checked} style="accent-color:var(--success);">
+                    <span>${getFlagEmoji(c.code)} ${c.city}</span>
+                </label>`;
+            });
+            html += '</div>';
+        }
+        html += '<div style="display:flex;gap:10px;margin-top:20px;justify-content:flex-end;">';
+        html += '<button class="btn btn-secondary" id="pickerCancel">Cancel</button>';
+        html += '<button class="btn" style="background:var(--success);border-color:var(--success);color:#fff;" id="pickerSave">Save</button>';
+        html += '</div>';
+
+        modal.innerHTML = html;
+        overlay.appendChild(modal);
+        document.body.appendChild(overlay);
+
+        overlay.addEventListener('click', (e) => { if (e.target === overlay) overlay.remove(); });
+        document.getElementById('pickerCancel').addEventListener('click', () => overlay.remove());
+        document.getElementById('pickerSave').addEventListener('click', () => {
+            const checks = modal.querySelectorAll('input[type=checkbox]:checked');
+            const vals = Array.from(checks).map(c => c.value);
+            hiddenInput.value = vals.join(',');
+            const label = document.getElementById('gp_cities_label_' + profileIndex);
+            label.textContent = vals.length ? vals.join(', ') : 'All Cities';
+            markChanged();
+            overlay.remove();
+        });
+    };
+
+    window.openWgCountryPicker = function (profileIndex) {
+        const existing = document.getElementById('pickerOverlay');
+        if (existing) existing.remove();
+
+        const selected = new Set((currentWgProfiles[profileIndex].countries || []).map(c => c.toUpperCase()));
+
+        const overlay = document.createElement('div');
+        overlay.id = 'pickerOverlay';
+        overlay.style.cssText = 'position:fixed;top:0;left:0;width:100vw;height:100vh;background:rgba(0,0,0,0.7);z-index:2000;display:flex;align-items:center;justify-content:center;';
+
+        const modal = document.createElement('div');
+        modal.style.cssText = 'background:var(--bg-card);border:1px solid var(--border);border-radius:12px;padding:25px;max-width:500px;width:90%;max-height:70vh;overflow-y:auto;';
+
+        let html = '<h3 style="margin:0 0 15px;color:var(--accent);">Select Countries (WireGuard)</h3>';
+        html += '<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:8px;">';
+
+        if (window._allCountries) {
+            const sorted = Object.entries(window._allCountries).sort((a, b) => a[1].localeCompare(b[1]));
+            sorted.forEach(([code, name]) => {
+                const checked = selected.has(code.toUpperCase()) ? 'checked' : '';
+                html += `<label class="country-checkbox" style="cursor:pointer;">
+                    <input type="checkbox" value="${code}" ${checked} style="accent-color:var(--success);">
+                    <span>${getFlagEmoji(code)} ${name}</span>
+                </label>`;
+            });
+        }
+        html += '</div>';
+        html += '<div style="display:flex;gap:10px;margin-top:20px;justify-content:flex-end;">';
+        html += '<button class="btn btn-secondary" id="pickerCancel">Cancel</button>';
+        html += '<button class="btn" style="background:var(--success);border-color:var(--success);color:#fff;" id="pickerSave">Save</button>';
+        html += '</div>';
+
+        modal.innerHTML = html;
+        overlay.appendChild(modal);
+        document.body.appendChild(overlay);
+
+        overlay.addEventListener('click', (e) => { if (e.target === overlay) overlay.remove(); });
+        document.getElementById('pickerCancel').addEventListener('click', () => overlay.remove());
+        document.getElementById('pickerSave').addEventListener('click', () => {
+            const checks = modal.querySelectorAll('input[type=checkbox]:checked');
+            const vals = Array.from(checks).map(c => c.value);
+            currentWgProfiles[profileIndex].countries = vals;
+            const label = document.getElementById('wg_countries_label_' + profileIndex);
+            if (label) label.textContent = vals.length ? vals.join(', ') : 'All Countries';
+            markChanged();
+            overlay.remove();
+        });
+    };
+
+    window.openWgCityPicker = function (profileIndex) {
+        const existing = document.getElementById('pickerOverlay');
+        if (existing) existing.remove();
+
+        const selected = new Set((currentWgProfiles[profileIndex].cities || []).map(c => c.toLowerCase()));
+
+        const overlay = document.createElement('div');
+        overlay.id = 'pickerOverlay';
+        overlay.style.cssText = 'position:fixed;top:0;left:0;width:100vw;height:100vh;background:rgba(0,0,0,0.7);z-index:2000;display:flex;align-items:center;justify-content:center;';
+
+        const modal = document.createElement('div');
+        modal.style.cssText = 'background:var(--bg-card);border:1px solid var(--border);border-radius:12px;padding:25px;max-width:500px;width:90%;max-height:70vh;overflow-y:auto;';
+
+        let html = '<h3 style="margin:0 0 15px;color:var(--accent);">Select Cities (WireGuard)</h3>';
+
+        if (window._allCitiesByCountry) {
+            let cityMap = {};
+            Object.entries(window._allCitiesByCountry).forEach(([code, cities]) => {
+                cities.forEach(city => {
+                    if (!cityMap[city.toLowerCase()]) {
+                        cityMap[city.toLowerCase()] = { city, code };
+                    }
+                });
+            });
+            
+            let allCities = Object.values(cityMap).sort((a, b) => a.city.localeCompare(b.city));
+
+            html += '<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:8px;">';
+            allCities.forEach(c => {
+                const checked = selected.has(c.city.toLowerCase()) ? 'checked' : '';
+                html += `<label class="country-checkbox" style="cursor:pointer;">
+                    <input type="checkbox" value="${c.city}" ${checked} style="accent-color:var(--success);">
+                    <span>${getFlagEmoji(c.code)} ${c.city}</span>
+                </label>`;
+            });
+            html += '</div>';
+        }
+        html += '<div style="display:flex;gap:10px;margin-top:20px;justify-content:flex-end;">';
+        html += '<button class="btn btn-secondary" id="pickerCancel">Cancel</button>';
+        html += '<button class="btn" style="background:var(--success);border-color:var(--success);color:#fff;" id="pickerSave">Save</button>';
+        html += '</div>';
+
+        modal.innerHTML = html;
+        overlay.appendChild(modal);
+        document.body.appendChild(overlay);
+
+        overlay.addEventListener('click', (e) => { if (e.target === overlay) overlay.remove(); });
+        document.getElementById('pickerCancel').addEventListener('click', () => overlay.remove());
+        document.getElementById('pickerSave').addEventListener('click', () => {
+            const checks = modal.querySelectorAll('input[type=checkbox]:checked');
+            const vals = Array.from(checks).map(c => c.value);
+            currentWgProfiles[profileIndex].cities = vals;
+            const label = document.getElementById('wg_cities_label_' + profileIndex);
+            if (label) label.textContent = vals.length ? vals.join(', ') : 'All Cities';
+            markChanged();
+            overlay.remove();
+        });
+    };
+
+    function getGluetunProfilesData() {
+        const arr = [];
+        currentGluetunProfiles.forEach((p, index) => {
+            const countriesVal = document.getElementById('gp_countries_' + index).value;
+            const citiesVal = document.getElementById('gp_cities_' + index).value;
+            arr.push({
+                name: document.getElementById('gp_name_' + index).value,
+                enabled: document.getElementById('gp_enabled_' + index).checked,
+                output_path: document.getElementById('gp_path_' + index).value,
+                endpoint_strategy: document.getElementById('gp_strategy_' + index).value,
+                min_download_mbps: parseFloat(document.getElementById('gp_dl_' + index).value) || 0,
+                min_upload_mbps: parseFloat(document.getElementById('gp_ul_' + index).value) || 0,
+                require_clean: document.getElementById('gp_clean_' + index).checked,
+                allowed_countries: countriesVal ? countriesVal.split(',') : [],
+                allowed_cities: citiesVal ? citiesVal.split(',') : []
+            });
+        });
+        return arr;
+    }
+
+    window.addGluetunProfile = function () {
+        currentGluetunProfiles.push({
+            name: `Profile ${currentGluetunProfiles.length + 1}`,
+            enabled: true,
+            output_path: `/app/gluetun/custom_${currentGluetunProfiles.length + 1}.json`,
+            endpoint_strategy: 'ALL',
+            min_download_mbps: 0,
+            min_upload_mbps: 0,
+            require_clean: true,
+            allowed_countries: [],
+            allowed_cities: []
+        });
+        renderGluetunProfiles();
+        markChanged();
+    };
+
+    window.removeGluetunProfile = function (index) {
+        currentGluetunProfiles.splice(index, 1);
+        renderGluetunProfiles();
+        markChanged();
+    };
+
+    // --- WireGuard Profile Management ---
+    let currentWgProfiles = [];
+
+    function renderWgProfiles() {
+        const container = document.getElementById('wgProfilesContainer');
+        container.innerHTML = '';
+        currentWgProfiles.forEach((p, i) => {
+            const card = document.createElement('div');
+            card.className = 'settings-section';
+            card.style.cssText = 'margin-bottom: 0; padding: 15px; border: 1px solid var(--border); border-radius: 8px;';
+            card.innerHTML = `
+                <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px;">
+                    <input type="text" value="${p.name}" onchange="currentWgProfiles[${i}].name=this.value; markChanged();" style="font-weight: 600; font-size: 1rem; background: transparent; border: none; color: var(--text-primary); width: 200px;">
+                    <div style="display: flex; gap: 10px; align-items: center;">
+                        <label class="toggle"><input type="checkbox" ${p.enabled ? 'checked' : ''} onchange="currentWgProfiles[${i}].enabled=this.checked; markChanged();"><span class="toggle-slider"></span></label>
+                        <button class="btn btn-danger" onclick="window.removeWgProfile(${i})" style="padding: 4px 10px; font-size: 0.8rem;">✕</button>
+                    </div>
+                </div>
+                <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 10px;">
+                    <div class="setting-row" style="margin:0; padding: 8px 0;">
+                        <span class="setting-label" style="font-size: 0.85rem;">Output Dir</span>
+                        <input type="text" value="${p.output_dir}" onchange="currentWgProfiles[${i}].output_dir=this.value; markChanged();" style="width: 160px; font-size: 0.85rem;">
+                    </div>
+                    <div class="setting-row" style="margin:0; padding: 8px 0;">
+                        <span class="setting-label" style="font-size: 0.85rem;">Entry IP</span>
+                        <select onchange="currentWgProfiles[${i}].entry_ip=this.value; markChanged();" style="padding: 4px 8px;">
+                            <option value="ENTRY1" ${p.entry_ip === 'ENTRY1' ? 'selected' : ''}>Entry 1</option>
+                            <option value="ENTRY3" ${p.entry_ip === 'ENTRY3' ? 'selected' : ''}>Entry 3</option>
+                            <option value="AUTO" ${p.entry_ip === 'AUTO' ? 'selected' : ''}>Auto (Lowest Latency)</option>
+                        </select>
+                    </div>
+                    <div class="setting-row" style="margin:0; padding: 8px 0;">
+                        <span class="setting-label" style="font-size: 0.85rem;">IP Protocol</span>
+                        <select onchange="currentWgProfiles[${i}].ip_protocol=this.value; markChanged();" style="padding: 4px 8px;">
+                            <option value="IPv4" ${p.ip_protocol === 'IPv4' ? 'selected' : ''}>IPv4</option>
+                            <option value="IPv6" ${p.ip_protocol === 'IPv6' ? 'selected' : ''}>IPv6</option>
+                        </select>
+                    </div>
+                    <div class="setting-row" style="margin:0; padding: 8px 0;">
+                        <span class="setting-label" style="font-size: 0.85rem;">Port</span>
+                        <select onchange="currentWgProfiles[${i}].port=parseInt(this.value); markChanged();" style="padding: 4px 8px;">
+                            <option value="1637" ${p.port === 1637 ? 'selected' : ''}>1637</option>
+                            <option value="47107" ${p.port === 47107 ? 'selected' : ''}>47107</option>
+                            <option value="51820" ${p.port === 51820 ? 'selected' : ''}>51820</option>
+                        </select>
+                    </div>
+                    <div class="setting-row" style="margin:0; padding: 8px 0;">
+                        <span class="setting-label" style="font-size: 0.85rem;">IP Layer Exit</span>
+                        <select onchange="currentWgProfiles[${i}].ip_layer_exit=this.value; markChanged();" style="padding: 4px 8px;">
+                            <option value="Both" ${p.ip_layer_exit === 'Both' ? 'selected' : ''}>Both</option>
+                            <option value="IPv4" ${p.ip_layer_exit === 'IPv4' ? 'selected' : ''}>IPv4 Only</option>
+                            <option value="IPv6" ${p.ip_layer_exit === 'IPv6' ? 'selected' : ''}>IPv6 Only</option>
+                        </select>
+                    </div>
+                    <div class="setting-row" style="margin:0; padding: 8px 0;">
+                        <span class="setting-label" style="font-size: 0.85rem;">MTU</span>
+                        <input type="number" value="${p.mtu}" min="1200" max="1500" onchange="currentWgProfiles[${i}].mtu=parseInt(this.value); markChanged();" style="width: 80px; font-size: 0.85rem;">
+                    </div>
+                    <div class="setting-row" style="margin:0; padding: 8px 0;">
+                        <span class="setting-label" style="font-size: 0.85rem;">Keep Alive</span>
+                        <input type="number" value="${p.keepalive}" min="0" max="300" onchange="currentWgProfiles[${i}].keepalive=parseInt(this.value); markChanged();" style="width: 80px; font-size: 0.85rem;">
+                    </div>
+                    <div class="setting-row" style="margin:0; padding: 8px 0;">
+                        <span class="setting-label" style="font-size: 0.85rem;">Mode</span>
+                        <select onchange="currentWgProfiles[${i}].mode=this.value; markChanged();" style="padding: 4px 8px;">
+                            <option value="custom" ${p.mode === 'custom' ? 'selected' : ''}>All Servers</option>
+                            <option value="clean" ${p.mode === 'clean' ? 'selected' : ''}>Only Clean Server</option>
+                            <option value="fastest" ${p.mode === 'fastest' ? 'selected' : ''}>Fastest Server</option>
+                            <option value="fastest_clean" ${p.mode === 'fastest_clean' ? 'selected' : ''}>Fastest Clean Server</option>
+                            <option value="countries" ${p.mode === 'countries' ? 'selected' : ''}>By Country</option>
+                            <option value="cities" ${p.mode === 'cities' ? 'selected' : ''}>By City</option>
+                            <option value="use_speedtest" ${p.mode === 'use_speedtest' ? 'selected' : ''}>Use AirBL Settings</option>
+                        </select>
+                    </div>
+                </div>
+                <div style="margin-top: 10px;">
+                    <div class="setting-row" style="margin:0; padding: 8px 0; flex-wrap: wrap;">
+                        <span class="setting-label" style="font-size: 0.85rem;">Allowed Countries</span>
+                        <div style="flex: 1; max-width: 280px; margin-left: auto;">
+                            <button class="btn btn-secondary" style="width: 100%; text-align: left; font-size: 0.85rem;" onclick="window.openWgCountryPicker(${i})">
+                                <span id="wg_countries_label_${i}">${(p.countries || []).length ? (p.countries || []).join(', ') : 'All Countries'}</span>
+                            </button>
+                        </div>
+                    </div>
+                    <div class="setting-row" style="margin:0; padding: 8px 0; flex-wrap: wrap;">
+                        <span class="setting-label" style="font-size: 0.85rem;">Allowed Cities</span>
+                        <div style="flex: 1; max-width: 280px; margin-left: auto;">
+                            <button class="btn btn-secondary" style="width: 100%; text-align: left; font-size: 0.85rem;" onclick="window.openWgCityPicker(${i})">
+                                <span id="wg_cities_label_${i}">${(p.cities || []).length ? (p.cities || []).join(', ') : 'All Cities'}</span>
+                            </button>
+                        </div>
+                    </div>
+                    <div class="setting-row" style="margin:0; padding: 8px 0;">
+                        <span class="setting-label" style="font-size: 0.85rem;">Private Key</span>
+                        <input type="password" value="${p.private_key || ''}" onchange="currentWgProfiles[${i}].private_key=this.value; markChanged();" placeholder="Paste WG private key" style="width: 280px; font-size: 0.85rem;">
+                    </div>
+                    <div class="setting-row" style="margin:0; padding: 8px 0;">
+                        <span class="setting-label" style="font-size: 0.85rem;">Public Key</span>
+                        <input type="text" value="${p.public_key || ''}" onchange="currentWgProfiles[${i}].public_key=this.value; markChanged();" placeholder="Server public key (optional override)" style="width: 280px; font-size: 0.85rem;">
+                    </div>
+                    <div class="setting-row" style="margin:0; padding: 8px 0;">
+                        <span class="setting-label" style="font-size: 0.85rem;">Auto-update wg0.conf</span>
+                        <label class="toggle"><input type="checkbox" ${p.auto_update_wg0 ? 'checked' : ''} onchange="currentWgProfiles[${i}].auto_update_wg0=this.checked; markChanged();"><span class="toggle-slider"></span></label>
+                    </div>
+                </div>
+            `;
+            container.appendChild(card);
+        });
+    }
+
+    window.showDiscoveryDetails = function (combo_key) {
+        if (!window.currentDiscoveryResults || !window.currentDiscoveryResults[combo_key]) return;
+        const result = window.currentDiscoveryResults[combo_key];
+
+        let historyHtml = '';
+        if (result.history && result.history.length > 0) {
+            historyHtml = `<table style="width: 100%; border-collapse: collapse; margin-top: 15px; text-align: left; font-size: 0.9rem;">
+                <thead>
+                    <tr style="border-bottom: 1px solid var(--border); color: var(--text-secondary);">
+                        <th style="padding: 8px;">Run</th>
+                        <th style="padding: 8px;">Ping</th>
+                        <th style="padding: 8px;">Down</th>
+                        <th style="padding: 8px;">Up</th>
+                        <th style="padding: 8px;">Time</th>
+                    </tr>
+                </thead>
+                <tbody>`;
+            result.history.forEach((test, index) => {
+                const dt = new Date(test.timestamp);
+                const timeStr = dt.getHours().toString().padStart(2, '0') + ':' + dt.getMinutes().toString().padStart(2, '0');
+                historyHtml += `
+                    <tr style="border-bottom: 1px solid var(--border);">
+                        <td style="padding: 8px;">#${index + 1}</td>
+                        <td style="padding: 8px;">${test.ping_ms ? test.ping_ms.toFixed(1) : '—'} ms</td>
+                        <td style="padding: 8px; color: var(--success);">${test.download_mbps ? test.download_mbps.toFixed(1) : '—'}</td>
+                        <td style="padding: 8px; color: #38bdf8;">${test.upload_mbps ? test.upload_mbps.toFixed(1) : '—'}</td>
+                        <td style="padding: 8px; color: var(--text-secondary); font-size: 0.8rem;">${timeStr}</td>
+                    </tr>`;
+            });
+            historyHtml += `</tbody></table>`;
+        } else {
+            historyHtml = `<div style="text-align: center; color: var(--text-secondary); margin-top: 20px; font-style: italic;">No raw history recorded for this bundle.</div>`;
+        }
+
+        const overlay = document.createElement('div');
+        overlay.style.cssText = 'position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,0.5);display:flex;align-items:center;justify-content:center;z-index:9999;backdrop-filter:blur(2px);';
+
+        const modal = document.createElement('div');
+        modal.style.cssText = 'background:var(--bg-card);border:1px solid var(--border);border-radius:12px;padding:25px;max-width:500px;width:90%;max-height:80vh;overflow-y:auto;box-shadow:0 10px 25px rgba(0,0,0,0.5);position:relative;';
+
+        modal.innerHTML = `
+            <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:15px">
+                <h3 style="margin:0;color:var(--accent);">Discovery: ${combo_key.replace('_', ' : ')}</h3>
+                <button onclick="this.closest('div').parentElement.parentElement.remove()" style="background:none;border:none;color:var(--text-secondary);font-size:1.5rem;cursor:pointer;">&times;</button>
+            </div>
+            
+            <div style="display: flex; justify-content: space-between; background: var(--bg-secondary); padding: 10px 15px; border-radius: 8px; margin-bottom: 15px;">
+                <div style="text-align: center;">
+                    <div style="font-size: 0.75rem; color: var(--text-secondary); text-transform: uppercase;">Avg Down</div>
+                    <div style="font-weight: bold; color: var(--success);">${result.download_mbps.toFixed(1)} <span style="font-size:0.7em;">Mbps</span></div>
+                </div>
+                <div style="text-align: center;">
+                    <div style="font-size: 0.75rem; color: var(--text-secondary); text-transform: uppercase;">Avg Up</div>
+                    <div style="font-weight: bold; color: #38bdf8;">${result.upload_mbps.toFixed(1)} <span style="font-size:0.7em;">Mbps</span></div>
+                </div>
+                <div style="text-align: center;">
+                    <div style="font-size: 0.75rem; color: var(--text-secondary); text-transform: uppercase;">Avg Ping</div>
+                    <div style="font-weight: bold;">${result.ping_ms.toFixed(1)} <span style="font-size:0.7em;">ms</span></div>
+                </div>
+            </div>
+            
+            <h4 style="margin: 20px 0 5px 0;">Raw Test History</h4>
+            ${historyHtml}
+            
+            <div style="margin-top:25px;text-align:right;">
+                <button class="btn btn-secondary" onclick="this.closest('div').parentElement.parentElement.remove()">Close</button>
+            </div>
+        `;
+
+        overlay.appendChild(modal);
+
+        // Close on dark area click
+        overlay.addEventListener('click', function (e) {
+            if (e.target === overlay) overlay.remove();
+        });
+
+        document.body.appendChild(overlay);
+    };
+
+    window.toggleMtuInput = function () {
+        const select = document.getElementById('preferredMtu');
+        const manualInput = document.getElementById('preferredMtuManual');
+        if (select.value === 'manual') {
+            manualInput.style.display = 'inline-block';
+            if (!manualInput.value) {
+                manualInput.value = 1360;
+            }
+        } else {
+            manualInput.style.display = 'none';
+        }
+    };
+
+    window.addWgProfile = function () {
+        currentWgProfiles.push({
+            name: `WG Profile ${currentWgProfiles.length + 1}`,
+            enabled: true,
+            output_dir: '/app/wireguard',
+            entry_ip: 'ENTRY3',
+            ip_protocol: 'IPv4',
+            port: 1637,
+            ip_layer_exit: 'Both',
+            mtu: 1320,
+            keepalive: 25,
+            private_key: (originalSettings && originalSettings.extracted_private_key) ? originalSettings.extracted_private_key : '',
+            public_key: '',
+            mode: 'custom',
+            countries: [],
+            cities: [],
+            auto_update_wg0: false
+        });
+        renderWgProfiles();
+        markChanged();
+    };
+
+    window.removeWgProfile = function (index) {
+        currentWgProfiles.splice(index, 1);
+        renderWgProfiles();
+        markChanged();
+    };
+
+    function getWgProfilesData() {
+        return currentWgProfiles.map(p => ({
+            name: p.name,
+            enabled: p.enabled,
+            output_dir: p.output_dir,
+            entry_ip: p.entry_ip,
+            ip_protocol: p.ip_protocol,
+            port: p.port,
+            ip_layer_exit: p.ip_layer_exit,
+            mtu: p.mtu,
+            keepalive: p.keepalive,
+            private_key: p.private_key,
+            public_key: p.public_key,
+            mode: p.mode,
+            countries: p.countries || [],
+            cities: p.cities || [],
+            auto_update_wg0: p.auto_update_wg0
+        }));
+    }
+
+    function selectAllCountries() {
+        document.querySelectorAll('#countryGrid input[type="checkbox"]:not(:disabled)').forEach(cb => cb.checked = true);
+        markChanged();
+    }
+
+    function deselectAllCountries() {
+        document.querySelectorAll('#countryGrid input[type="checkbox"]').forEach(cb => cb.checked = false);
+        markChanged();
+    }
+
+    function selectConfigCountries() {
+        // Only select countries that have config files
+        document.querySelectorAll('#countryGrid input[type="checkbox"]').forEach(cb => {
+            cb.checked = cb.dataset.hasConfig === 'true';
+        });
+        markChanged();
+    }
+
+    function selectEurope() {
+        document.querySelectorAll('#countryGrid input[type="checkbox"]:not(:disabled)').forEach(cb => {
+            cb.checked = europeCountries.includes(cb.value.toUpperCase());
+        });
+        markChanged();
+    }
+
+    function selectAllServers() {
+        document.querySelectorAll('#serverGrid input[type="checkbox"]').forEach(cb => cb.checked = true);
+        markChanged();
+    }
+
+    function deselectAllServers() {
+        document.querySelectorAll('#serverGrid input[type="checkbox"]').forEach(cb => cb.checked = false);
+        markChanged();
+    }
+
+    function markChanged() {
+        // Don't mark as changed during initial settings load
+        if (isLoadingSettings) return;
+
+        hasChanges = true;
+        document.getElementById('saveBar').classList.add('visible');
+    }
+
+    function resetChanges() {
+        const autoScanEl = document.getElementById('autoScan');
+        const speedtestEl = document.getElementById('speedtestEnabled');
+
+        autoScanEl.checked = Boolean(originalSettings.auto_scan_enabled);
+        autoScanEl.dispatchEvent(new Event('change'));
+
+        document.getElementById('scanInterval').value = originalSettings.scan_interval_minutes;
+
+        speedtestEl.checked = Boolean(originalSettings.speedtest_enabled);
+        speedtestEl.dispatchEvent(new Event('change'));
+
+        // Reset performance settings
+        if (originalSettings.performance_threshold_download !== undefined) {
+            document.getElementById('performanceThresholdDownload').value = originalSettings.performance_threshold_download;
+        }
+        if (originalSettings.performance_threshold_upload !== undefined) {
+            document.getElementById('performanceThresholdUpload').value = originalSettings.performance_threshold_upload;
+        }
+        if (originalSettings.performance_check_count !== undefined) {
+            document.getElementById('performanceCheckCount').value = originalSettings.performance_check_count;
+        }
+
+        // Reset port discovery settings
+        document.getElementById('portDiscoveryEnabled').checked = Boolean(originalSettings.port_discovery_enabled);
+        document.getElementById('portDiscoveryEnabled').dispatchEvent(new Event('change'));
+        document.getElementById('discoveryDurationDays').value = originalSettings.discovery_duration_days || 3;
+        document.getElementById('discoveryEntryFilter').value = originalSettings.discovery_entry_filter || 'ALL';
+        document.getElementById('discoveryTestCount').value = originalSettings.discovery_test_count || 3;
+        document.getElementById('preferredPort').value = originalSettings.preferred_port || 1637;
+        document.getElementById('preferredEntryIp').value = originalSettings.preferred_entry_ip || 'ENTRY3';
+
+        const originalMtu = originalSettings.preferred_mtu || 1320;
+        if (originalMtu === 1320 || originalMtu === 1420) {
+            document.getElementById('preferredMtu').value = originalMtu;
+            document.getElementById('preferredMtuManual').style.display = 'none';
+        } else {
+            document.getElementById('preferredMtu').value = 'manual';
+            document.getElementById('preferredMtuManual').value = originalMtu;
+            document.getElementById('preferredMtuManual').style.display = 'inline-block';
+        }
+
+        // Reset speedtest blacklist settings
+        if (originalSettings.speedtest_blacklist_duration_days !== undefined) {
+            document.getElementById('speedtestBlacklistDuration').value = originalSettings.speedtest_blacklist_duration_days;
+        }
+        if (originalSettings.speedtest_max_blacklist_failures !== undefined) {
+            document.getElementById('speedtestMaxBlacklistFailures').value = originalSettings.speedtest_max_blacklist_failures;
+        }
+
+        // Reset VPN cooldown
+        document.getElementById('postServerWait').value = originalSettings.post_server_wait || 120;
+
+        // Reset Gluetun settings
+        if (originalSettings.gluetun_profiles !== undefined) {
+            currentGluetunProfiles = JSON.parse(JSON.stringify(originalSettings.gluetun_profiles));
+            renderGluetunProfiles();
+        }
+
+        // Reset disabled servers display
+        renderDisabledServers(originalSettings.disabled_servers || []);
+
+        renderCountryGrid(originalSettings.all_countries, originalSettings.countries_with_configs, originalSettings.enabled_countries);
+        if (originalSettings.cities_by_country) {
+            renderCityGrid(originalSettings.cities_by_country, originalSettings.enabled_cities || {}, originalSettings.all_countries || {});
+        }
+        renderServerGrid(originalSettings.all_servers, originalSettings.enabled_servers, originalSettings.disabled_servers || []);
+
+        hasChanges = false;
+        document.getElementById('saveBar').classList.remove('visible');
+    }
+
+    async function saveSettings() {
+        const settings = {
+            auto_scan_enabled: document.getElementById('autoScan').checked,
+            scan_interval_minutes: parseInt(document.getElementById('scanInterval').value),
+            speedtest_enabled: document.getElementById('speedtestEnabled').checked,
+            // Port discovery settings
+            port_discovery_enabled: document.getElementById('portDiscoveryEnabled').checked,
+            preferred_port: parseInt(document.getElementById('preferredPort').value),
+            preferred_entry_ip: document.getElementById('preferredEntryIp').value,
+            preferred_mtu: document.getElementById('preferredMtu').value === 'manual'
+                ? parseInt(document.getElementById('preferredMtuManual').value || 1320)
+                : parseInt(document.getElementById('preferredMtu').value),
+            discovery_test_count: parseInt(document.getElementById('discoveryTestCount').value),
+            discovery_duration_days: parseInt(document.getElementById('discoveryDurationDays').value),
+            discovery_entry_filter: document.getElementById('discoveryEntryFilter').value,
+            post_server_wait: parseInt(document.getElementById('postServerWait').value),
+            enabled_countries: getSelectedCountries(),
+            enabled_cities: getSelectedCities(),
+            enabled_servers: getSelectedServers(),
+            performance_threshold_download: parseFloat(document.getElementById('performanceThresholdDownload').value),
+            performance_threshold_upload: parseFloat(document.getElementById('performanceThresholdUpload').value),
+            performance_check_count: parseInt(document.getElementById('performanceCheckCount').value),
+            speedtest_blacklist_duration_days: parseInt(document.getElementById('speedtestBlacklistDuration').value),
+            speedtest_max_blacklist_failures: parseInt(document.getElementById('speedtestMaxBlacklistFailures').value),
+
+            // Gluetun settings
+            gluetun_force_update: document.getElementById('gluetunForceUpdate').checked,
+            gluetun_force_update_mode: document.getElementById('gluetunForceUpdateMode').value,
+            gluetun_control_host: document.getElementById('gluetunControlHost').value,
+            gluetun_control_port: parseInt(document.getElementById('gluetunControlPort').value),
+            gluetun_profiles: getGluetunProfilesData(),
+
+            // WireGuard settings
+            wg_profiles: getWgProfilesData()
+        };
+
+        try {
+            const response = await fetch('/api/settings', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(settings),
+            });
+
+            const data = await response.json();
+
+            if (data.status) {
+                originalSettings = { ...originalSettings, ...settings };
+                hasChanges = false;
+                document.getElementById('saveBar').classList.remove('visible');
+
+                // Show toast
+                const toast = document.getElementById('toast');
+                toast.classList.add('visible');
+                setTimeout(() => toast.classList.remove('visible'), 3000);
+            }
+        } catch (e) {
+            alert('Failed to save settings: ' + e.message);
+        }
+    }
+
+    async function restartDiscovery() {
+        if (!confirm("This will clear existing discovery results and restart the discovery period. Continue?")) return;
+
+        try {
+            const res = await fetch('/api/discovery/restart', { method: 'POST' });
+            if (!res.ok) throw new Error("Failed to restart discovery");
+
+            const toast = document.getElementById('toast');
+            toast.textContent = "Discovery restarted!";
+            toast.style.background = "var(--success)";
+            toast.classList.add('visible');
+            setTimeout(() => {
+                toast.classList.remove('visible');
+                toast.textContent = "Settings saved!"; // reset text
+                toast.style.background = "var(--accent)"; // reset background
+            }, 3000);
+
+            // Wait a moment then reload settings to reflect new state
+            setTimeout(() => {
+                loadSettings();
+            }, 500);
+        } catch (e) {
+            alert('Error: ' + e.message);
+        }
+    }
+
+    // Navigation and Toggling
+    function filterCategory(categoryName) {
+        document.querySelectorAll('.tab-btn').forEach(btn => {
+            if (btn.innerText.toLowerCase() === categoryName.toLowerCase()) {
+                btn.classList.add('active');
+            } else {
+                btn.classList.remove('active');
+            }
+        });
+
+        document.querySelectorAll('.settings-section').forEach(section => {
+            if (categoryName === 'all' || section.dataset.category === categoryName) {
+                section.style.display = 'block';
+            } else {
+                section.style.display = 'none';
+            }
+        });
+    }
+
+    function toggleSection(headerEl) {
+        const section = headerEl.parentElement;
+        section.classList.toggle('collapsed');
+    }
+
+    // Warn before leaving with unsaved changes
+    window.addEventListener('beforeunload', (e) => {
+        if (hasChanges) {
+            e.preventDefault();
+            e.returnValue = '';
+        }
+    });
+
+    // Initialize layout defaults
+    document.addEventListener('DOMContentLoaded', () => {
+        loadSettings();
+        filterCategory('general');
+    });
+</script>
+{% endblock %}

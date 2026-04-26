@@ -1,0 +1,324 @@
+{% extends "base.html" %}
+
+{% block body_class %}dashboard{% endblock %}
+
+{% block head %}
+<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+{% endblock %}
+
+{% block header_extra %}
+<div id="baselineDisplay" class="baseline-display" style="display: none;">
+    <span id="baselineText" class="baseline-text"></span>
+</div>
+{% endblock %}
+
+{% block content %}
+<!-- Dashboard Controls -->
+<div class="settings-section" style="padding: 15px 25px; display: flex; align-items: center; gap: 15px; margin-bottom: 25px;">
+    <span style="font-weight: 500; color: var(--text-secondary);">Scanner Controls:</span>
+    <button id="scanBtn" class="btn" onclick="startScan()" style="background: var(--text-primary); color: var(--bg-primary); border-color: var(--text-primary);">Start Scan</button>
+    <button id="restartBtn" class="btn" onclick="restartScan()" style="display: none; background: transparent; border-color: var(--border);">Restart</button>
+    <button id="pauseBtn" class="btn" onclick="pauseScan()" style="display: none; background: #f59e0b; color: #fff; border-color: #f59e0b;">Pause</button>
+    <button id="stopBtn" class="btn" onclick="stopScan()" style="display: none; background: #ef4444; color: #fff; border-color: #ef4444;">Stop</button>
+</div>
+
+<div class="status-bar">
+    <div class="status-group">
+        <div class="status-item">
+            <span class="status-label">Status:</span>
+            <span id="scanStatus" class="status-value">Idle</span>
+        </div>
+        <div class="status-item">
+            <span class="status-label">Progress:</span>
+            <span id="scanProgress" class="status-value">-</span>
+        </div>
+        <div class="status-item">
+            <span class="status-label">Next Scan:</span>
+            <span id="nextScan" class="countdown">--:--</span>
+        </div>
+    </div>
+</div>
+
+<div id="progressContainer" style="display: none;">
+    <div class="progress-bar">
+        <div id="progressFill" class="progress-fill" style="width: 0%"></div>
+    </div>
+</div>
+
+<!-- Results Summary -->
+<div id="resultsSummary" class="results-summary">
+    <div class="summary-card">
+        <div id="summaryServers" class="summary-value">0</div>
+        <div class="summary-label">Total Servers</div>
+    </div>
+    <div class="summary-card success">
+        <div id="summaryClean" class="summary-value">0</div>
+        <div class="summary-label">Clean Servers</div>
+    </div>
+    <div class="summary-card danger">
+        <div id="summaryBlocked" class="summary-value">0</div>
+        <div class="summary-label">Blocked Servers</div>
+    </div>
+    <div class="summary-card">
+        <div id="summaryIPs" class="summary-value">0</div>
+        <div class="summary-label">IPs Scanned</div>
+    </div>
+</div>
+
+<!-- Imported Metrics (Charts) -->
+<div style="display: flex; justify-content: space-between; align-items: center; margin-top: 25px;">
+    <h2 style="font-size: 1.25rem; font-family: 'Outfit', sans-serif; color: var(--text-primary); margin: 0;">Performance History</h2>
+    <select id="timeframeSelect" style="width: 150px; background: rgba(255,255,255,0.05); color: var(--text-primary); border: 1px solid var(--border); border-radius: 6px; padding: 6px 12px; cursor: pointer; outline: none;" onchange="renderCharts()">
+        <option value="latest">Latest Scan</option>
+        <option value="72">Last 3 Days</option>
+        <option value="168">Last 7 Days</option>
+        <option value="720">Last 30 Days</option>
+        <option value="all">All Time</option>
+    </select>
+</div>
+
+<div class="charts-grid" style="margin-top: 15px;">
+    <div class="chart-card">
+        <h3>⚡ Speedtest Results</h3>
+        <div class="chart-container" id="speedtestChartContainer">
+            <canvas id="speedtestChart"></canvas>
+        </div>
+    </div>
+
+    <div class="chart-card">
+        <h3>⏱️ Ping Latency</h3>
+        <div class="chart-container" id="pingChartContainer">
+            <canvas id="pingChart"></canvas>
+        </div>
+    </div>
+</div>
+
+<!-- Top Servers Recommendation -->
+<div style="margin-top: 15px;">
+    <div id="topServersGrid" class="results-summary" style="grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));">
+        <p class="setting-description" style="grid-column: 1/-1; text-align:center;">Run a scan to see recommendations.</p>
+    </div>
+    <div id="serverDetailPanel" style="display:none; margin-top: 15px;"></div>
+</div>
+
+<div class="empty-state" id="emptyState" style="display: none; margin-top: 25px;">
+    <p>Run a scan to start collecting metrics data.</p>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script src="/static/js/app.js"></script>
+<script>
+    let speedtestChart, pingChart;
+    Chart.defaults.color = '#6b7280';
+    Chart.defaults.borderColor = '#1f1f1f';
+
+    function getFlagEmoji(cc) {
+        if (!cc) return '';
+        return String.fromCodePoint(...[...cc.toUpperCase()].map(c => 0x1F1E6 - 65 + c.charCodeAt(0)));
+    }
+
+    let rawSpeedtestHistory = [];
+
+    async function loadMetrics() {
+        try {
+            const response = await fetch('/api/metrics');
+            const data = await response.json();
+
+            if (data.scan_history.length === 0 && data.speedtest_history.length === 0) {
+                document.getElementById('emptyState').style.display = 'block';
+                return;
+            } else {
+                document.getElementById('emptyState').style.display = 'none';
+            }
+
+            rawSpeedtestHistory = data.speedtest_history || [];
+            renderCharts();
+
+        } catch (e) {
+            console.error('Failed to load metrics:', e);
+        }
+    }
+
+    function renderCharts() {
+        if (!rawSpeedtestHistory || rawSpeedtestHistory.length === 0) return;
+
+        const tfVal = document.getElementById('timeframeSelect').value;
+        let recent = rawSpeedtestHistory;
+
+        if (tfVal === 'latest') {
+            const maxScanId = Math.max(...rawSpeedtestHistory.map(d => d.scan_id || 0));
+            if (maxScanId > 0) {
+                recent = rawSpeedtestHistory.filter(d => d.scan_id === maxScanId);
+            } else {
+                // Fallback dynamically mapped to the last 24 block structure if IDs decay
+                const cutoff = new Date(Date.now() - 24 * 60 * 60 * 1000);
+                recent = rawSpeedtestHistory.filter(d => new Date(d.timestamp) >= cutoff);
+            }
+        } else if (tfVal !== 'all') {
+            const hours = parseInt(tfVal);
+            const cutoff = new Date(Date.now() - hours * 60 * 60 * 1000);
+            recent = rawSpeedtestHistory.filter(d => new Date(d.timestamp) >= cutoff);
+        }
+
+        if (recent.length > 0) {
+            const mapLabels = (arr) => arr.map(d => {
+                let name = (d.vpn_server_name || d.server_name || '').replace(/AirVPN /g, '');
+                const cc = d.vpn_country_code || '';
+                const flag = cc ? getFlagEmoji(cc) + ' ' : '';
+                if (d.vpn_entry) {
+                    const eStr = d.vpn_entry.replace('Entry ', 'E');
+                    name += ` (${eStr})`;
+                }
+                return flag + name;
+            });
+
+            const sLabels = mapLabels(recent);
+
+            const tooltipPlugin = {
+                tooltip: {
+                    callbacks: {
+                        afterLabel: function(context) {
+                            const port = recent[context.dataIndex]?.vpn_port;
+                            return port ? `Port: ${port}` : null;
+                        }
+                    }
+                }
+            };
+
+            if (speedtestChart) speedtestChart.destroy();
+            speedtestChart = new Chart(document.getElementById('speedtestChart'), {
+                type: 'bar',
+                data: {
+                    labels: sLabels,
+                    datasets: [
+                        { label: 'Download (Mbps)', data: recent.map(d => d.download_mbps), backgroundColor: '#06b6d4' },
+                        { label: 'Upload (Mbps)', data: recent.map(d => d.upload_mbps), backgroundColor: '#8b5cf6' }
+                    ]
+                },
+                options: { responsive: true, maintainAspectRatio: false, plugins: tooltipPlugin }
+            });
+
+            if (pingChart) pingChart.destroy();
+            pingChart = new Chart(document.getElementById('pingChart'), {
+                type: 'line',
+                data: {
+                    labels: sLabels,
+                    datasets: [{ label: 'Ping (ms)', data: recent.map(d => d.ping_ms), borderColor: '#f59e0b', backgroundColor: 'rgba(245, 158, 11, 0.1)', fill: true, tension: 0.3 }]
+                },
+                options: { responsive: true, maintainAspectRatio: false, plugins: tooltipPlugin }
+            });
+        } else {
+            if (speedtestChart) speedtestChart.destroy();
+            if (pingChart) pingChart.destroy();
+        }
+    }
+
+    let _topServerData = [];
+
+    async function loadTopServers() {
+        try {
+            const response = await fetch('/api/servers');
+            const data = await response.json();
+            const grid = document.getElementById('topServersGrid');
+
+            const allServers = [];
+            (data.countries || []).forEach(country => {
+                (country.servers || []).forEach(s => {
+                    s._country_code = country.country_code;
+                    s._country_name = country.country_name;
+                    allServers.push(s);
+                });
+            });
+
+            const ranked = allServers
+                .filter(s => s.is_clean && s.score > 0)
+                .sort((a, b) => b.score - a.score)
+                .slice(0, 4);
+
+            _topServerData = ranked;
+
+            if (ranked.length === 0) {
+                grid.innerHTML = '<p class="setting-description" style="grid-column:1/-1;text-align:center;">No scored servers yet. Run a scan to see recommendations.</p>';
+                return;
+            }
+
+            grid.innerHTML = ranked.map((s, i) => {
+                const flag = getFlagEmoji(s._country_code);
+                const name = (s.server_name || '').replace(/AirVPN /g, '');
+                const e1 = s.entry1_ping && s.entry1_ping.latency_ms != null ? s.entry1_ping.latency_ms : null;
+                const e3 = s.entry3_ping && s.entry3_ping.latency_ms != null ? s.entry3_ping.latency_ms : null;
+                const pings = [e1, e3].filter(v => v != null);
+                const bestPing = pings.length ? Math.min(...pings).toFixed(1) + ' ms' : '--';
+                const ul = s.speedtest && s.speedtest.upload_mbps ? s.speedtest.upload_mbps.toFixed(1) + ' Mbps' : '--';
+                const dl = s.speedtest && s.speedtest.download_mbps ? s.speedtest.download_mbps.toFixed(1) + ' Mbps' : '--';
+                const score = s.score != null ? s.score.toFixed(1) : '--';
+                return `
+                    <div class="summary-card success" style="padding: 18px; text-align: left; cursor: pointer;" onclick="showServerDetail(${i})">
+                        <div style="font-size: 1.3rem; font-weight: bold; margin-bottom: 8px;">${flag} ${name}</div>
+                        <div style="display: flex; flex-direction: column; gap: 4px; font-size: 0.85rem; color: var(--text-secondary);">
+                            <span>⏱️ Ping: <strong style="color:var(--text-primary)">${bestPing}</strong></span>
+                            <span>⬆️ Upload: <strong style="color:var(--text-primary)">${ul}</strong></span>
+                            <span>⬇️ Download: <strong style="color:var(--text-primary)">${dl}</strong></span>
+                            <span>⭐ Score: <strong style="color:var(--accent)">${score}</strong></span>
+                        </div>
+                    </div>
+                `;
+            }).join('');
+
+        } catch (e) {
+            console.error('Failed to load top servers:', e);
+        }
+    }
+
+    function showServerDetail(index) {
+        const s = _topServerData[index];
+        if (!s) return;
+        const panel = document.getElementById('serverDetailPanel');
+        const flag = getFlagEmoji(s._country_code);
+        const name = (s.server_name || '').replace(/AirVPN /g, '');
+
+        const e1 = s.entry1_ping ? (s.entry1_ping.latency_ms != null ? s.entry1_ping.latency_ms.toFixed(1) + ' ms' : 'unreachable') : 'N/A';
+        const e3 = s.entry3_ping ? (s.entry3_ping.latency_ms != null ? s.entry3_ping.latency_ms.toFixed(1) + ' ms' : 'unreachable') : 'N/A';
+        const exit = s.exit_ping ? (s.exit_ping.latency_ms != null ? s.exit_ping.latency_ms.toFixed(1) + ' ms' : 'unreachable') : 'N/A';
+        const stPing = s.speedtest && s.speedtest.ping_ms != null ? s.speedtest.ping_ms.toFixed(1) + ' ms' : '--';
+        const ul = s.speedtest && s.speedtest.upload_mbps ? s.speedtest.upload_mbps.toFixed(1) + ' Mbps' : '--';
+        const dl = s.speedtest && s.speedtest.download_mbps ? s.speedtest.download_mbps.toFixed(1) + ' Mbps' : '--';
+        const dev = s.speedtest && s.speedtest.deviation_score != null ? s.speedtest.deviation_score.toFixed(1) + '%' : '--';
+        const load = s.load_percent != null ? s.load_percent + '%' : '--';
+
+        panel.style.display = 'block';
+        panel.innerHTML = `
+            <div class="settings-section" style="padding: 20px;">
+                <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:15px;">
+                    <h3 style="margin:0;color:var(--accent);">${flag} ${name}</h3>
+                    <button class="btn btn-secondary" style="padding:4px 12px;" onclick="document.getElementById('serverDetailPanel').style.display='none'">✕</button>
+                </div>
+                <div style="display:grid;grid-template-columns:repeat(5,1fr);gap:10px;">
+                    <div class="summary-card" style="padding:10px;"><div class="summary-label">Entry 1 Ping</div><div class="summary-value" style="font-size:1.1rem;">${e1}</div></div>
+                    <div class="summary-card" style="padding:10px;"><div class="summary-label">Exit Ping</div><div class="summary-value" style="font-size:1.1rem;">${exit}</div></div>
+                    <div class="summary-card" style="padding:10px;"><div class="summary-label">Upload</div><div class="summary-value" style="font-size:1.1rem;">${ul}</div></div>
+                    <div class="summary-card" style="padding:10px;"><div class="summary-label">Deviation</div><div class="summary-value" style="font-size:1.1rem;">${dev}</div></div>
+                    <div class="summary-card" style="padding:10px;"><div class="summary-label">Load</div><div class="summary-value" style="font-size:1.1rem;">${load}</div></div>
+                    <div class="summary-card" style="padding:10px;"><div class="summary-label">Entry 3 Ping</div><div class="summary-value" style="font-size:1.1rem;">${e3}</div></div>
+                    <div class="summary-card" style="padding:10px;"><div class="summary-label">Speedtest Ping</div><div class="summary-value" style="font-size:1.1rem;">${stPing}</div></div>
+                    <div class="summary-card" style="padding:10px;"><div class="summary-label">Download</div><div class="summary-value" style="font-size:1.1rem;">${dl}</div></div>
+                    <div style="padding:10px;"></div>
+                    <div class="summary-card" style="padding:10px;"><div class="summary-label">Score</div><div class="summary-value" style="font-size:1.1rem;color:var(--accent);">${s.score != null ? s.score.toFixed(1) : '--'}</div></div>
+                </div>
+            </div>
+        `;
+        panel.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+    }
+
+    // Load once on page load
+    loadMetrics();
+    loadTopServers();
+
+    // Refresh when a scan finishes (via WebSocket event from app.js)
+    window.onScanComplete = function() {
+        loadMetrics();
+        loadTopServers();
+    };
+</script>
+{% endblock %}

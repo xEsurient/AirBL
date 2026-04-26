@@ -1,0 +1,336 @@
+{% extends "base.html" %}
+
+{% block body_class %}metrics{% endblock %}
+
+{% block page_title %}Advanced Historic Metrics{% endblock %}
+
+{% block head %}
+<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+{% endblock %}
+
+{% block content %}
+<div class="category-tabs" id="metricsTabs">
+    <button class="tab-btn active" onclick="filterMetrics('all')">ALL</button>
+    <button class="tab-btn" onclick="filterMetrics('ping')">PING</button>
+    <button class="tab-btn" onclick="filterMetrics('servers')">SERVERS</button>
+    <button class="tab-btn" onclick="filterMetrics('wireguard')">WIREGUARD</button>
+    <button class="tab-btn" onclick="filterMetrics('averages')">AVERAGES</button>
+</div>
+
+<!-- Avg Entry Ping by Country -->
+<div class="chart-card" data-metric-category="ping" style="margin-bottom: 30px;">
+    <h3>🌐 Average Entry Ping by Country</h3>
+    <div class="chart-container" id="pingCountryChartContainer" style="min-height: 350px;">
+        <canvas id="pingCountryChart"></canvas>
+    </div>
+</div>
+
+<!-- Server Status by Country -->
+<div class="chart-card" data-metric-category="servers" style="margin-bottom: 30px;">
+    <h3>🌍 Server Status by Country</h3>
+    <div class="chart-container" id="metricsCountryChartContainer" style="min-height: 350px;">
+        <canvas id="metricsCountryChart"></canvas>
+    </div>
+</div>
+
+<!-- Entry Ping by Server -->
+<div class="chart-card" data-metric-category="ping" style="margin-bottom: 30px;">
+    <h3>📡 Entry Ping by Server</h3>
+    <div class="chart-container" id="pingServerChartContainer" style="min-height: 400px;">
+        <canvas id="pingServerChart"></canvas>
+    </div>
+</div>
+
+
+<!-- Ban Frequency -->
+<div class="chart-card" data-metric-category="servers" style="margin-bottom: 30px;">
+    <h3>🚫 Ban Frequency by Server</h3>
+    <div class="chart-container" id="banHistoryChartContainer" style="min-height: 350px;">
+        <canvas id="banHistoryChart"></canvas>
+        <p id="banHistoryPlaceholder" class="setting-description" style="text-align:center; padding: 40px 0; display: none;">No ban data recorded yet. Run a few scans to see patterns.</p>
+    </div>
+</div>
+
+<!-- WireGuard Discovery Performance -->
+<div class="chart-card" data-metric-category="wireguard" style="margin-bottom: 30px;">
+    <h3>🔒 WireGuard Port Performance</h3>
+    <div class="chart-container" id="wgPortChartContainer" style="min-height: 350px;">
+        <canvas id="wgPortChart"></canvas>
+        <p id="wgPortPlaceholder" class="setting-description" style="text-align:center; padding: 40px 0;">No WireGuard port performance data yet. Run a scan with port discovery enabled.</p>
+    </div>
+</div>
+
+<div class="chart-card" data-metric-category="wireguard" style="margin-bottom: 30px;">
+    <h3>🔒 WireGuard Entry IP Performance</h3>
+    <div class="chart-container" id="wgEntryChartContainer" style="min-height: 350px;">
+        <canvas id="wgEntryChart"></canvas>
+        <p id="wgEntryPlaceholder" class="setting-description" style="text-align:center; padding: 40px 0;">No WireGuard entry IP performance data yet. Run a scan with port discovery enabled.</p>
+    </div>
+</div>
+
+<div class="status-bar" data-metric-category="averages" style="margin-bottom: 25px;">
+    <p style="color: var(--text-secondary); margin: 0;">Long-term averages for server availability across the DroneBL infrastructure. Averages are calculated dynamically based on total scans recorded over the specified period.</p>
+</div>
+
+<div id="metricsContainer" data-metric-category="averages">
+    <!-- Rendered by JS -->
+</div>
+
+{% endblock %}
+
+{% block scripts %}
+<script>
+    let metricsCountryChart, pingCountryChart, pingServerChart, banHistoryChart, wgPortChart, wgEntryChart;
+    Chart.defaults.color = '#6b7280';
+    Chart.defaults.borderColor = '#1f1f1f';
+
+    function filterMetrics(category) {
+        document.querySelectorAll('#metricsTabs .tab-btn').forEach(btn => {
+            btn.classList.remove('active');
+        });
+        event.target.classList.add('active');
+
+        document.querySelectorAll('[data-metric-category]').forEach(el => {
+            if (category === 'all' || el.dataset.metricCategory === category) {
+                el.style.display = '';
+            } else {
+                el.style.display = 'none';
+            }
+        });
+    }
+
+    async function loadAdvancedMetrics() {
+        try {
+            // Load server status over time chart
+            const metricsRes = await fetch('/api/metrics');
+            const metricsData = await metricsRes.json();
+
+            // Country-grouped stacked bar chart
+            if (metricsData.country_stats && metricsData.country_stats.length > 0) {
+                const countryLabels = metricsData.country_stats.map(c => c.country_code);
+                if (metricsCountryChart) metricsCountryChart.destroy();
+                metricsCountryChart = new Chart(document.getElementById('metricsCountryChart'), {
+                    type: 'bar',
+                    data: {
+                        labels: countryLabels,
+                        datasets: [
+                            { label: 'Clean', data: metricsData.country_stats.map(c => c.clean), backgroundColor: '#10b981' },
+                            { label: 'Blocked', data: metricsData.country_stats.map(c => c.blocked), backgroundColor: '#ef4444' },
+                            { label: 'Disabled', data: metricsData.country_stats.map(c => c.disabled), backgroundColor: '#f59e0b' }
+                        ]
+                    },
+                    options: {
+                        responsive: true,
+                        maintainAspectRatio: false,
+                        scales: { x: { stacked: true }, y: { stacked: true, beginAtZero: true } },
+                        plugins: { legend: { position: 'top' } }
+                    }
+                });
+            }
+
+            // Average Entry Ping by Country
+            if (metricsData.ping_by_country && metricsData.ping_by_country.length > 0) {
+                const pbc = metricsData.ping_by_country.filter(c => c.avg_entry1 != null || c.avg_entry3 != null);
+                if (pbc.length > 0) {
+                    if (pingCountryChart) pingCountryChart.destroy();
+                    pingCountryChart = new Chart(document.getElementById('pingCountryChart'), {
+                        type: 'bar',
+                        data: {
+                            labels: pbc.map(c => c.country_code),
+                            datasets: [
+                                { label: 'Entry 1 Avg (ms)', data: pbc.map(c => c.avg_entry1), backgroundColor: '#06b6d4' },
+                                { label: 'Entry 3 Avg (ms)', data: pbc.map(c => c.avg_entry3), backgroundColor: '#8b5cf6' }
+                            ]
+                        },
+                        options: {
+                            responsive: true,
+                            maintainAspectRatio: false,
+                            scales: { y: { beginAtZero: true, title: { display: true, text: 'ms' } } },
+                            plugins: { legend: { position: 'top' } }
+                        }
+                    });
+                }
+            }
+
+            // Entry Ping per Server
+            if (metricsData.ping_by_server && metricsData.ping_by_server.length > 0) {
+                const pbs = metricsData.ping_by_server.filter(s => s.entry1_ping != null || s.entry3_ping != null);
+                if (pbs.length > 0) {
+                    if (pingServerChart) pingServerChart.destroy();
+                    pingServerChart = new Chart(document.getElementById('pingServerChart'), {
+                        type: 'bar',
+                        data: {
+                            labels: pbs.map(s => s.server_name),
+                            datasets: [
+                                { label: 'Entry 1 (ms)', data: pbs.map(s => s.entry1_ping), backgroundColor: '#06b6d4' },
+                                { label: 'Entry 3 (ms)', data: pbs.map(s => s.entry3_ping), backgroundColor: '#8b5cf6' }
+                            ]
+                        },
+                        options: {
+                            responsive: true,
+                            maintainAspectRatio: false,
+                            indexAxis: 'y',
+                            scales: { x: { beginAtZero: true, title: { display: true, text: 'ms' } } },
+                            plugins: { legend: { position: 'top' } }
+                        }
+                    });
+                }
+            }
+
+            // Ban Frequency chart
+            if (metricsData.ban_history && metricsData.ban_history.length > 0) {
+                const bh = metricsData.ban_history.slice(0, 30); // Top 30
+                document.getElementById('banHistoryPlaceholder').style.display = 'none';
+                if (banHistoryChart) banHistoryChart.destroy();
+                banHistoryChart = new Chart(document.getElementById('banHistoryChart'), {
+                    type: 'bar',
+                    data: {
+                        labels: bh.map(s => s.server_name),
+                        datasets: [{
+                            label: 'Times Banned',
+                            data: bh.map(s => s.ban_count),
+                            backgroundColor: bh.map((_, i) => `rgba(239, 68, 68, ${0.4 + (0.6 * (1 - i / bh.length))})`),
+                            borderColor: '#ef4444',
+                            borderWidth: 1
+                        }]
+                    },
+                    options: {
+                        responsive: true,
+                        maintainAspectRatio: false,
+                        indexAxis: 'y',
+                        scales: { x: { beginAtZero: true, title: { display: true, text: 'Ban Count' } } },
+                        plugins: { legend: { display: false } }
+                    }
+                });
+            } else {
+                document.getElementById('banHistoryPlaceholder').style.display = '';
+            }
+
+            // --- WireGuard Discovery Charts ---
+            try {
+                const settingsRes = await fetch('/api/settings');
+                const settingsData = await settingsRes.json();
+                const discoveryResults = settingsData.port_discovery_results || {};
+                const entries = Object.entries(discoveryResults);
+
+                if (entries.length > 0) {
+                    // Group by port and by entry
+                    const byPort = {};  // port -> {download, upload, ping, count}
+                    const byEntry = {}; // "E1"/"E3" -> {download, upload, ping, count}
+
+                    entries.forEach(([key, val]) => {
+                        const parts = key.split('_'); // e.g. "47107_E3"
+                        const port = parts[0];
+                        const entry = parts[1] || key;
+
+                        if (!byPort[port]) byPort[port] = { dl: 0, ul: 0, ping: 0, n: 0 };
+                        byPort[port].dl += val.download_mbps || 0;
+                        byPort[port].ul += val.upload_mbps || 0;
+                        byPort[port].ping += val.ping_ms || 0;
+                        byPort[port].n += 1;
+
+                        if (!byEntry[entry]) byEntry[entry] = { dl: 0, ul: 0, ping: 0, n: 0 };
+                        byEntry[entry].dl += val.download_mbps || 0;
+                        byEntry[entry].ul += val.upload_mbps || 0;
+                        byEntry[entry].ping += val.ping_ms || 0;
+                        byEntry[entry].n += 1;
+                    });
+
+                    // Port chart
+                    const portLabels = Object.keys(byPort).sort();
+                    document.getElementById('wgPortPlaceholder').style.display = 'none';
+                    if (wgPortChart) wgPortChart.destroy();
+                    wgPortChart = new Chart(document.getElementById('wgPortChart'), {
+                        type: 'bar',
+                        data: {
+                            labels: portLabels.map(p => `Port ${p}`),
+                            datasets: [
+                                { label: 'Avg Download (Mbps)', data: portLabels.map(p => +(byPort[p].dl / byPort[p].n).toFixed(1)), backgroundColor: '#10b981' },
+                                { label: 'Avg Upload (Mbps)', data: portLabels.map(p => +(byPort[p].ul / byPort[p].n).toFixed(1)), backgroundColor: '#38bdf8' },
+                                { label: 'Avg Ping (ms)', data: portLabels.map(p => +(byPort[p].ping / byPort[p].n).toFixed(1)), backgroundColor: '#f59e0b' }
+                            ]
+                        },
+                        options: {
+                            responsive: true,
+                            maintainAspectRatio: false,
+                            scales: { y: { beginAtZero: true } },
+                            plugins: { legend: { position: 'top' } }
+                        }
+                    });
+
+                    // Entry chart
+                    const entryLabels = Object.keys(byEntry).sort();
+                    document.getElementById('wgEntryPlaceholder').style.display = 'none';
+                    if (wgEntryChart) wgEntryChart.destroy();
+                    wgEntryChart = new Chart(document.getElementById('wgEntryChart'), {
+                        type: 'bar',
+                        data: {
+                            labels: entryLabels.map(e => e.replace('E', 'Entry ')),
+                            datasets: [
+                                { label: 'Avg Download (Mbps)', data: entryLabels.map(e => +(byEntry[e].dl / byEntry[e].n).toFixed(1)), backgroundColor: '#10b981' },
+                                { label: 'Avg Upload (Mbps)', data: entryLabels.map(e => +(byEntry[e].ul / byEntry[e].n).toFixed(1)), backgroundColor: '#38bdf8' },
+                                { label: 'Avg Ping (ms)', data: entryLabels.map(e => +(byEntry[e].ping / byEntry[e].n).toFixed(1)), backgroundColor: '#f59e0b' }
+                            ]
+                        },
+                        options: {
+                            responsive: true,
+                            maintainAspectRatio: false,
+                            scales: { y: { beginAtZero: true } },
+                            plugins: { legend: { position: 'top' } }
+                        }
+                    });
+                }
+            } catch (wgErr) {
+                console.error('Failed to load WireGuard discovery charts:', wgErr);
+            }
+
+            // Load advanced period-based averages
+            const response = await fetch('/api/metrics/advanced');
+            const data = await response.json();
+            
+            const container = document.getElementById('metricsContainer');
+            container.innerHTML = '';
+            
+            const periods = [
+                { key: '7d', title: 'Last 7 Days', desc: 'Short-term rolling averages' },
+                { key: '30d', title: 'Last 30 Days', desc: 'Monthly rolling averages' },
+                { key: '180d', title: 'Last 6 Months', desc: 'Long-term rolling averages' }
+            ];
+            
+            periods.forEach(p => {
+                const metrics = data[p.key] || { total_scans: 0, avg_clean: 0, avg_blocked: 0 };
+                
+                const section = document.createElement('div');
+                section.className = 'settings-section';
+                section.style.marginBottom = '30px';
+                
+                section.innerHTML = `
+                    <div style="margin-bottom: 20px; padding-bottom: 15px; border-bottom: 1px solid var(--border);">
+                        <h2 style="margin: 0; color: var(--accent); font-size: 1.25rem;">${p.title}</h2>
+                        <span style="color: var(--text-secondary); font-size: 0.9rem;">${p.desc} (${metrics.total_scans} scans recorded)</span>
+                    </div>
+                    
+                    <div class="stats-grid" style="display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 20px;">
+                        <div class="summary-card success" style="padding: 25px;">
+                            <div class="summary-value" style="font-size: 2.5rem; text-align: center;">${metrics.avg_clean}</div>
+                            <div class="summary-label" style="text-align: center;">Average Clean Servers</div>
+                        </div>
+                        
+                        <div class="summary-card danger" style="padding: 25px;">
+                            <div class="summary-value" style="font-size: 2.5rem; text-align: center;">${metrics.avg_blocked}</div>
+                            <div class="summary-label" style="text-align: center;">Average Blocked Servers</div>
+                        </div>
+                    </div>
+                `;
+                container.appendChild(section);
+            });
+            
+        } catch(e) {
+            console.error('Failed to load advanced metrics:', e);
+            document.getElementById('metricsContainer').innerHTML = '<div style="color: var(--danger); padding: 20px;">Failed to load historic metrics.</div>';
+        }
+    }
+    
+    loadAdvancedMetrics();
+</script>
+{% endblock %}

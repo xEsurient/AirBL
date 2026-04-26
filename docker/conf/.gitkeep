@@ -1,0 +1,16 @@
+# Place your AirVPN WireGuard .conf files here
+# 
+# Expected naming convention:
+# AirVPN_AT-Vienna_Alderamin_UDP-1637-Entry3.conf
+#
+# The filename is parsed to extract:
+# - Country code (AT)
+# - City (Vienna)
+# - Server name (Alderamin)
+# - Protocol (UDP)
+# - Port (1637)
+# - Entry number (3)
+#
+# US servers are filtered to only include East Coast/Midwest locations
+# (closer to Europe): New York, Chicago, Dallas, Atlanta, Washington DC
+
