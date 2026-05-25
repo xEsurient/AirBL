@@ -7,6 +7,8 @@
 </div>
 
 ---
+> [!NOTE]  
+> This readme was AI generated (excluding the header!), whilst the information has been proofchecked, it looks like crap and is an info dump at the end of the day, hopefully I can condense this in the future but readme files are not my strong suit.
 
 **AirBL** is a comprehensive toolkit designed to optimize your AirVPN connections. It continuously scans AirVPN infrastructure, drops unresponsive or DroneBL-blacklisted endpoints, performs speed and latency tests, and actively generates routing configurations for your local network—all controlled through a beautiful, glassmorphism web dashboard.
 
