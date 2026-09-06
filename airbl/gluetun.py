@@ -118,7 +118,7 @@ async def generate_gluetun_servers_json():
                     "country": server.country_name,
                     "region": region_str,
                     "city": server.location,
-                    "server_name": server.server_name,
+                    "name": server.server_name,
                     "hostname": f"{server.country_code.lower()}.vpn.airdns.org",
                     "wgpubkey": server.wg_pubkey or WG_PUBKEY,
                     "ips": [ip]
@@ -128,7 +128,7 @@ async def generate_gluetun_servers_json():
         
         # Wrapping into expected root framework
         custom_data = {
-            "version": 1,
+            "version": 2,
             "airvpn": {
                 "version": 1,
                 "timestamp": int(time.time()),
