@@ -138,8 +138,15 @@ async def generate_gluetun_servers_json():
         
         try:
             output_path.parent.mkdir(parents=True, exist_ok=True)
-            with open(output_path, 'w', encoding='utf-8') as f:
+            
+            temp_path = output_path.with_suffix('.tmp')
+            with open(temp_path, 'w', encoding='utf-8') as f:
                 json.dump(custom_data, f, indent=2)
+                f.flush()
+                import os
+                os.fsync(f.fileno())
+                
+            temp_path.replace(output_path)
             logger.info(f"Successfully generated offline Gluetun servers.json to {output_path}")
         except Exception as e:
             logger.error(f"Error persisting native Gluetun generation for '{profile.name}': {e}")
