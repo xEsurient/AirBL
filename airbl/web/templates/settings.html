@@ -34,11 +34,50 @@
 
         <div class="setting-row">
             <div class="setting-info">
+                <div class="setting-label">Scan Mode</div>
+                <div class="setting-description">How should automatic scans be triggered?</div>
+            </div>
+            <div class="setting-control">
+                <select id="scanMode" onchange="toggleScanModeUI(); markChanged()" style="padding: 6px 10px;">
+                    <option value="interval">Interval (Minutes)</option>
+                    <option value="schedule">Daily Schedule</option>
+                </select>
+            </div>
+        </div>
+
+        <div class="setting-row" id="rowScanInterval">
+            <div class="setting-info">
                 <div class="setting-label">Scan Interval</div>
                 <div class="setting-description">Time between automatic scans (minutes)</div>
             </div>
             <div class="setting-control">
                 <input type="number" id="scanInterval" min="5" max="1440" value="120" onchange="markChanged()">
+            </div>
+        </div>
+        
+        <div class="setting-row" id="rowScanScheduleTime" style="display: none;">
+            <div class="setting-info">
+                <div class="setting-label">Scheduled Time</div>
+                <div class="setting-description">Time of day to run the scan (local time)</div>
+            </div>
+            <div class="setting-control">
+                <input type="time" id="scanScheduleTime" value="20:00" onchange="markChanged()" style="padding: 6px 10px;">
+            </div>
+        </div>
+        
+        <div class="setting-row" id="rowScanScheduleDays" style="display: none; align-items: flex-start;">
+            <div class="setting-info">
+                <div class="setting-label">Scheduled Days</div>
+                <div class="setting-description">Days of the week to run the scheduled scan</div>
+            </div>
+            <div class="setting-control" style="display: flex; flex-wrap: wrap; gap: 8px; justify-content: flex-end; max-width: 300px;">
+                <label><input type="checkbox" name="schedDay" value="Mon" onchange="markChanged()"> Mon</label>
+                <label><input type="checkbox" name="schedDay" value="Tue" onchange="markChanged()"> Tue</label>
+                <label><input type="checkbox" name="schedDay" value="Wed" onchange="markChanged()"> Wed</label>
+                <label><input type="checkbox" name="schedDay" value="Thu" onchange="markChanged()"> Thu</label>
+                <label><input type="checkbox" name="schedDay" value="Fri" onchange="markChanged()"> Fri</label>
+                <label><input type="checkbox" name="schedDay" value="Sat" onchange="markChanged()"> Sat</label>
+                <label><input type="checkbox" name="schedDay" value="Sun" onchange="markChanged()"> Sun</label>
             </div>
         </div>
 
@@ -523,7 +562,15 @@
             autoScanEl.checked = Boolean(data.auto_scan_enabled);
             autoScanEl.dispatchEvent(new Event('change')); // Trigger visual update
 
+            document.getElementById('scanMode').value = data.scan_mode || 'interval';
             document.getElementById('scanInterval').value = data.scan_interval_minutes;
+            document.getElementById('scanScheduleTime').value = data.scan_schedule_time || '20:00';
+            
+            const schedDays = data.scan_schedule_days || ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
+            document.querySelectorAll('input[name="schedDay"]').forEach(cb => {
+                cb.checked = schedDays.includes(cb.value);
+            });
+            toggleScanModeUI();
 
             speedtestEl.checked = Boolean(data.speedtest_enabled);
             speedtestEl.dispatchEvent(new Event('change')); // Trigger visual update
@@ -1637,7 +1684,14 @@
         autoScanEl.checked = Boolean(originalSettings.auto_scan_enabled);
         autoScanEl.dispatchEvent(new Event('change'));
 
+        document.getElementById('scanMode').value = originalSettings.scan_mode || 'interval';
         document.getElementById('scanInterval').value = originalSettings.scan_interval_minutes;
+        document.getElementById('scanScheduleTime').value = originalSettings.scan_schedule_time || '20:00';
+        const origDays = originalSettings.scan_schedule_days || ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
+        document.querySelectorAll('input[name="schedDay"]').forEach(cb => {
+            cb.checked = origDays.includes(cb.value);
+        });
+        toggleScanModeUI();
 
         speedtestEl.checked = Boolean(originalSettings.speedtest_enabled);
         speedtestEl.dispatchEvent(new Event('change'));
@@ -1702,10 +1756,27 @@
         document.getElementById('saveBar').classList.remove('visible');
     }
 
+    function toggleScanModeUI() {
+        const mode = document.getElementById('scanMode').value;
+        if (mode === 'interval') {
+            document.getElementById('rowScanInterval').style.display = 'flex';
+            document.getElementById('rowScanScheduleTime').style.display = 'none';
+            document.getElementById('rowScanScheduleDays').style.display = 'none';
+        } else {
+            document.getElementById('rowScanInterval').style.display = 'none';
+            document.getElementById('rowScanScheduleTime').style.display = 'flex';
+            document.getElementById('rowScanScheduleDays').style.display = 'flex';
+        }
+    }
+
     async function saveSettings() {
+        const schedDays = Array.from(document.querySelectorAll('input[name="schedDay"]:checked')).map(cb => cb.value);
         const settings = {
             auto_scan_enabled: document.getElementById('autoScan').checked,
+            scan_mode: document.getElementById('scanMode').value,
             scan_interval_minutes: parseInt(document.getElementById('scanInterval').value),
+            scan_schedule_time: document.getElementById('scanScheduleTime').value,
+            scan_schedule_days: schedDays,
             speedtest_enabled: document.getElementById('speedtestEnabled').checked,
             // Port discovery settings
             port_discovery_enabled: document.getElementById('portDiscoveryEnabled').checked,

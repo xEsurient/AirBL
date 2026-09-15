@@ -75,12 +75,50 @@ async def run_server(
     server = uvicorn.Server(config)
     
     # Always start the scan timer loop so it respects dynamic settings changes.
-    # The loop sleeps for the configured interval before checking, so no scan fires on boot.
     async def auto_scan_loop():
+        from datetime import datetime
+        from .tasks import calculate_next_scan_time
+        
         while True:
-            await asyncio.sleep(state.scan_interval_minutes * 60)
-            if state.auto_scan_enabled and not state.is_scanning:
+            # Wait for startup to initialize the event
+            if state.settings_updated_event is None:
+                await asyncio.sleep(1)
+                continue
+                
+            # Clear event in case it was set previously
+            state.settings_updated_event.clear()
+            
+            if not state.auto_scan_enabled or state.is_scanning:
+                # If disabled or currently scanning, wait for setting change or short fallback
+                try:
+                    await asyncio.wait_for(state.settings_updated_event.wait(), timeout=60)
+                except asyncio.TimeoutError:
+                    pass
+                continue
+                
+            from ..config import config_manager
+            scan_cfg = config_manager.config.scan
+            
+            now = datetime.now()
+            if state.next_scan_at is None:
+                state.next_scan_at = calculate_next_scan_time(scan_cfg, now)
+                
+            # How long until next scan?
+            sleep_duration = (state.next_scan_at - datetime.now()).total_seconds()
+            
+            if sleep_duration <= 0:
+                # Time to scan
                 await run_scan_task()
+                continue
+                
+            # Sleep until next scan, but wake up instantly if settings change
+            try:
+                await asyncio.wait_for(state.settings_updated_event.wait(), timeout=sleep_duration)
+                # If we get here, event was set! Recalculate next_scan_at.
+                state.next_scan_at = calculate_next_scan_time(config_manager.config.scan, datetime.now())
+            except asyncio.TimeoutError:
+                # Timeout means sleep completed naturally without interruption. Loop will run the scan.
+                pass
     
     asyncio.create_task(auto_scan_loop())
     

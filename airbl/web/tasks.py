@@ -21,6 +21,41 @@ from ..gluetun import generate_gluetun_servers_json
 logger = logging.getLogger("airbl.web.tasks")
 
 
+def calculate_next_scan_time(scan_cfg, last_scan_time=None) -> datetime:
+    """Calculate the next scheduled scan time based on configuration."""
+    now = datetime.now()
+    if last_scan_time is None:
+        last_scan_time = now
+        
+    mode = getattr(scan_cfg, 'scan_mode', 'interval')
+    if mode == "interval":
+        # Note: If last_scan_time is now (startup), it will wait the full interval
+        return last_scan_time + timedelta(minutes=scan_cfg.scan_interval_minutes)
+    else:
+        scheduled_time = getattr(scan_cfg, 'scan_schedule_time', "20:00")
+        scheduled_days = getattr(scan_cfg, 'scan_schedule_days', ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"])
+        
+        try:
+            sched_h, sched_m = map(int, scheduled_time.split(':'))
+        except ValueError:
+            sched_h, sched_m = 20, 0
+            
+        days_map = {"Mon": 0, "Tue": 1, "Wed": 2, "Thu": 3, "Fri": 4, "Sat": 5, "Sun": 6}
+        target_days = [days_map.get(d, 0) for d in scheduled_days]
+        if not target_days:
+            target_days = list(range(7))
+            
+        for offset in range(8):
+            test_date = now + timedelta(days=offset)
+            if test_date.weekday() in target_days:
+                target_datetime = test_date.replace(hour=sched_h, minute=sched_m, second=0, microsecond=0)
+                # If it's today but the time has already passed, skip to next match
+                if target_datetime > now:
+                    return target_datetime
+                    
+        return now + timedelta(days=1)
+
+
 async def _check_and_disable_underperforming_server(server_name: str, speedtest_result: dict):
     """
     Check if server consistently underperforms and auto-disable if needed.
@@ -155,9 +190,9 @@ async def run_scan_task():
     state.scan_cancelled = False
     
     try:
-        # Calculate next scan time
-        interval = state.scan_interval_minutes
-        state.next_scan_at = datetime.now() + timedelta(minutes=interval)
+        # Calculate next scan time using config
+        scan_cfg = config_manager.config.scan
+        state.next_scan_at = calculate_next_scan_time(scan_cfg, datetime.now())
         
         await broadcast_update("scan_started", {
             "next_scan_at": state.next_scan_at.isoformat()

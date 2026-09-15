@@ -471,6 +471,17 @@ async def run_speedtest(
         upload_mbps = data["upload"] / 1_000_000
         ping_ms = data["ping"]
         
+        # Speedtest-cli sometimes returns astronomical pings (e.g. 1000000) when latency tests fail.
+        # Mark these as failed tests rather than letting them pass with perfect deviation scores.
+        if ping_ms > 10000:
+            return SpeedTestResult(
+                download_mbps=download_mbps,
+                upload_mbps=upload_mbps,
+                ping_ms=0,
+                duration_seconds=duration,
+                error=f"Speedtest latency test failed (impossible ping: {ping_ms}ms)",
+            )
+            
         result = SpeedTestResult(
             download_mbps=download_mbps,
             upload_mbps=upload_mbps,

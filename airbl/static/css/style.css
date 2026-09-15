@@ -770,6 +770,7 @@ footer {
 
 .setting-control input[type="number"],
 .setting-control input[type="text"],
+.setting-control input[type="time"],
 .setting-control select {
     background: var(--bg-primary);
     color: var(--text-primary);
@@ -788,6 +789,11 @@ footer {
     outline: none;
     border-color: var(--border-hover);
     box-shadow: 0 0 0 1px var(--border-hover);
+}
+
+.setting-control input[type="time"]::-webkit-calendar-picker-indicator {
+    filter: invert(1);
+    cursor: pointer;
 }
 
 /* Toggle Switch (Terminal Block Style) */

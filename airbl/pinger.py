@@ -51,15 +51,46 @@ class PingResult:
         return "N/A"
 
 
+async def tcp_ping(ip: str, count: int = 1, timeout: float = 2.0, port: int = 443) -> PingResult:
+    import time
+    latencies = []
+    for _ in range(count):
+        start = time.perf_counter()
+        try:
+            reader, writer = await asyncio.wait_for(
+                asyncio.open_connection(ip, port),
+                timeout=timeout,
+            )
+            latencies.append((time.perf_counter() - start) * 1000.0)
+            writer.close()
+            await writer.wait_closed()
+        except Exception:
+            pass
+    
+    if not latencies:
+        return PingResult(ip=ip, is_alive=False, packets_sent=count, packets_received=0, packet_loss=100.0)
+    
+    return PingResult(
+        ip=ip,
+        is_alive=True,
+        min_rtt_ms=min(latencies),
+        avg_rtt_ms=sum(latencies)/len(latencies),
+        max_rtt_ms=max(latencies),
+        packet_loss=(count - len(latencies)) / count * 100.0,
+        packets_sent=count,
+        packets_received=len(latencies)
+    )
+
 async def ping_ip(
     ip: str,
     count: int = None,
     timeout: float = None,
 ) -> PingResult:
     """
-    Ping an IP address using system ping command.
+    Ping an IP address using system ping command, falling back to TCP ping.
     
     Uses subprocess to call system ping, which works without root on macOS.
+    If ICMP is blocked, falls back to a TCP ping on port 443.
     
     Args:
         ip: IP address to ping
@@ -99,9 +130,17 @@ async def ping_ip(
         output = stdout.decode("utf-8", errors="ignore")
         
         # Parse ping output
-        return parse_ping_output(ip, output, count)
+        result = parse_ping_output(ip, output, count)
+        if not result.is_alive:
+            tcp_res = await tcp_ping(ip, count, timeout)
+            if tcp_res.is_alive:
+                return tcp_res
+        return result
         
     except asyncio.TimeoutError:
+        tcp_res = await tcp_ping(ip, count, timeout)
+        if tcp_res.is_alive:
+            return tcp_res
         return PingResult(
             ip=ip,
             is_alive=False,
@@ -109,6 +148,9 @@ async def ping_ip(
             error="Ping timeout",
         )
     except Exception as e:
+        tcp_res = await tcp_ping(ip, count, timeout)
+        if tcp_res.is_alive:
+            return tcp_res
         return PingResult(
             ip=ip,
             is_alive=False,

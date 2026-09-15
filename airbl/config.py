@@ -78,7 +78,10 @@ class RegionConfig(BaseModel):
 
 class ScanConfig(BaseModel):
     auto_scan_enabled: bool = True
+    scan_mode: str = "interval"  # "interval" or "schedule"
     scan_interval_minutes: int = 120
+    scan_schedule_time: str = "20:00"
+    scan_schedule_days: List[str] = Field(default_factory=lambda: ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"])
     speedtest_enabled: bool = True
     # Port/Entry discovery: test all combos each scan for N days to find optimal
     port_discovery_enabled: bool = False

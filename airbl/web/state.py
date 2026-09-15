@@ -50,6 +50,8 @@ class AppState:
         self.scan_task: Optional[asyncio.Task] = None
         self.scan_cancelled: bool = False
         
+        self.settings_updated_event = None
+        
         # Load initial settings
         config_manager.load()
         
@@ -94,6 +96,8 @@ class AppState:
     async def startup(self):
         """Asynchronous startup initialization."""
         logger = logging.getLogger("airbl.state")
+        
+        self.settings_updated_event = asyncio.Event()
         
         # Initialize Database
         db_path = settings.cache_dir / "airbl.db"
@@ -166,6 +170,11 @@ class AppState:
                 self.all_countries[code] = server.country_name
                 # Track all servers
                 self.all_servers.add(server.public_name)
+                # Map server to country and city globally
+                self.servers_by_country[server.public_name] = code
+                if not hasattr(self, 'server_to_city_api'):
+                    self.server_to_city_api = {}
+                self.server_to_city_api[server.public_name] = server.location
                 # Track all cities by country
                 if code not in self.all_cities_by_country:
                     self.all_cities_by_country[code] = set()

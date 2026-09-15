@@ -179,14 +179,18 @@ class ServerScanResult:
         # Speedtest score (if available)
         # Prefer deviation_score if available (compares to baseline), otherwise use regular score
         if self.speedtest_result:
-            if self.speedtest_result.get("deviation_score") is not None:
+            if self.speedtest_result.get("error"):
+                score = 0.0
+            elif self.speedtest_result.get("deviation_score") is not None:
                 # deviation_score is percentage of baseline speed retained
                 # e.g., 100 = same as baseline, 50 = half speed, 150 = 50% faster
                 # Cap at 100 for display, so 80% of baseline = 80, 120% = 100
                 deviation = self.speedtest_result["deviation_score"]
                 score = max(0, min(100, deviation))  # Cap at 0-100
-            elif self.speedtest_result.get("score"):
+            elif self.speedtest_result.get("score") is not None:
                 score = self.speedtest_result["score"] * 10  # Scale up
+            else:
+                score = 0.0
         else:
             # Fallback to ping/load based scoring
             best = self.best_ip

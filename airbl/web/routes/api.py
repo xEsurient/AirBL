@@ -396,6 +396,9 @@ async def get_settings():
     
     return {
         "scan_interval_minutes": cfg.scan.scan_interval_minutes,
+        "scan_mode": getattr(cfg.scan, 'scan_mode', 'interval'),
+        "scan_schedule_time": getattr(cfg.scan, 'scan_schedule_time', '20:00'),
+        "scan_schedule_days": getattr(cfg.scan, 'scan_schedule_days', ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]),
         "auto_scan_enabled": cfg.scan.auto_scan_enabled,
         "speedtest_enabled": cfg.scan.speedtest_enabled,
         # Port discovery
@@ -471,11 +474,26 @@ async def update_settings(request: Request):
     if "scan_interval_minutes" in data:
         cfg.scan.scan_interval_minutes = max(5, min(1440, int(data["scan_interval_minutes"])))
     
+    if "scan_mode" in data:
+        mode = str(data["scan_mode"])
+        if mode in ("interval", "schedule"):
+            cfg.scan.scan_mode = mode
+            
+    if "scan_schedule_time" in data:
+        cfg.scan.scan_schedule_time = str(data["scan_schedule_time"])
+        
+    if "scan_schedule_days" in data:
+        cfg.scan.scan_schedule_days = list(data["scan_schedule_days"])
+    
     if "auto_scan_enabled" in data:
         cfg.scan.auto_scan_enabled = bool(data["auto_scan_enabled"])
     
     if "speedtest_enabled" in data:
         cfg.scan.speedtest_enabled = bool(data["speedtest_enabled"])
+        
+    # Trigger recalculation of next scan time
+    if state.settings_updated_event:
+        state.settings_updated_event.set()
     
     # Port Discovery Settings
     if "port_discovery_enabled" in data:

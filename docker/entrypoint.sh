@@ -74,8 +74,8 @@ setup_policy_routing() {
     
     if [ -n "$eth0_ip" ]; then
         echo "Setting up policy routing for container IP: $eth0_ip on $default_iface"
-        # Ensure replies from the container IP go out the main table, bypassing WireGuard's table 51820
-        ip rule add from "$eth0_ip" table main priority 100 2>/dev/null || true
+        # Keep dashboard replies ahead of VPN rules, after the kernel's priority-0 local rule.
+        ip -4 rule add from "$eth0_ip" table main priority 1
     fi
 }
 

@@ -46,6 +46,8 @@ services:
       # Using bind mount to host for easy access and backup
       # Alternative: Use named volume by replacing with: - airbl_data:/app/data
       - ./data:/app/data
+      # Gluetun profiles output directory
+      - ./gluetun:/app/gluetun
       # Optional: mount Hummingbird binary
       # - ./hummingbird:/usr/local/bin/hummingbird:ro
     
@@ -100,6 +102,8 @@ services:
       # Using bind mount to host for easy access and backup
       # Alternative: Use named volume by replacing with: - airbl_data:/app/data
       - ./data:/app/data
+      # Gluetun profiles output directory
+      - ./gluetun:/app/gluetun
     
     environment:
       - SCAN_INTERVAL=0

@@ -523,8 +523,10 @@ class WireGuardController:
             for subnet in ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"]:
                 await self._run_sudo(["ip", "-4", "rule", "add", "to", subnet, "table", "main", "priority", "10"])
                 
-            await self._run_sudo(["ip", "-4", "rule", "add", "not", "fwmark", fwmark, "table", table])
-            await self._run_sudo(["ip", "-4", "rule", "add", "table", "main", "suppress_prefixlength", "0"])
+            # Automatic priorities can precede the dashboard's priority-1 exception.
+            # Keep connected routes ahead of the VPN catch-all, but both after bypasses.
+            await self._run_sudo(["ip", "-4", "rule", "add", "not", "fwmark", fwmark, "table", table, "priority", "20010"])
+            await self._run_sudo(["ip", "-4", "rule", "add", "table", "main", "suppress_prefixlength", "0", "priority", "20000"])
             logger.debug(f"Set fwmark {fwmark}, local bypasses, and routing rules for table {table}")
             
             # NOTE: We intentionally skip sysctl -q net.ipv4.conf.all.src_valid_mark=1
