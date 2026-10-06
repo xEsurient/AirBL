@@ -8,13 +8,13 @@ Workflow:
 4. Ping all discovered IPs
 5. Check responsive IPs against DroneBL
 6. Only scan countries present in conf directory
-7. Apply US Europe-friendly filter
+7. Optional US "close to Europe" filter (regions.us_near_europe_only, off by default)
 """
 
 import asyncio
 import logging
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import AsyncGenerator, Optional
 from datetime import datetime
 import ipaddress
 from pathlib import Path
@@ -25,14 +25,27 @@ logger = logging.getLogger("airbl.scanner")
 from .airvpn import AirVPNServer, AirVPNStatus, get_airvpn_status
 from .dronebl import DroneBLResult, check_dronebl_batch
 from .pinger import PingResult, ping_batch
-from .dns_lookup import lookup_server_exit_ips
+from .dns_lookup import lookup_exit_ips
 from .wireguard import (
     WireGuardConfig,
     scan_config_directory,
     get_unique_countries,
     get_scannable_configs,
-    US_ALLOWED_LOCATIONS,
 )
+
+# Preferred config when a server has several .conf files (port/entry combos)
+PREFERRED_CONF_PORT = 1637
+PREFERRED_CONF_ENTRY = 3
+
+
+def _ping_protocols(ping) -> dict:
+    """Which protocol gave latency_ms, plus per-protocol averages."""
+    rnd = lambda v: round(v, 1) if v is not None else None
+    return {
+        "method": getattr(ping, "method", None),
+        "icmp_ms": rnd(getattr(ping, "icmp_avg_ms", None)),
+        "tcp_ms": rnd(getattr(ping, "tcp_avg_ms", None)),
+    }
 
 
 @dataclass
@@ -60,15 +73,24 @@ class ScannedIP:
         """Get overall status string."""
         if self.is_blocked:
             return "BLOCKED"
+        if not self.reputation_verified:
+            return "UNKNOWN"
         if not self.is_responsive:
             return "OFFLINE"
         return "OK"
+
+    @property
+    def reputation_verified(self) -> bool:
+        """DroneBL gave a definite answer for this IP."""
+        return self.dronebl is not None and self.dronebl.is_verified
     
     @property
     def status_color(self) -> str:
         """Get color for status display."""
         if self.is_blocked:
             return "red"
+        if not self.reputation_verified:
+            return "yellow"
         if not self.is_responsive:
             return "dim"
         return "green"
@@ -90,10 +112,15 @@ class ScannedIP:
             "location": self.location,
             "is_from_config": self.is_from_config,
             "is_blocked": self.is_blocked,
+            "reputation_verified": self.reputation_verified,
+            "dronebl_error": self.dronebl.error if self.dronebl else "Not checked",
             "is_responsive": self.is_responsive,
             "status": self.status,
             "latency_ms": self.latency_ms,
+            **_ping_protocols(self.ping),
             "dronebl_reason": self.dronebl.listing_reason if self.dronebl and self.dronebl.is_listed else None,
+            "dronebl_code": self.dronebl.listing_code if self.dronebl and self.dronebl.is_listed else None,
+            "dronebl_checked_at": self.dronebl.checked_at.isoformat() if self.dronebl else None,
         }
 
 
@@ -116,6 +143,9 @@ class ServerScanResult:
     exit_ping: Optional[PingResult] = None  # Exit IP ping (DNS)
     entry1_ping: Optional[PingResult] = None  # Entry 1 Ping
     entry3_ping: Optional[PingResult] = None  # Entry 3 Ping
+    load_known: bool = True  # False when the server had no API match (load_percent is a placeholder 0)
+    dns_error: Optional[str] = None  # Every exit-IP DNS query failed
+    scan_error: Optional[str] = None  # scan_server raised; result kept as "unknown"
     
     @property
     def total_ips_scanned(self) -> int:
@@ -143,9 +173,38 @@ class ServerScanResult:
         return [ip for ip in self.scanned_ips if ip.is_responsive and not ip.is_blocked]
     
     @property
+    def is_blocked(self) -> bool:
+        """At least one exit IP is listed on DroneBL."""
+        return self.blocked_count > 0
+
+    @property
+    def reputation(self) -> str:
+        """"blocked" (any listing), "clean" (every exit IP verified unlisted), else "unknown"."""
+        if self.is_blocked:
+            return "blocked"
+        if self.scanned_ips and all(ip.reputation_verified for ip in self.scanned_ips):
+            return "clean"
+        return "unknown"
+
+    @property
+    def reputation_note(self) -> Optional[str]:
+        """Why a server is not verified clean (None when clean or blocked)."""
+        if self.reputation != "unknown":
+            return None
+        if self.scan_error:
+            return f"Scan failed: {self.scan_error}"
+        if not self.scanned_ips:
+            if self.dns_error:
+                return f"DNS lookup failed: {self.dns_error}"
+            return "No exit IPs found (DNS returned no records)"
+        failed = [ip for ip in self.scanned_ips if not ip.reputation_verified]
+        reasons = sorted({(ip.dronebl.error if ip.dronebl else "not checked") for ip in failed})
+        return f"DroneBL lookup failed for {len(failed)}/{len(self.scanned_ips)} exit IP(s): {'; '.join(reasons)}"
+
+    @property
     def is_clean(self) -> bool:
-        """True if server has NO blocked IPs."""
-        return self.blocked_count == 0
+        """True only with fresh evidence: every exit IP verified as not listed."""
+        return self.reputation == "clean"
     
     @property
     def best_ip(self) -> Optional[ScannedIP]:
@@ -168,58 +227,42 @@ class ServerScanResult:
     @property
     def score(self) -> float:
         """
-        Calculate overall server score for ranking.
-        Considers: speedtest results, ping, load, blocked status.
+        Overall server score for ranking, always 0-100.
+        Not verified clean -> 0. With a speedtest: its score. Otherwise ping
+        (0 ms = 100, 200 ms = 0) minus a load penalty.
         """
         if not self.is_clean:
             return 0.0
         
-        score = 100.0
-        
-        # Speedtest score (if available)
-        # Prefer deviation_score if available (compares to baseline), otherwise use regular score
         if self.speedtest_result:
             if self.speedtest_result.get("error"):
                 score = 0.0
             elif self.speedtest_result.get("deviation_score") is not None:
-                # deviation_score is percentage of baseline speed retained
-                # e.g., 100 = same as baseline, 50 = half speed, 150 = 50% faster
-                # Cap at 100 for display, so 80% of baseline = 80, 120% = 100
-                deviation = self.speedtest_result["deviation_score"]
-                score = max(0, min(100, deviation))  # Cap at 0-100
+                # Percentage of baseline speed retained (100 = baseline, 150 = faster)
+                score = self.speedtest_result["deviation_score"]
             elif self.speedtest_result.get("score") is not None:
-                score = self.speedtest_result["score"] * 10  # Scale up
+                score = self.speedtest_result["score"] * 10  # SpeedTestResult.score is 0-10
             else:
                 score = 0.0
         else:
-            # Fallback to ping/load based scoring
             best = self.best_ip
-            if best and best.latency_ms:
-                # Lower latency = higher score
-                ping_score = max(0, 50 - (best.latency_ms / 4))  # 200ms = 0, 0ms = 50
-                score = ping_score
-            elif self.entry1_ping or self.entry3_ping:
-                pings = [p.avg_rtt_ms for p in (self.entry1_ping, self.entry3_ping) if p and p.avg_rtt_ms]
-                if pings:
-                    best_ping = min(pings)
-                    ping_score = max(0, 50 - (best_ping / 4))
-                    score = ping_score
-                else:
-                    # Entry pings exist but none are reachable
-                    score = 1
-            else:
-                # No ping data at all
-                score = 1
+            latency = best.latency_ms if best else None
+            if latency is None:
+                pings = [p.avg_rtt_ms for p in (self.entry1_ping, self.entry3_ping)
+                         if p and p.is_alive and p.avg_rtt_ms is not None]
+                latency = min(pings) if pings else None
+            if latency is None:
+                # No ping data at all: clean but unranked. Keep it above blocked and
+                # unverified servers (0), so no load penalty here.
+                return 1.0
+            score = 100 - latency / 2
             
-            # Load penalty
-            load_penalty = self.load_percent / 5  # 100% load = -20 points
-            score -= load_penalty
+            # Load penalty: 100% load = -20. Unknown load (no API match) gets the
+            # mid penalty so it is neither rewarded as 0% nor punished as full.
+            load = self.load_percent if self.load_known else 50
+            score -= load / 5
         
-        # Block penalty
-        if self.blocked_count > 0:
-            score -= self.blocked_count * 5
-        
-        return max(0, score)
+        return max(0.0, min(100.0, float(score)))
     
     def to_dict(self) -> dict:
         """Convert to dictionary for JSON."""
@@ -237,7 +280,11 @@ class ServerScanResult:
             "responsive_count": self.responsive_count,
             "blocked_count": self.blocked_count,
             "is_clean": self.is_clean,
+            "is_blocked": self.is_blocked,
+            "reputation": self.reputation,
+            "reputation_note": self.reputation_note,
             "best_ip": self.best_ip.to_dict() if self.best_ip else None,
+            "exit_ips": [ip.to_dict() for ip in self.scanned_ips],
             "score": round(self.score, 2),
             "speedtest": self.speedtest_result,
             "scanned_at": self.scanned_at.isoformat(),
@@ -245,16 +292,19 @@ class ServerScanResult:
                 "ip": self.exit_ping.ip,
                 "latency_ms": round(self.exit_ping.avg_rtt_ms, 1) if self.exit_ping and self.exit_ping.avg_rtt_ms else None,
                 "is_alive": self.exit_ping.is_alive if self.exit_ping else False,
+                **_ping_protocols(self.exit_ping),
             } if self.exit_ping else None,
             "entry1_ping": {
                 "ip": self.entry1_ping.ip,
                 "latency_ms": round(self.entry1_ping.avg_rtt_ms, 1) if self.entry1_ping and self.entry1_ping.avg_rtt_ms else None,
                 "is_alive": self.entry1_ping.is_alive if self.entry1_ping else False,
+                **_ping_protocols(self.entry1_ping),
             } if self.entry1_ping else None,
             "entry3_ping": {
                 "ip": self.entry3_ping.ip,
                 "latency_ms": round(self.entry3_ping.avg_rtt_ms, 1) if self.entry3_ping and self.entry3_ping.avg_rtt_ms else None,
                 "is_alive": self.entry3_ping.is_alive if self.entry3_ping else False,
+                **_ping_protocols(self.entry3_ping),
             } if self.entry3_ping else None,
         }
 
@@ -283,7 +333,12 @@ class ScanSummary:
     
     @property
     def blocked_servers(self) -> list[ServerScanResult]:
-        return [s for s in self.servers if not s.is_clean]
+        return [s for s in self.servers if s.is_blocked]
+
+    @property
+    def unknown_servers_count(self) -> int:
+        """Servers with no verified DroneBL result (lookup errors or no exit IPs)."""
+        return len([s for s in self.servers if s.reputation == "unknown"])
     
     @property
     def blocked_servers_count(self) -> int:
@@ -330,13 +385,14 @@ class ScanSummary:
             "total_servers": self.total_servers,
             "clean_servers_count": len(self.clean_servers),
             "blocked_servers_count": len(self.blocked_servers),
+            "unknown_servers_count": self.unknown_servers_count,
             "total_ips_scanned": self.total_ips_scanned,
             "total_responsive": self.total_responsive,
             "total_blocked": self.total_blocked,
             "countries_scanned": self.countries_scanned,
             "started_at": self.started_at.isoformat(),
             "completed_at": self.completed_at.isoformat() if self.completed_at else None,
-            "next_scan_at": self.next_scan_at.isoformat() if self.next_scan_at else None,
+            "next_scan_at": self.next_scan_at.astimezone().isoformat() if self.next_scan_at else None,
             "scan_interval_minutes": self.scan_interval_minutes,
             "servers_by_country": {
                 country: [s.to_dict() for s in servers]
@@ -375,6 +431,8 @@ class EnhancedScanner:
         country_exclude: set[str] = None,
         city_filter: dict[str, set[str]] = None,
         server_exclude: set[str] = None,
+        server_filter: set[str] = None,
+        us_near_europe_only: Optional[bool] = None,
     ):
         self.config_dir = config_dir or Path("./conf")
         self.scan_concurrency = scan_concurrency
@@ -383,9 +441,10 @@ class EnhancedScanner:
         # Country filtering (set from web UI settings)
         self._country_filter = country_filter or set()  # If set, only scan these countries
         self._country_exclude = country_exclude or set()  # Exclude these countries
-        self._server_filter = set()  # If set, only scan these servers (by name)
+        self._server_filter = set(server_filter or ())  # If set, only scan these servers (by name)
         self._server_exclude = {s.lower() for s in (server_exclude or set())}  # Always exclude these servers (case-insensitive)
         self._city_filter = city_filter or {}  # country_code -> set of city names
+        self._us_near_europe_only = us_near_europe_only  # None = regions.us_near_europe_only setting
         
         # Cache
         self._configs: list[WireGuardConfig] = []
@@ -397,25 +456,23 @@ class EnhancedScanner:
         return self._configs
     
     def get_countries_to_scan(self) -> list[str]:
-        """Get list of country codes from config files, applying filters."""
-        if not self._configs:
-            self.load_configs()
-        
-        countries = set()
-        for config in get_scannable_configs(self._configs):
-            country = config.country_code.upper()
+        """Get list of country codes from API (with fallback to configs), applying filters."""
+        if not self._api_status or not self._api_status.servers:
+            if not self._configs:
+                self.load_configs()
+            countries = set(c.country_code.upper() for c in get_scannable_configs(self._configs, self._us_near_europe_only))
+        else:
+            countries = set(s.country_code.upper() for s in self._api_status.servers)
             
-            # Apply include filter
+        filtered = set()
+        for country in countries:
             if self._country_filter and country not in {c.upper() for c in self._country_filter}:
                 continue
-            
-            # Apply exclude filter
             if self._country_exclude and country in {c.upper() for c in self._country_exclude}:
                 continue
+            filtered.add(country)
             
-            countries.add(config.country_code)
-        
-        return sorted(countries)
+        return sorted(filtered)
     
     def get_servers_for_country(
         self,
@@ -432,7 +489,7 @@ class EnhancedScanner:
         
         # Get configs for this country
         country_configs = [
-            c for c in get_scannable_configs(self._configs)
+            c for c in get_scannable_configs(self._configs, self._us_near_europe_only)
             if c.country_code.upper() == country_code.upper()
         ]
         
@@ -462,6 +519,15 @@ class EnhancedScanner:
                 if c.city.lower() in allowed_cities
             ]
             logger.debug(f"City filter for {country_code}: {original_count} -> {len(country_configs)} configs (allowed cities: {allowed_cities})")
+        
+        # One config per server: several port/entry files would scan it twice
+        by_server: dict[str, list[WireGuardConfig]] = {}
+        for c in country_configs:
+            by_server.setdefault(c.server_name.lower(), []).append(c)
+        country_configs = [
+            next((c for c in group if c.port == PREFERRED_CONF_PORT and c.entry_number == PREFERRED_CONF_ENTRY), group[0])
+            for group in by_server.values()
+        ]
         
         # Match with API servers by name
         results = []
@@ -582,26 +648,20 @@ class EnhancedScanner:
             else:
                 progress_callback(server_name, "DNS lookup", 0, 1)
         
-        # Query DNS for server exit IPs
-        dns_ips = await lookup_server_exit_ips(server_name)
+        # Query DNS for server exit IPs (IPv4 and IPv6)
+        dns_ips, dns_error = await lookup_exit_ips(server_name)
         
         logger.debug(f"DNS lookup for {server_name}: found {len(dns_ips)} exit IPs: {dns_ips}")
         
         # Only check DNS exit IPs in DroneBL (not config/API IPs)
         if not dns_ips:
-            logger.warning(f"No DNS exit IPs found for server {server_name}")
-            return ServerScanResult(
-                server_name=server_name,
-                country_code=config.country_code,
-                country_name=config.country_name,
-                location=config.city,
-                load_percent=api_server.load_percent if api_server else 0,
-                users=api_server.users if api_server else 0,
-                bandwidth_current=api_server.bandwidth_current if api_server else 0,
-                bandwidth_max=api_server.bandwidth_max if api_server else 0,
-                config_file=config.file_path,
-                scanned_ips=[],
-                exit_ping=None,
+            if dns_error:
+                logger.warning(f"DNS lookup failed for server {server_name}: {dns_error}")
+            else:
+                logger.warning(f"No DNS exit IPs found for server {server_name}")
+            return self._make_result(
+                config, api_server,
+                dns_error=dns_error,
                 entry1_ping=entry1_ping_result,
                 entry3_ping=entry3_ping_result,
             )
@@ -638,40 +698,23 @@ class EnhancedScanner:
                 exit_ping = exit_ping_results[0]
                 logger.warning(f"All exit IPs failed to respond for {server_name}. IPs tried: {[r.ip for r in exit_ping_results]}, errors: {[r.error for r in exit_ping_results]}")
         
-        # If no responsive DNS IPs, return empty result
-        if not responsive_dns_ips:
-            return ServerScanResult(
-                server_name=server_name,
-                country_code=config.country_code,
-                country_name=config.country_name,
-                location=config.city,
-                load_percent=api_server.load_percent if api_server else 0,
-                users=api_server.users if api_server else 0,
-                bandwidth_current=api_server.bandwidth_current if api_server else 0,
-                bandwidth_max=api_server.bandwidth_max if api_server else 0,
-                config_file=config.file_path,
-                scanned_ips=[],
-                exit_ping=exit_ping,
-                entry1_ping=entry1_ping_result,
-                entry3_ping=entry3_ping_result,
-            )
-        
-        # DroneBL check only on responsive DNS exit IPs
+        # DroneBL check on every DNS exit IP: reputation doesn't depend on ping
+        # replies, and skipping silent exits used to make such servers look clean.
         if progress_callback:
             if asyncio.iscoroutinefunction(progress_callback):
-                await progress_callback(server_name, "DroneBL check", 0, len(responsive_dns_ips))
+                await progress_callback(server_name, "DroneBL check", 0, len(dns_ips))
             else:
-                progress_callback(server_name, "DroneBL check", 0, len(responsive_dns_ips))
+                progress_callback(server_name, "DroneBL check", 0, len(dns_ips))
         
         dronebl_results = await check_dronebl_batch(
-            list(responsive_dns_ips),
+            list(dns_ips),
             concurrency=self.scan_concurrency,
         )
         dronebl_map = {r.ip: r for r in dronebl_results}
         
-        # Build scanned IPs list from responsive DNS exit IPs only
+        # Build scanned IPs list from all DNS exit IPs
         scanned_ips = []
-        for ip in responsive_dns_ips:
+        for ip in sorted(dns_ips):
             scanned_ip = ScannedIP(
                 ip=ip,
                 server_name=server_name,
@@ -679,16 +722,31 @@ class EnhancedScanner:
                 country_name=config.country_name,
                 location=config.city,
                 is_from_config=(ip == config.endpoint_ip),
-                is_from_api=(api_server and ip in api_server.all_ipv4),
+                is_from_api=bool(api_server and ip in api_server.all_ipv4),
                 is_from_dns=(ip in dns_ips),
                 dronebl=dronebl_map.get(ip),
                 ping=ping_map.get(ip),
-                is_responsive=True,  # All IPs in this list are responsive
+                is_responsive=ip in responsive_dns_ips,
             )
             scanned_ips.append(scanned_ip)
         
+        return self._make_result(
+            config, api_server,
+            scanned_ips=scanned_ips,
+            exit_ping=exit_ping,
+            entry1_ping=entry1_ping_result,
+            entry3_ping=entry3_ping_result,
+        )
+    
+    @staticmethod
+    def _make_result(
+        config: WireGuardConfig,
+        api_server: Optional[AirVPNServer],
+        **kwargs,
+    ) -> ServerScanResult:
+        """ServerScanResult with the config/API fields filled in."""
         return ServerScanResult(
-            server_name=server_name,
+            server_name=config.server_name,
             country_code=config.country_code,
             country_name=config.country_name,
             location=config.city,
@@ -696,13 +754,25 @@ class EnhancedScanner:
             users=api_server.users if api_server else 0,
             bandwidth_current=api_server.bandwidth_current if api_server else 0,
             bandwidth_max=api_server.bandwidth_max if api_server else 0,
+            load_known=api_server is not None,
             config_file=config.file_path,
             wg_pubkey=config.public_key or "",
-            scanned_ips=scanned_ips,
-            exit_ping=exit_ping,
-            entry1_ping=entry1_ping_result,
-            entry3_ping=entry3_ping_result,
+            **kwargs,
         )
+    
+    async def _scan_server_safe(
+        self,
+        config: WireGuardConfig,
+        api_server: Optional[AirVPNServer],
+    ) -> ServerScanResult:
+        """scan_server, but an exception gives an "unknown" result instead of dropping the server."""
+        try:
+            return await self.scan_server(config, api_server)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.error(f"Error scanning {config.server_name}: {e}", exc_info=True)
+            return self._make_result(config, api_server, scan_error=str(e) or type(e).__name__)
     
     async def scan_all(
         self,
@@ -712,7 +782,7 @@ class EnhancedScanner:
         Scan all servers from config files.
         
         Only scans countries present in conf directory.
-        Applies US Europe-friendly filter.
+        Applies the US filter only if enabled.
         """
         # Load configs
         self.load_configs()
@@ -774,11 +844,8 @@ class EnhancedScanner:
                             total_servers,
                         )
                 
-                try:
-                    result = await self.scan_server(config, api_server)
-                    summary.servers.append(result)
-                except Exception as e:
-                    logger.error(f"Error scanning {config.server_name}: {e}")
+                result = await self._scan_server_safe(config, api_server)
+                summary.servers.append(result)
         
         summary.completed_at = datetime.now()
         return summary
@@ -826,17 +893,14 @@ class EnhancedScanner:
             for config, api_server in servers:
                 server_index += 1
                 
-                try:
-                    result = await self.scan_server(config, api_server)
-                    summary.servers.append(result)
-                    
-                    yield ScanUpdate(
-                        summary=summary,
-                        server=result,
-                        total_expected=total_servers
-                    )
-                except Exception as e:
-                    logger.error(f"Error scanning {config.server_name}: {e}")
+                result = await self._scan_server_safe(config, api_server)
+                summary.servers.append(result)
+                
+                yield ScanUpdate(
+                    summary=summary,
+                    server=result,
+                    total_expected=total_servers
+                )
         
         summary.completed_at = datetime.now()
 

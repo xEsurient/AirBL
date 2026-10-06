@@ -107,11 +107,12 @@
 {% endblock %}
 
 {% block scripts %}
-<script src="/static/js/app.js"></script>
 <script>
     let speedtestChart, pingChart;
-    Chart.defaults.color = '#6b7280';
-    Chart.defaults.borderColor = '#1f1f1f';
+    if (typeof Chart !== 'undefined') {
+        Chart.defaults.color = '#6b7280';
+        Chart.defaults.borderColor = '#1f1f1f';
+    }
 
     function getFlagEmoji(cc) {
         if (!cc) return '';
@@ -132,7 +133,9 @@
                 document.getElementById('emptyState').style.display = 'none';
             }
 
-            rawSpeedtestHistory = data.speedtest_history || [];
+            // API returns newest first; charts read oldest -> newest
+            rawSpeedtestHistory = (data.speedtest_history || []).slice()
+                .sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp));
             renderCharts();
 
         } catch (e) {
@@ -142,6 +145,7 @@
 
     function renderCharts() {
         if (!rawSpeedtestHistory || rawSpeedtestHistory.length === 0) return;
+        if (chartsUnavailable()) return;
 
         const tfVal = document.getElementById('timeframeSelect').value;
         let recent = rawSpeedtestHistory;
@@ -245,7 +249,7 @@
 
             grid.innerHTML = ranked.map((s, i) => {
                 const flag = getFlagEmoji(s._country_code);
-                const name = (s.server_name || '').replace(/AirVPN /g, '');
+                const name = escapeHtml((s.server_name || '').replace(/AirVPN /g, ''));
                 const e1 = s.entry1_ping && s.entry1_ping.latency_ms != null ? s.entry1_ping.latency_ms : null;
                 const e3 = s.entry3_ping && s.entry3_ping.latency_ms != null ? s.entry3_ping.latency_ms : null;
                 const pings = [e1, e3].filter(v => v != null);
@@ -276,11 +280,13 @@
         if (!s) return;
         const panel = document.getElementById('serverDetailPanel');
         const flag = getFlagEmoji(s._country_code);
-        const name = (s.server_name || '').replace(/AirVPN /g, '');
+        const name = escapeHtml((s.server_name || '').replace(/AirVPN /g, ''));
 
-        const e1 = s.entry1_ping ? (s.entry1_ping.latency_ms != null ? s.entry1_ping.latency_ms.toFixed(1) + ' ms' : 'unreachable') : 'N/A';
-        const e3 = s.entry3_ping ? (s.entry3_ping.latency_ms != null ? s.entry3_ping.latency_ms.toFixed(1) + ' ms' : 'unreachable') : 'N/A';
-        const exit = s.exit_ping ? (s.exit_ping.latency_ms != null ? s.exit_ping.latency_ms.toFixed(1) + ' ms' : 'unreachable') : 'N/A';
+        // Lowest of ICMP/TCP, labelled with the protocol that produced it
+        const fmtPing = p => p ? (p.latency_ms != null ? p.latency_ms.toFixed(1) + ' ms' + (p.method ? ' (' + escapeHtml(p.method.toUpperCase()) + ')' : '') : 'unreachable') : 'N/A';
+        const e1 = fmtPing(s.entry1_ping);
+        const e3 = fmtPing(s.entry3_ping);
+        const exit = fmtPing(s.exit_ping);
         const stPing = s.speedtest && s.speedtest.ping_ms != null ? s.speedtest.ping_ms.toFixed(1) + ' ms' : '--';
         const ul = s.speedtest && s.speedtest.upload_mbps ? s.speedtest.upload_mbps.toFixed(1) + ' Mbps' : '--';
         const dl = s.speedtest && s.speedtest.download_mbps ? s.speedtest.download_mbps.toFixed(1) + ' Mbps' : '--';
@@ -315,10 +321,11 @@
     loadMetrics();
     loadTopServers();
 
-    // Refresh when a scan finishes (via WebSocket event from app.js)
+    // Refresh when a scan or speedtests finish (via WebSocket events from app.js)
     window.onScanComplete = function() {
         loadMetrics();
         loadTopServers();
     };
+    window.onSpeedtestsComplete = window.onScanComplete;
 </script>
 {% endblock %}

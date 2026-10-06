@@ -3,7 +3,11 @@ Background tasks for AirBL Web UI.
 """
 
 import asyncio
-from datetime import datetime, timedelta
+from contextlib import asynccontextmanager
+from datetime import datetime, timedelta, timezone
+import copy
+import random
+from typing import Optional
 import logging
 from collections import defaultdict, deque
 import statistics
@@ -21,6 +25,46 @@ from ..gluetun import generate_gluetun_servers_json
 logger = logging.getLogger("airbl.web.tasks")
 
 
+# --- VPN / routing ownership ---
+# Every job that brings the VPN up or depends on direct (non-VPN) routing must hold
+# this lock: scans (incl. their baseline, batch speedtests and discovery), manual
+# speedtests and standalone baseline tests. They share wg0 and routing table 51820.
+_network_lock = asyncio.Lock()
+_network_owner: Optional[str] = None
+
+
+def network_owner() -> Optional[str]:
+    """Name of the job currently holding the VPN/routing lock, or None."""
+    return _network_owner if _network_lock.locked() else None
+
+
+@asynccontextmanager
+async def network_job(name: str):
+    """Hold the VPN/routing lock for the duration of a job; tells the UI if it has to wait."""
+    global _network_owner
+    if _network_lock.locked():
+        logger.info(f"{name} waiting for '{_network_owner}' to release the VPN")
+        await broadcast_update("network_job_waiting", {"job": name, "owner": _network_owner})
+    async with _network_lock:
+        _network_owner = name
+        try:
+            yield
+        finally:
+            _network_owner = None
+
+
+def _reject_if_not_via_vpn(res, egress_ip: Optional[str]):
+    """Mark a speedtest failed if Ookla saw a different public IP than the verified VPN exit.
+
+    Catches any measurement that leaked onto the direct line (tunnel dropped mid-test,
+    source-bound socket, ...) so it is never stored as a VPN server's result.
+    """
+    if res.is_success and egress_ip and res.external_ip and res.external_ip != egress_ip:
+        res.error = f"Measured outside the VPN (speedtest saw {res.external_ip}, VPN exit is {egress_ip})"
+        logger.warning(f"Discarding speedtest: {res.error}")
+    return res
+
+
 def calculate_next_scan_time(scan_cfg, last_scan_time=None) -> datetime:
     """Calculate the next scheduled scan time based on configuration."""
     now = datetime.now()
@@ -36,8 +80,11 @@ def calculate_next_scan_time(scan_cfg, last_scan_time=None) -> datetime:
         scheduled_days = getattr(scan_cfg, 'scan_schedule_days', ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"])
         
         try:
-            sched_h, sched_m = map(int, scheduled_time.split(':'))
+            sched_h, sched_m = map(int, str(scheduled_time).split(':'))
+            if not (0 <= sched_h < 24 and 0 <= sched_m < 60):
+                raise ValueError(scheduled_time)
         except ValueError:
+            logger.warning(f"Invalid scan_schedule_time {scheduled_time!r}; using 20:00")
             sched_h, sched_m = 20, 0
             
         days_map = {"Mon": 0, "Tue": 1, "Wed": 2, "Thu": 3, "Fri": 4, "Sat": 5, "Sun": 6}
@@ -61,7 +108,8 @@ async def _check_and_disable_underperforming_server(server_name: str, speedtest_
     Check if server consistently underperforms and auto-disable if needed.
     """
     # Skip if speedtest failed
-    if not speedtest_result or "error" in speedtest_result:
+    # to_dict() always has an "error" key (None on success), so test its value
+    if not speedtest_result or speedtest_result.get("error"):
         return
     
     download = speedtest_result.get("download_mbps", 0)
@@ -123,11 +171,11 @@ def _average_speedtest_results(results: list[SpeedTestResult], server_name: str)
     """Calculate average from multiple speedtest results."""
     if not results:
         return SpeedTestResult(
-            server_id=0,
+            download_mbps=0.0,
+            upload_mbps=0.0,
+            ping_ms=0.0,
             server_name=server_name,
-            server_country="Unknown",
-            timestamp=datetime.now().isoformat(),
-            error="No results to average"
+            error="No results to average",
         )
     
     # Simple arithmetic mean
@@ -141,7 +189,10 @@ def _average_speedtest_results(results: list[SpeedTestResult], server_name: str)
     return SpeedTestResult(
         server_id=last.server_id,
         server_name=last.server_name,
+        server_location=last.server_location,
         server_country=last.server_country,
+        client_ip=last.client_ip,
+        external_ip=last.external_ip,
         tested_at=last.tested_at,
         download_mbps=avg_download,
         upload_mbps=avg_upload,
@@ -150,9 +201,17 @@ def _average_speedtest_results(results: list[SpeedTestResult], server_name: str)
 
 
 async def run_baseline_speedtest():
+    """Standalone baseline speedtest (API). Waits for the VPN to be free: a baseline
+    measured while another job has the tunnel up would really be a VPN measurement."""
+    async with network_job("baseline speedtest"):
+        await _run_baseline_speedtest()
+
+
+async def _run_baseline_speedtest():
     """
     Run a speedtest without VPN to establish baseline performance.
     This is used to calculate deviation scores for VPN-connected speedtests.
+    Caller must hold the network lock.
     """
     from ..speedtest import run_speedtest
     
@@ -161,6 +220,12 @@ async def run_baseline_speedtest():
     
     try:
         result = await run_speedtest(timeout=120)
+        if not result.is_success:
+            # One retry: a transient Ookla/network failure shouldn't leave the scan
+            # without a baseline (all deviation scores depend on it)
+            logger.warning(f"Baseline speedtest failed ({result.error}); retrying once")
+            await asyncio.sleep(5)
+            result = await run_speedtest(timeout=120)
         
         if result.is_success:
             baseline = {
@@ -171,7 +236,7 @@ async def run_baseline_speedtest():
                 "server_location": result.server_location,
                 "tested_at": result.tested_at.isoformat() if result.tested_at else None,
             }
-            state.baseline_speedtest = baseline
+            state.save_baseline(baseline)
             logger.info(f"Baseline speedtest complete: ↓{result.download_mbps:.1f} ↑{result.upload_mbps:.1f} Mbps")
             await broadcast_update("baseline_speedtest_complete", {"baseline": baseline})
         else:
@@ -183,182 +248,216 @@ async def run_baseline_speedtest():
         await broadcast_update("baseline_speedtest_error", {"error": str(e)})
 
 
+def _idle_progress() -> dict:
+    return {"phase": "idle", "current": 0, "total": 0, "server": "", "country": "", "next": ""}
+
+
+async def _generate_outputs():
+    """Gluetun servers.json and WireGuard configs from the last completed scan."""
+    try:
+        await generate_gluetun_servers_json()
+    except Exception as e:
+        logger.error(f"Failed to generate Gluetun servers.json: {e}")
+    try:
+        from ..wireguard_gen import generate_wireguard_configs
+        await generate_wireguard_configs()
+    except Exception as e:
+        logger.error(f"Failed to generate WireGuard configs: {e}")
+
+
 async def run_scan_task():
     """Background task to run a full scan."""
     state.is_scanning = True
     state.is_paused = False
     state.scan_cancelled = False
+    state.live_scan = None
+    scan_id = None
+    status = "cancelled"  # DB status unless the scan phase completes (or fails)
     
     try:
-        # Calculate next scan time using config
-        scan_cfg = config_manager.config.scan
-        state.next_scan_at = calculate_next_scan_time(scan_cfg, datetime.now())
+        # Own the VPN/routing for the whole cycle (scan, baseline, speedtests, discovery)
+        async with network_job("scan"):
+            # Calculate next scan time using config
+            scan_cfg = config_manager.config.scan
+            state.next_scan_at = calculate_next_scan_time(scan_cfg, datetime.now())
         
-        await broadcast_update("scan_started", {
-            "next_scan_at": state.next_scan_at.isoformat()
-        })
-        
-        logger.info("Starting scheduled scan task")
-        
-        # Initialize scanner with disabled servers exclusion
-        # We need to pass the excluded servers from config
-        excluded = set(config_manager.config.performance.disabled_servers)
-        
-        # Pass country filter from enabled countries settings
-        country_filter = state.enabled_countries if state.enabled_countries else None
-        
-        # Pass city filter if enabled
-        city_filter = state.enabled_cities if state.enabled_cities else None
-
-        scanner = EnhancedScanner(
-            config_dir=state.config_dir,
-            server_exclude=excluded,
-            country_filter=country_filter,
-            city_filter=city_filter
-        )
-        
-        # Create scan entry in DB at start to get ID
-        if state.db:
-            try:
-                state.current_scan_id = await state.db.add_scan_result({
-                    "total_servers": 0,
-                    "clean_servers": 0,
-                    "blocked_servers": 0,
-                    "disabled_servers": len(excluded)
-                })
-                logger.info(f"Scan started with DB ID: {state.current_scan_id}")
-            except Exception as e:
-                logger.error(f"Failed to create scan entry in DB: {e}")
-                state.current_scan_id = None
-        
-        # Generator based scanning for real-time updates
-        async for update in scanner.scan_iter():
-            if state.scan_cancelled:
-                logger.info("Scan cancelled manually")
-                break
-                
-            # Handle pause
-            while state.is_paused and not state.scan_cancelled:
-                await asyncio.sleep(1)
-            
-            if state.scan_cancelled:
-                break
-            
-            # update.summary is ScanSummary object
-            # update.server is the server that just finished (optional)
-            
-            # Update global state
-            state.current_scan = update.summary
-            
-            # Broadcast update
-            if update.server:
-                # Individual server update
-                await broadcast_update("server_complete", {
-                    "server": update.server.to_dict(),
-                    "summary": update.summary.to_dict()
-                })
-                
-                # Persist individual server result to DB
-                if state.db and getattr(state, "current_scan_id", None):
-                    try:
-                        await state.db.add_server_scan_result(
-                            state.current_scan_id, 
-                            update.server.to_dict()
-                        )
-                    except Exception as e:
-                        logger.error(f"Failed to persist server result to DB: {e}")
-                    
-                    # Persist entry ping history for AUTO mode
-                    try:
-                        srv = update.server
-                        if srv.entry1_ping:
-                            await state.db.add_entry_ping(
-                                state.current_scan_id, srv.server_name,
-                                "ENTRY1", srv.entry1_ping.ip,
-                                srv.entry1_ping.avg_rtt_ms,
-                                srv.entry1_ping.is_alive
-                            )
-                        if srv.entry3_ping:
-                            await state.db.add_entry_ping(
-                                state.current_scan_id, srv.server_name,
-                                "ENTRY3", srv.entry3_ping.ip,
-                                srv.entry3_ping.avg_rtt_ms,
-                                srv.entry3_ping.is_alive
-                            )
-                    except Exception as e:
-                        logger.error(f"Failed to persist entry ping to DB: {e}")
-            
-            # Update progress
-            state.scan_progress = {
-                "phase": "scanning",
-                "current": update.summary.total_servers,
-                "total": update.total_expected if hasattr(update, 'total_expected') else 0, # total_expected might need to be added to scanner
-                # Just use scanned count for now
-                "server": update.server.server_name if update.server else "...",
-                "country": update.server.country_code if update.server else "...",
-                "next": ""
-            }
-            await broadcast_update("progress_update", {"progress": state.scan_progress})
-
-        # Scan Complete Handling
-        if not state.scan_cancelled and state.current_scan:
-            logger.info(f"Scan completed. Found {state.current_scan.clean_servers_count} clean servers.")
-            
-            await broadcast_update("scan_complete", {
-                "summary": state.current_scan.to_dict(),
-                "next_scan_at": state.next_scan_at.isoformat() if state.next_scan_at else None
+            await broadcast_update("scan_started", {
+                "next_scan_at": state.next_scan_at.astimezone().isoformat()
             })
+        
+            logger.info("Starting scheduled scan task")
+        
+            # Initialize scanner with disabled servers exclusion
+            # We need to pass the excluded servers from config
+            excluded = set(config_manager.config.performance.disabled_servers)
+        
+            # Pass country filter from enabled countries settings
+            country_filter = state.enabled_countries if state.enabled_countries else None
+        
+            # Pass city filter if enabled
+            city_filter = state.enabled_cities if state.enabled_cities else None
+
+            scanner = EnhancedScanner(
+                config_dir=state.config_dir,
+                server_exclude=excluded,
+                country_filter=country_filter,
+                country_exclude=set(config_manager.config.regions.excluded_countries),
+                city_filter=city_filter,
+                # Settings > Server Selection; empty means all servers
+                server_filter=state.enabled_servers or None,
+            )
+        
+            # Create scan entry in DB at start to get ID (status 'running' until it completes)
+            if state.db:
+                try:
+                    scan_id = await state.db.add_scan_result({
+                        "total_servers": 0,
+                        "clean_servers": 0,
+                        "blocked_servers": 0,
+                        "disabled_servers": len(excluded)
+                    })
+                    logger.info(f"Scan started with DB ID: {scan_id}")
+                except Exception as e:
+                    logger.error(f"Failed to create scan entry in DB: {e}")
+            state.current_scan_id = scan_id
+        
+            # Generator based scanning for real-time updates
+            async for update in scanner.scan_iter():
+                if state.scan_cancelled:
+                    logger.info("Scan cancelled manually")
+                    break
+                
+                # Handle pause
+                while state.is_paused and not state.scan_cancelled:
+                    await asyncio.sleep(1)
             
+                if state.scan_cancelled:
+                    break
+            
+                # Build into live_scan; current_scan keeps the last completed scan until this one finishes
+                state.live_scan = update.summary
+            
+                # Broadcast update
+                if update.server:
+                    # Individual server update
+                    await broadcast_update("server_complete", {
+                        "server": update.server.to_dict(),
+                        "summary": update.summary.to_dict()
+                    })
+                
+                    # Persist the server row and its entry pings (AUTO entry mode), one commit per server
+                    if state.db and scan_id:
+                        try:
+                            srv = update.server
+                            await state.db.add_server_scan_result(scan_id, srv.to_dict(), commit=False)
+                            for entry_type, ping in (("ENTRY1", srv.entry1_ping), ("ENTRY3", srv.entry3_ping)):
+                                if ping:
+                                    await state.db.add_entry_ping(
+                                        scan_id, srv.server_name, entry_type, ping.ip,
+                                        ping.avg_rtt_ms, ping.is_alive, commit=False,
+                                    )
+                            await state.db.commit()
+                        except Exception as e:
+                            logger.error(f"Failed to persist server result to DB: {e}")
+            
+                # Update progress
+                state.scan_progress = {
+                    "phase": "scanning",
+                    "current": update.summary.total_servers,
+                    "total": update.total_expected if hasattr(update, 'total_expected') else 0, # total_expected might need to be added to scanner
+                    # Just use scanned count for now
+                    "server": update.server.server_name if update.server else "...",
+                    "country": update.server.country_code if update.server else "...",
+                    "next": ""
+                }
+                await broadcast_update("progress_update", {"progress": state.scan_progress})
+
+            if state.scan_cancelled or state.live_scan is None:
+                if not state.scan_cancelled:
+                    status = "failed"
+                    logger.warning("Scan produced no results")
+                return
+
+            # Scan complete: promote it to the results everything else reads
+            state.current_scan, state.live_scan = state.live_scan, None
+            summary = state.current_scan
+            logger.info(f"Scan completed. Found {summary.clean_servers_count} clean servers.")
+
+            # Ban frequency tracking (unknown, i.e. lookup failed, is not a ban)
+            for server in summary.servers:
+                if server.is_blocked:
+                    state.ban_history[server.server_name] = state.ban_history.get(server.server_name, 0) + 1
+        
+            await broadcast_update("scan_complete", {
+                "summary": summary.to_dict(),
+                "next_scan_at": state.next_scan_at.astimezone().isoformat() if state.next_scan_at else None
+            })
+        
             # Save history to memory (and log)
             state.scan_history.append({
                 "timestamp": datetime.now().isoformat(),
-                "total_servers": state.current_scan.total_servers,
-                "clean_servers": state.current_scan.clean_servers_count,
-                "blocked_servers": state.current_scan.blocked_servers_count,
-                 # "disabled_servers": len(state.disabled_servers), 
-                 # use config directly
+                "total_servers": summary.total_servers,
+                "clean_servers": summary.clean_servers_count,
+                "blocked_servers": summary.blocked_servers_count,
                 "disabled_servers": len(config_manager.config.performance.disabled_servers),
             })
             # Keep only last 50 entries in memory
             if len(state.scan_history) > 50:
                 state.scan_history = state.scan_history[-50:]
 
-            # Update DB with final summary
-            if state.db and getattr(state, "current_scan_id", None):
+            # Update DB with final summary and mark the scan complete
+            status = "complete"
+            if state.db and scan_id:
                 try:
-                    await state.db.update_scan_result(
-                        state.current_scan_id, 
-                        state.current_scan.to_dict()
-                    )
-                    logger.info(f"Updated scan result ID {state.current_scan_id} with final stats")
+                    # Same keys as the in-memory history entry (to_dict uses *_count names)
+                    await state.db.update_scan_result(scan_id, state.scan_history[-1], status="complete")
+                    logger.info(f"Updated scan result ID {scan_id} with final stats")
                 except Exception as e:
                     logger.error(f"Failed to update scan in DB: {e}")
 
-        
-        # Run speedtests on clean servers if enabled (only if not cancelled)
-        if not state.scan_cancelled and state.speedtest_enabled and state.current_scan:
-            # Force baseline speedtest refresh for every new scan cycle
-            # This ensures we have an up-to-date baseline for comparison
-            logger.info("Running baseline speedtest (no VPN) before VPN tests")
-            await run_baseline_speedtest()
+            # Run speedtests on clean servers if enabled (only if not cancelled)
+            if not state.scan_cancelled and state.speedtest_enabled:
+                # Force baseline speedtest refresh for every new scan cycle
+                # This ensures we have an up-to-date baseline for comparison
+                logger.info("Running baseline speedtest (no VPN) before VPN tests")
+                await _run_baseline_speedtest()  # already inside the scan's network lock
             
-            await _run_batch_speedtests()
+                await _run_batch_speedtests()
+
+            # Once per completed cycle, after speedtests so the outputs include them
+            if not state.scan_cancelled:
+                await _generate_outputs()
         
     except asyncio.CancelledError:
         await broadcast_update("scan_cancelled", {})
     except Exception as e:
+        if status != "complete":
+            status = "failed"
         logger.error(f"Scan task error: {e}", exc_info=True)
         await broadcast_update("scan_error", {"error": str(e)})
     finally:
-        # Only set is_scanning to False after everything is complete (including speedtests)
-        state.is_scanning = False
-        state.is_paused = False
-        state.scan_cancelled = False
-        state.scan_task = None
-        
-        # Reset progress to idle
-        state.scan_progress = {"phase": "idle", "current": 0, "total": 0, "server": "", "country": "", "next": ""}
-        await broadcast_update("progress_update", {"progress": state.scan_progress})
+        # A stopped or failed scan never replaces the last completed one
+        state.live_scan = None
+        state.current_scan_id = None
+        if state.db and scan_id and status != "complete":
+            try:
+                await state.db.set_scan_status(scan_id, status)
+            except Exception as e:
+                logger.error(f"Failed to set scan status in DB: {e}")
+
+        # A restart may already have started a newer scan task; leave its state alone
+        if state.scan_task in (None, asyncio.current_task()):
+            state.is_scanning = False
+            state.is_paused = False
+            state.scan_cancelled = False
+            state.scan_task = None
+            # Count the interval from the end of the cycle, so a long cycle can't cause back-to-back scans
+            state.next_scan_at = calculate_next_scan_time(config_manager.config.scan, datetime.now())
+            state.scan_progress = _idle_progress()
+            await broadcast_update("progress_update", {
+                "progress": state.scan_progress,
+                "next_scan_at": state.next_scan_at.astimezone().isoformat(),
+            })
 
 
 async def _run_batch_speedtests():
@@ -422,7 +521,7 @@ async def _run_batch_speedtests():
         controller = WireGuardController(use_sudo=None)
         
         # Consts — TESTS_PER_SERVER uses the same user-configured value as discovery
-        TESTS_PER_SERVER = config_manager.config.scan.discovery_test_count
+        TESTS_PER_SERVER = _speedtest_count()
         INTER_TEST_DELAY = 10
         VPN_STABILIZATION_WAIT = 30
         POST_SERVER_WAIT = config_manager.config.scan.post_server_wait
@@ -472,7 +571,7 @@ async def _run_batch_speedtests():
                     await _run_single_server_speedtest(
                         server, server_index, total_speedtests, 
                         controller, TESTS_PER_SERVER, INTER_TEST_DELAY, VPN_STABILIZATION_WAIT,
-                        config_override=config_override
+                        config_override=config_override, scan_id=state.current_scan_id,
                     )
                     
                     # Post-server wait
@@ -485,95 +584,141 @@ async def _run_batch_speedtests():
             except:
                 pass
                 
-        # Completion broadcast logic
+        # Completion broadcast (ban history and output generation happen in run_scan_task)
         if not state.scan_cancelled:
-             # Update ban frequency tracking
-             if state.current_scan and state.current_scan.servers:
-                 for server in state.current_scan.servers:
-                     if not server.is_clean:
-                         name = server.server_name
-                         state.ban_history[name] = state.ban_history.get(name, 0) + 1
-
-             # Generate custom Gluetun servers.json
-             try:
-                 await generate_gluetun_servers_json()
-             except Exception as e:
-                 logger.error(f"Failed to generate Gluetun servers.json: {e}")
-
-             # Generate WireGuard configs
-             try:
-                 from ..wireguard_gen import generate_wireguard_configs
-                 await generate_wireguard_configs()
-             except Exception as e:
-                 logger.error(f"Failed to generate WireGuard configs: {e}")
-
-             await broadcast_update("speedtest_all_complete", {
+            await broadcast_update("speedtest_all_complete", {
                 "summary": state.current_scan.to_dict(),
                 "progress": state.scan_progress
             })
 
 
+# --- Port & entry discovery ---------------------------------------------------
+DISCOVERY_MIN_SUCCESS = 3     # successful tests a combo needs before it can be chosen
+DISCOVERY_HISTORY_CAP = 30    # per-combo test history kept (persisted with the results)
+DISCOVERY_STABILIZE = 10      # seconds after a verified connect before testing
+
+
+def _utcnow_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _parse_ts(value: str) -> datetime:
+    """Parse a stored timestamp; old naive values were local time."""
+    dt = datetime.fromisoformat(value)
+    return dt if dt.tzinfo else dt.astimezone()
+
+
+def _speedtest_count() -> int:
+    """Tests per server for normal speedtests (separate from discovery's tests per combo)."""
+    cfg = config_manager.config.scan
+    return cfg.speedtest_test_count or cfg.discovery_test_count
+
+
+async def _wait_if_paused():
+    while state.is_paused and not state.scan_cancelled:
+        await asyncio.sleep(0.5)
+
+
+def reset_discovery(start: bool) -> None:
+    """Clear discovery results; optionally start a new period now. Caller saves config."""
+    cfg = config_manager.config.scan
+    cfg.discovery_results = {}
+    cfg.discovery_scan_count = 0
+    cfg.discovery_started_at = _utcnow_iso() if start else None
+    if start:
+        cfg.port_discovery_enabled = True
+    state.port_discovery_results = {}
+
+
+def _combo_record(existing: Optional[dict], port: int, entry: int) -> dict:
+    """Combo record with running sums over successful tests only.
+    Older records (averages that included failures as zeros) convert exactly:
+    sum over all tests == sum over successes, because failures added 0."""
+    r = dict(existing or {})
+    if "dl_sum" not in r:
+        tests = r.get("tests", 0)
+        r["dl_sum"] = r.get("download_mbps", 0) * tests
+        r["ul_sum"] = r.get("upload_mbps", 0) * tests
+        r["ping_sum"] = r.get("ping_ms", 0) * tests
+    r.setdefault("tests", 0)
+    r.setdefault("success_tests", 0)
+    for k in ("rel_dl_sum", "rel_ul_sum", "rel_ping_sum", "rel_n"):
+        r.setdefault(k, 0)
+    r.setdefault("history", [])
+    r["port"], r["entry"] = port, entry
+    return r
+
+
+def _refresh_combo_stats(r: dict) -> None:
+    ok = r["success_tests"]
+    r["download_mbps"] = round(r["dl_sum"] / ok, 2) if ok else 0.0
+    r["upload_mbps"] = round(r["ul_sum"] / ok, 2) if ok else 0.0
+    r["ping_ms"] = round(r["ping_sum"] / ok, 2) if ok else 0.0
+    r["success_rate"] = round(ok / max(1, r["tests"]), 2)
+    if r["rel_n"]:
+        r["relative_score"] = round(
+            (0.5 * r["rel_dl_sum"] + 0.3 * r["rel_ul_sum"] + 0.2 * r["rel_ping_sum"]) / r["rel_n"], 3)
+    r["history"] = r["history"][-DISCOVERY_HISTORY_CAP:]
+
+
+def _persist_discovery() -> None:
+    config_manager.config.scan.discovery_results = copy.deepcopy(state.port_discovery_results)
+    config_manager.save()
+
+
 async def _resolve_server_config(server):
     """
-    Resolve the correct WireGuard config file for a server based on
-    preferred port, entry IP settings (including AUTO mode).
-    
-    Returns a Path to the config file to use, or None to use server.config_file.
+    Config to use for a server's speedtest, from the Preferred Port / Entry settings
+    (which discovery updates when it finishes). Returns a Path, or None to use
+    server.config_file.
     """
     scan_cfg = config_manager.config.scan
-    target_port = scan_cfg.discovery_auto_port or scan_cfg.preferred_port
-    target_entry_str = scan_cfg.discovery_auto_entry or scan_cfg.preferred_entry_ip
-    
-    # Determine entry number
+    # preferred_* is the single source of truth; discovery_auto_* is only a label
+    target_port = scan_cfg.preferred_port
+    target_entry_str = scan_cfg.preferred_entry_ip
+
     if target_entry_str == "AUTO":
-        # Use DB-backed historical latency analysis
+        entry_number = 3
         if state.db:
             try:
                 best_entry = await state.db.get_best_entry_for_server(server.server_name)
                 entry_number = 1 if best_entry == "ENTRY1" else 3
             except Exception as e:
                 logger.debug(f"AUTO entry lookup failed for {server.server_name}: {e}")
-                entry_number = 3  # Default fallback
-        else:
-            entry_number = 3
-    elif target_entry_str == "ENTRY1":
-        entry_number = 1
     else:
-        entry_number = 3  # Default to ENTRY3
-    
-    # Get the entry IP
-    if entry_number == 1:
-        entry_ping = server.entry1_ping
-    else:
-        entry_ping = server.entry3_ping
-    
+        entry_number = 1 if target_entry_str == "ENTRY1" else 3
+
+    pings = {1: server.entry1_ping, 3: server.entry3_ping}
+    entry_ping = pings.get(entry_number)
     if not entry_ping or not entry_ping.is_alive:
-        # Fallback to original config file
-        return None
-    
-    endpoint_ip = entry_ping.ip
-    
-    # Check if the current server.config_file already matches
+        # Keep the preferred port; try the other entry before giving up
+        other = 3 if entry_number == 1 else 1
+        alt = pings.get(other)
+        if alt and alt.is_alive:
+            logger.info(f"{server.server_name}: Entry {entry_number} not responding, using Entry {other} on port {target_port}")
+            entry_number, entry_ping = other, alt
+        else:
+            return None
+
     if server.config_file:
         try:
-            from ..wireguard import parse_filename, parse_config_content
+            from ..wireguard import parse_filename
             meta = parse_filename(server.config_file.name)
-            if meta.get("port") == target_port and meta.get("entry_number") == entry_number:
+            if int(meta.get("port")) == int(target_port) and int(meta.get("entry_number")) == entry_number:
                 return None  # Already the right config
         except Exception:
             pass
-    
-    # Need a different config — use confgen
+
     if not server.wg_pubkey:
         return None
-    
+
     try:
         from ..confgen import get_or_generate_config
         config_path = get_or_generate_config(
             server_name=server.server_name,
             country_code=server.country_code,
             city=server.location,
-            endpoint_ip=endpoint_ip,
+            endpoint_ip=entry_ping.ip,
             server_pubkey=server.wg_pubkey,
             port=target_port,
             entry_number=entry_number,
@@ -587,236 +732,216 @@ async def _resolve_server_config(server):
 
 async def _run_discovery_phase(clean_servers, controller):
     """
-    Run port/entry discovery if enabled and still within the discovery period.
-    
-    Tests ALL port×entry combos on the top-scored clean server each scan.
-    Runs for discovery_duration_days, then auto-selects the best combo.
+    Port/entry discovery, run inside a scan's speedtest phase while the period is active.
+
+    Each scan tests every port x entry combo on ONE server (rotating through the top 3
+    clean servers), in random order, all from the same generated config template.
+    Per combo it keeps sums over successful tests only. Per scan it also records how each
+    combo did relative to the others on that server, so scans on different servers or at
+    different times of day stay comparable. After discovery_duration_days the next scan
+    finalizes.
     """
     scan_cfg = config_manager.config.scan
-    
     if not scan_cfg.port_discovery_enabled:
         return
-    
-    # Check if discovery period is active
+
     if scan_cfg.discovery_started_at:
-        started = datetime.fromisoformat(scan_cfg.discovery_started_at)
-        elapsed_days = (datetime.now() - started).total_seconds() / 86400
-        
+        try:
+            started = _parse_ts(scan_cfg.discovery_started_at)
+        except ValueError:
+            started = datetime.now(timezone.utc)
+            scan_cfg.discovery_started_at = started.isoformat()
+        elapsed_days = (datetime.now(timezone.utc) - started).total_seconds() / 86400
         if elapsed_days >= scan_cfg.discovery_duration_days:
-            # Discovery period is over — finalize results
             await _finalize_discovery()
             return
-        
-        days_remaining = scan_cfg.discovery_duration_days - elapsed_days
-        logger.info(f"Discovery active: {days_remaining:.1f} days remaining")
+        logger.info(f"Discovery active: {scan_cfg.discovery_duration_days - elapsed_days:.1f} days remaining")
     else:
-        # First run — set the start time
-        scan_cfg.discovery_started_at = datetime.now().isoformat()
+        reset_discovery(start=True)
         config_manager.save()
-        logger.info(f"Discovery started — will run for {scan_cfg.discovery_duration_days} days")
-    
-    # Pick the top-scored clean server for discovery
-    scored_servers = sorted(
+        logger.info(f"Discovery started; runs for {scan_cfg.discovery_duration_days} days")
+
+    candidates = sorted(
         [s for s in clean_servers if s.wg_pubkey and (s.entry1_ping or s.entry3_ping)],
-        key=lambda s: s.score,
-        reverse=True
-    )
-    
-    if not scored_servers:
+        key=lambda s: s.score or 0, reverse=True,
+    )[:3]
+    if not candidates:
         logger.warning("Discovery: no eligible servers with pubkey and entry pings")
         return
-    
-    target = scored_servers[0]
-    logger.info(f"Discovery: testing combos on {target.server_name} ({target.country_code})")
-    
-    # Get entry IPs
-    entry1_ip = target.entry1_ping.ip if target.entry1_ping and target.entry1_ping.is_alive else None
-    entry3_ip = target.entry3_ping.ip if target.entry3_ping and target.entry3_ping.is_alive else None
-    
+    target = candidates[scan_cfg.discovery_scan_count % len(candidates)]
+    scan_cfg.discovery_scan_count += 1
+
     try:
-        from ..confgen import generate_all_combos, get_client_identity
+        from ..confgen import generate_config, get_client_identity
         identity = get_client_identity()
     except ValueError as e:
-        logger.error(f"Discovery: cannot run — {e}")
+        logger.error(f"Discovery: cannot run: {e}")
         return
-    
-    combos = generate_all_combos(
-        server_name=target.server_name,
-        country_code=target.country_code,
-        city=target.location,
-        entry1_ip=entry1_ip,
-        entry3_ip=entry3_ip,
-        server_pubkey=target.wg_pubkey,
-        ports=scan_cfg.available_ports,
-        entry_filter=scan_cfg.discovery_entry_filter,
-        identity=identity,
-    )
-    
+
+    entries = []
+    for num, ping in ((1, target.entry1_ping), (3, target.entry3_ping)):
+        if scan_cfg.discovery_entry_filter in ("ALL", f"ENTRY{num}") and ping and ping.is_alive:
+            entries.append((num, ping.ip))
+    combos = []
+    for port in scan_cfg.available_ports:
+        for num, ip in entries:
+            # Every combo from the same template (same MTU), freshly generated
+            path = generate_config(
+                server_name=target.server_name, country_code=target.country_code, city=target.location,
+                endpoint_ip=ip, server_pubkey=target.wg_pubkey, port=port, entry_number=num, identity=identity,
+            )
+            combos.append((path, port, num))
     if not combos:
-        logger.warning("Discovery: no valid combos generated")
+        logger.warning(f"Discovery: no testable combos on {target.server_name}")
         return
-    
-    total_combos = len(combos)
-    POST_SERVER_WAIT = scan_cfg.post_server_wait
-    VPN_STABILIZATION_WAIT = 30
-    INTER_TEST_DELAY = 10
+    random.shuffle(combos)  # no fixed order, so no time-of-day bias towards the first combo
+
     tests_per_combo = scan_cfg.discovery_test_count
-    
+    total = len(combos)
     state.scan_progress = {
-        "phase": "discovery",
-        "current": 0,
-        "total": total_combos,
-        "server": target.server_name,
-        "country": target.country_code,
-        "next": f"Discovery: testing {total_combos} combos on {target.server_name}"
+        "phase": "discovery", "current": 0, "total": total,
+        "server": target.server_name, "country": target.country_code,
+        "next": f"Discovery: {total} combos on {target.server_name}",
     }
-    await broadcast_update("discovery_started", {
-        "server": target.server_name,
-        "combos": total_combos,
-        "tests_per_combo": tests_per_combo,
-    })
+    await broadcast_update("discovery_started", {"server": target.server_name, "combos": total,
+                                                 "tests_per_combo": tests_per_combo})
     await broadcast_update("progress_update", {"progress": state.scan_progress})
-    
-    for combo_idx, (config_path, port, entry_num) in enumerate(combos, 1):
+
+    this_scan: dict[str, list] = {}  # combo_key -> successful SpeedTestResults this scan
+    for idx, (config_path, port, entry_num) in enumerate(combos, 1):
+        await _wait_if_paused()
         if state.scan_cancelled:
             break
-        
-        combo_key = f"{port}_E{entry_num}"
-        logger.info(f"Discovery [{combo_idx}/{total_combos}]: port={port} entry=E{entry_num}")
-        
-        state.scan_progress["current"] = combo_idx
-        state.scan_progress["next"] = f"Discovery: {combo_key} ({combo_idx}/{total_combos})"
+        key = f"{port}_E{entry_num}"
+        rec = _combo_record(state.port_discovery_results.get(key), port, entry_num)
+        state.scan_progress.update(current=idx, next=f"Discovery: {key} on {target.server_name} ({idx}/{total})")
         await broadcast_update("progress_update", {"progress": state.scan_progress})
-        
+        logger.info(f"Discovery [{idx}/{total}]: {target.server_name} {key}")
+
         try:
-            # Connect with this combo's config
             result = await controller.connect(config_path)
             if not result.success:
-                logger.warning(f"Discovery: failed to connect with {combo_key}: {result.error}")
-                continue
-            
-            # Stabilize
-            await asyncio.sleep(VPN_STABILIZATION_WAIT)
-            
-            # Run speedtests
-            combo_results = []
-            for test_num in range(1, tests_per_combo + 1):
-                if state.scan_cancelled:
-                    break
-                
-                state.scan_progress["next"] = f"Discovery: {combo_key} test {test_num}/{tests_per_combo}"
-                await broadcast_update("progress_update", {"progress": state.scan_progress})
-                
-                res = await run_speedtest_for_country(
-                    target.country_code,
-                    secure=True
-                )
-                
-                if res.is_success:
-                    combo_results.append(res)
-                
-                if test_num < tests_per_combo:
-                    await asyncio.sleep(INTER_TEST_DELAY)
-            
-            # Average results for this combo
-            if combo_results:
-                avg = _average_speedtest_results(combo_results, f"DISCOVERY_{combo_key}")
-                
-                # Update or accumulate discovery results
-                existing = state.port_discovery_results.get(combo_key, {
-                    "download_mbps": 0, "upload_mbps": 0, "ping_ms": 0, "tests": 0, "history": []
-                })
-                prev_tests = existing["tests"]
-                new_tests = prev_tests + len(combo_results)
-                
-                # Running weighted average
-                state.port_discovery_results[combo_key] = {
-                    "download_mbps": round(
-                        (existing["download_mbps"] * prev_tests + avg.download_mbps * len(combo_results)) / new_tests, 2
-                    ),
-                    "upload_mbps": round(
-                        (existing["upload_mbps"] * prev_tests + avg.upload_mbps * len(combo_results)) / new_tests, 2
-                    ),
-                    "ping_ms": round(
-                        (existing["ping_ms"] * prev_tests + (avg.ping_ms or 0) * len(combo_results)) / new_tests, 2
-                    ),
-                    "tests": new_tests,
-                    "port": port,
-                    "entry": entry_num,
-                    "history": existing.get("history", []) + [res.to_dict() for res in combo_results]
-                }
-                
-                logger.info(
-                    f"Discovery {combo_key}: ↓{avg.download_mbps:.1f} ↑{avg.upload_mbps:.1f} "
-                    f"ping={avg.ping_ms:.1f}ms (total tests: {new_tests})"
-                )
-                
-                await broadcast_update("discovery_combo_complete", {
-                    "combo": combo_key,
-                    "results": state.port_discovery_results[combo_key],
-                })
-                
-                # Persist to config for survival across restarts (strip bulky history)
-                config_manager.config.scan.discovery_results = {
-                    k: {kk: vv for kk, vv in v.items() if kk != "history"}
-                    for k, v in state.port_discovery_results.items()
-                }
-                config_manager.save()
-        
+                logger.info(f"Discovery {key}: connect failed ({result.error}); retrying once")
+                await asyncio.sleep(5)
+                result = await controller.connect(config_path)
+            if not result.success:
+                # One failed attempt, not N: the speedtests never ran
+                rec["tests"] += 1
+                rec["history"].append({"tested_at": _utcnow_iso(), "server": target.server_name,
+                                       "error": f"Connect failed: {result.error}"})
+            else:
+                await asyncio.sleep(DISCOVERY_STABILIZE)
+                for test_num in range(1, tests_per_combo + 1):
+                    await _wait_if_paused()
+                    if state.scan_cancelled:
+                        break
+                    state.scan_progress["next"] = f"Discovery: {key} on {target.server_name} test {test_num}/{tests_per_combo}"
+                    await broadcast_update("progress_update", {"progress": state.scan_progress})
+                    res = await run_speedtest_for_country(target.country_code, secure=True)
+                    _reject_if_not_via_vpn(res, result.public_ip)
+                    rec["tests"] += 1
+                    entry = {"tested_at": res.tested_at.astimezone(timezone.utc).isoformat() if res.tested_at else _utcnow_iso(),
+                             "server": target.server_name}
+                    if res.is_success:
+                        # Only successful, verified-via-VPN tests feed the averages
+                        rec["success_tests"] += 1
+                        rec["dl_sum"] += res.download_mbps
+                        rec["ul_sum"] += res.upload_mbps
+                        rec["ping_sum"] += res.ping_ms
+                        this_scan.setdefault(key, []).append(res)
+                        entry.update(download_mbps=round(res.download_mbps, 2), upload_mbps=round(res.upload_mbps, 2),
+                                     ping_ms=round(res.ping_ms, 1))
+                    else:
+                        entry["error"] = res.error or "failed"
+                    rec["history"].append(entry)
+                    if test_num < tests_per_combo:
+                        await asyncio.sleep(10)
         finally:
             try:
                 await controller.disconnect(config_path)
             except Exception:
                 pass
-        
-        # Wait between combos
-        if combo_idx < total_combos and not state.scan_cancelled:
-            await _smart_wait(POST_SERVER_WAIT)
-    
-    await broadcast_update("discovery_scan_complete", {
-        "results": state.port_discovery_results,
-    })
+
+        _refresh_combo_stats(rec)
+        state.port_discovery_results[key] = rec
+        logger.info(f"Discovery {key}: avg ↓{rec['download_mbps']:.1f} ↑{rec['upload_mbps']:.1f} "
+                    f"ping {rec['ping_ms']:.1f}ms ({rec['success_tests']}/{rec['tests']} ok)")
+        await broadcast_update("discovery_combo_complete", {"combo": key, "results": rec})
+        _persist_discovery()
+
+    # Relative comparison within this scan (same server, same time window)
+    means = {k: (statistics.mean(r.download_mbps for r in v), statistics.mean(r.upload_mbps for r in v),
+                 statistics.mean(r.ping_ms for r in v)) for k, v in this_scan.items()}
+    if len(means) >= 2:
+        avg_dl = statistics.mean(m[0] for m in means.values()) or 1
+        avg_ul = statistics.mean(m[1] for m in means.values()) or 1
+        avg_inv_ping = statistics.mean(1 / max(m[2], 0.1) for m in means.values())
+        for k, (dl, ul, ping) in means.items():
+            rec = state.port_discovery_results[k]
+            rec["rel_dl_sum"] += dl / avg_dl
+            rec["rel_ul_sum"] += ul / avg_ul
+            rec["rel_ping_sum"] += (1 / max(ping, 0.1)) / avg_inv_ping
+            rec["rel_n"] += 1
+            _refresh_combo_stats(rec)
+        _persist_discovery()
+
+    await broadcast_update("discovery_scan_complete", {"server": target.server_name,
+                                                       "results": state.port_discovery_results})
+    # Cool down before the regular speedtests start
+    if not state.scan_cancelled:
+        await _smart_wait(scan_cfg.post_server_wait)
 
 
 async def _finalize_discovery():
     """
-    Called when discovery period expires.
-    Picks the best port/entry combo and updates config.
+    Called on the first scan after the discovery period ends. Picks the best combo
+    (relative score x success rate) among combos with enough successful tests, applies
+    it to Preferred Port/Entry (an "AUTO" entry choice is kept), and stops discovery.
     """
     scan_cfg = config_manager.config.scan
-    results = state.port_discovery_results
-    
-    if not results:
-        logger.warning("Discovery period ended but no results collected")
-        scan_cfg.port_discovery_enabled = False
+    allowed_entries = {1, 3} if scan_cfg.discovery_entry_filter == "ALL" else {int(scan_cfg.discovery_entry_filter[-1])}
+    results = {
+        k: _combo_record(v, v.get("port"), v.get("entry"))
+        for k, v in state.port_discovery_results.items()
+        if v.get("port") in scan_cfg.available_ports and v.get("entry") in allowed_entries
+    }
+    for r in results.values():
+        _refresh_combo_stats(r)
+    qualified = {k: r for k, r in results.items() if r["success_tests"] >= DISCOVERY_MIN_SUCCESS}
+
+    scan_cfg.port_discovery_enabled = False
+    scan_cfg.discovery_started_at = None
+    scan_cfg.discovery_finished_at = _utcnow_iso()
+
+    if not qualified:
+        scan_cfg.discovery_auto_port = None
+        scan_cfg.discovery_auto_entry = None
+        scan_cfg.discovery_outcome = (f"inconclusive: no combo reached {DISCOVERY_MIN_SUCCESS} successful tests; "
+                                      "kept current settings")
         config_manager.save()
+        logger.warning(f"Discovery finished: {scan_cfg.discovery_outcome}")
+        await broadcast_update("discovery_finalized", {"outcome": scan_cfg.discovery_outcome, "results": results})
         return
-    
-    # Find best combo by download speed (primary), then upload (secondary)
-    best_key = max(
-        results.keys(),
-        key=lambda k: (results[k].get("download_mbps", 0), results[k].get("upload_mbps", 0))
-    )
-    best = results[best_key]
-    
+
+    def score(r):
+        rel = r.get("relative_score", 1.0)  # 1.0 = neutral when only one combo was comparable
+        return rel * r["success_rate"]
+
+    best_key = max(qualified, key=lambda k: score(qualified[k]))
+    best = qualified[best_key]
     scan_cfg.discovery_auto_port = best["port"]
     scan_cfg.discovery_auto_entry = f"ENTRY{best['entry']}"
     scan_cfg.preferred_port = best["port"]
-    scan_cfg.preferred_entry_ip = f"ENTRY{best['entry']}"
-    scan_cfg.port_discovery_enabled = False
-    state.port_discovery_complete = True
-    
+    if scan_cfg.preferred_entry_ip != "AUTO":  # respect an explicit AUTO choice
+        scan_cfg.preferred_entry_ip = f"ENTRY{best['entry']}"
+    scan_cfg.discovery_outcome = f"{best['port']}/ENTRY{best['entry']}"
     config_manager.save()
-    
-    logger.info(
-        f"Discovery complete! Best combo: port={best['port']} entry=E{best['entry']} "
-        f"(↓{best['download_mbps']:.1f} ↑{best['upload_mbps']:.1f} ping={best['ping_ms']:.1f}ms "
-        f"from {best['tests']} tests)"
-    )
-    
+
+    logger.info(f"Discovery complete: best port={best['port']} entry=E{best['entry']} "
+                f"(↓{best['download_mbps']:.1f} ↑{best['upload_mbps']:.1f} ping={best['ping_ms']:.1f}ms, "
+                f"{best['success_tests']}/{best['tests']} ok, relative {best.get('relative_score', 1.0):.2f})")
     await broadcast_update("discovery_finalized", {
-        "best_port": best["port"],
-        "best_entry": best["entry"],
+        "best_port": best["port"], "best_entry": best["entry"], "outcome": scan_cfg.discovery_outcome,
         "results": results,
     })
 
@@ -837,8 +962,8 @@ def _should_skip_server(server_name: str) -> bool:
     if len(history) >= perf_cfg.check_count:
         recent = history[-perf_cfg.check_count:]
         all_below = all(
-            r.get("download_mbps", 0) < perf_cfg.threshold_download or
-            r.get("upload_mbps", 0) < perf_cfg.threshold_upload
+            r.get("download", r.get("download_mbps", 0)) < perf_cfg.threshold_download or
+            r.get("upload", r.get("upload_mbps", 0)) < perf_cfg.threshold_upload
             for r in recent
         )
         if all_below:
@@ -848,12 +973,16 @@ def _should_skip_server(server_name: str) -> bool:
     return False
 
 
-async def _run_single_server_speedtest(server, index, total, controller, tests_per_server, inter_test_delay, vpn_wait, config_override=None):
-    """Refactored single server speedtest runner using direct wg/ip commands (no namespaces)."""
+async def _run_single_server_speedtest(server, index, total, controller, tests_per_server, inter_test_delay, vpn_wait, config_override=None, scan_id=None):
+    """Refactored single server speedtest runner using direct wg/ip commands (no namespaces).
+
+    scan_id links the stored result to a scan (None for manual tests).
+    Returns None on success, otherwise a short reason (used for manual-run feedback).
+    """
     # Pre-check: skip if underperforming
     if _should_skip_server(server.server_name):
         logger.info(f"Skipping speedtest for {server.server_name} (below threshold / disabled)")
-        return
+        return "Skipped: server is disabled or below performance thresholds"
 
     # Update progress
     state.scan_progress["current"] = index
@@ -869,14 +998,14 @@ async def _run_single_server_speedtest(server, index, total, controller, tests_p
         # 1. Connect VPN directly (no namespace)
         if not conf_file:
             await _report_speedtest_error(server, "No config file available")
-            return
+            return "No config file available"
 
         logger.debug(f"Connecting to VPN for {server.server_name}")
         result = await controller.connect(conf_file)
         
         if not result.success:
              await _report_speedtest_error(server, f"Failed to connect: {result.error}")
-             return
+             return f"Failed to connect: {result.error}"
              
         # 2. Wait for VPN to stabilize
         state.scan_progress["next"] = "Stabilizing VPN..."
@@ -885,8 +1014,9 @@ async def _run_single_server_speedtest(server, index, total, controller, tests_p
         
         # 3. Run Tests (no namespace - runs directly in container)
         results = []
+        last_error = None
         for i in range(1, tests_per_server + 1):
-            if state.scan_cancelled: return
+            if state.scan_cancelled: return "Cancelled"
             state.scan_progress["next"] = f"Test {i}/{tests_per_server}"
             await broadcast_update("progress_update", {"progress": state.scan_progress})
             
@@ -904,14 +1034,21 @@ async def _run_single_server_speedtest(server, index, total, controller, tests_p
                 server.country_code, 
                 secure=True
             )
+            _reject_if_not_via_vpn(res, result.public_ip)
             
             if res.is_success:
                 results.append(res)
+            else:
+                last_error = res.error
             
             if i < tests_per_server:
                 await asyncio.sleep(inter_test_delay)
                 
         # Averaging and Reporting
+        if not results:
+            msg = f"All {tests_per_server} speedtest run(s) failed" + (f": {last_error}" if last_error else "")
+            await _report_speedtest_error(server, msg)
+            return msg
         if results:
             avg = _average_speedtest_results(results, server.server_name)
             dct = avg.to_dict()
@@ -965,8 +1102,6 @@ async def _run_single_server_speedtest(server, index, total, controller, tests_p
             # Persist to SQLite
             if state.db:
                 try:
-                    # Use current_scan_id if available (set in run_scan_task)
-                    scan_id = getattr(state, "current_scan_id", None)
                     await state.db.add_speedtest_result(dct, scan_id=scan_id)
                 except Exception as e:
                     logger.error(f"Failed to save speedtest to DB: {e}")
@@ -975,6 +1110,7 @@ async def _run_single_server_speedtest(server, index, total, controller, tests_p
                  "server": server.to_dict() if hasattr(server, 'to_dict') else {"server_name": server.server_name},
                  "summary": state.current_scan.to_dict() if state.current_scan else None
             })
+            return None
 
     finally:
         # Always disconnect VPN after test (cleanup for next server)
@@ -1016,17 +1152,43 @@ async def run_speedtest_task(server, current: int = None, total: int = None, con
     Creates its own WireGuard controller if none provided.
     """
     ctrl = controller or WireGuardController(use_sudo=None)
+    error = "Speedtest crashed (see logs)"
     try:
-        await _run_single_server_speedtest(
-            server,
-            current or 1,
-            total or 1,
-            ctrl,
-            tests_per_server=config_manager.config.scan.discovery_test_count,
-            inter_test_delay=10,
-            vpn_wait=30
-        )
+        # Queue behind any other VPN job (another manual test or a baseline)
+        async with network_job(f"speedtest {server.server_name}"):
+            # Own progress dict: a manual test must not leave the scan progress dirty
+            saved_progress = state.scan_progress
+            state.scan_progress = {"phase": "speedtesting", "current": 0, "total": total or 1,
+                                   "server": "", "country": "", "next": ""}
+            try:
+                error = await _run_single_server_speedtest(
+                    server,
+                    current or 1,
+                    total or 1,
+                    ctrl,
+                    tests_per_server=_speedtest_count(),
+                    inter_test_delay=10,
+                    vpn_wait=30,
+                    # Same port/entry as scan speedtests, so results are comparable
+                    config_override=await _resolve_server_config(server),
+                    scan_id=None,  # manual results don't belong to any scan
+                )
+            finally:
+                # Restore while still holding the lock, so a waiting scan's progress isn't overwritten
+                state.scan_progress = saved_progress if state.is_scanning else _idle_progress()
+                if not state.is_scanning:
+                    await broadcast_update("progress_update", {"progress": state.scan_progress})
     finally:
+        # Always tell the UI how a manual run ended (success, failure or skip)
+        result = server.speedtest_result if not error else None
+        await broadcast_update("speedtest_manual_done", {
+            "server": server.server_name,
+            "ok": error is None,
+            "error": error,
+            "download_mbps": result.get("download_mbps") if result else None,
+            "upload_mbps": result.get("upload_mbps") if result else None,
+            "ping_ms": result.get("ping_ms") if result else None,
+        })
         if not controller:
             try:
                 await ctrl.disconnect()

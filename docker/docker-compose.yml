@@ -48,15 +48,21 @@ services:
       - ./data:/app/data
       # Gluetun profiles output directory
       - ./gluetun:/app/gluetun
-      # Optional: mount Hummingbird binary
-      # - ./hummingbird:/usr/local/bin/hummingbird:ro
+      # Generated WireGuard configs (default profile output dir; files contain your private key)
+      - ./wireguard:/app/wireguard
     
     environment:
       # Scan interval in minutes
-      - SCAN_INTERVAL=120
+      # Optional: force the scan interval (minutes) on every start. Leave unset to use
+      # the interval saved in Settings (setting it here overrides the UI after each restart).
+      # - SCAN_INTERVAL=120
       
       # Web server port
       - PORT=5665
+      
+      # Time zone for scan schedules (e.g. "05:00") and log/history timestamps.
+      # Set your zone in docker/.env (TZ=Europe/London) or here; default UTC.
+      - TZ=${TZ:-UTC}
       
       # Config directory (inside container)
       - AIRBL_CONFIG_DIR=/app/conf
@@ -71,11 +77,15 @@ services:
       
       # DNS servers for DroneBL lookups
       - DNS_SERVERS=1.1.1.1,8.8.8.8
+      
+      # VPN kill switch during speedtests (container-only firewall; on by default).
+      # Automatically skipped with network_mode: host. Set to 0 to disable.
+      # - AIRBL_KILL_SWITCH=1
     
     restart: unless-stopped
     
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:5665/api/status"]
+      test: ["CMD-SHELL", "curl -f http://localhost:$${PORT:-5665}/api/status || exit 1"]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -104,9 +114,12 @@ services:
       - ./data:/app/data
       # Gluetun profiles output directory
       - ./gluetun:/app/gluetun
+      # Generated WireGuard configs (default profile output dir; files contain your private key)
+      - ./wireguard:/app/wireguard
     
     environment:
       - SCAN_INTERVAL=0
+      - TZ=${TZ:-UTC}
       # Cache directory (where database and cache files are stored)
       - AIRBL_CACHE_DIR=/app/data
     

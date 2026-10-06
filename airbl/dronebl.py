@@ -17,11 +17,23 @@ from dataclasses import dataclass, field
 from typing import Optional
 from datetime import datetime
 
+import dns.exception
 import dns.resolver
 import dns.asyncresolver
-from tenacity import retry, stop_after_attempt, wait_exponential
 
 from .config import settings, get_dronebl_reason
+
+RETRY_BACKOFF_SECONDS = 0.75
+
+_NAMESERVERS: Optional[list[str]] = None
+
+
+def _nameservers() -> list[str]:
+    """DNS_SERVERS env as a list, parsed once (empty = system resolver)."""
+    global _NAMESERVERS
+    if _NAMESERVERS is None:
+        _NAMESERVERS = settings.dns_server_list
+    return _NAMESERVERS
 
 
 @dataclass
@@ -35,6 +47,11 @@ class DroneBLResult:
     checked_at: datetime = field(default_factory=datetime.now)
     error: Optional[str] = None
     
+    @property
+    def is_verified(self) -> bool:
+        """True when DroneBL gave a definite answer (listed or not listed)."""
+        return self.error is None
+
     @property
     def status_color(self) -> str:
         """Return color for terminal display."""
@@ -100,7 +117,11 @@ async def check_dronebl(ip: str, timeout: float = None) -> DroneBLResult:
     
     try:
         query = build_dnsbl_query(ip)
-        resolver = dns.asyncresolver.Resolver()
+        nameservers = _nameservers()
+        # DNS_SERVERS env overrides the system resolver (resolv.conf not needed then)
+        resolver = dns.asyncresolver.Resolver(configure=not nameservers)
+        if nameservers:
+            resolver.nameservers = nameservers
         resolver.timeout = timeout
         resolver.lifetime = timeout
         
@@ -123,12 +144,14 @@ async def check_dronebl(ip: str, timeout: float = None) -> DroneBLResult:
                         lookup_time_ms=elapsed,
                     )
             
-            # Got a response but not in expected format
+            # Answer outside 127.0.0.x (e.g. a resolver hijacking DNSBL queries):
+            # we can't tell either way, so report it as an unverified lookup.
             elapsed = (asyncio.get_event_loop().time() - start_time) * 1000
             return DroneBLResult(
                 ip=ip,
                 is_listed=False,
                 lookup_time_ms=elapsed,
+                error=f"Unexpected DNSBL answer: {', '.join(str(r) for r in answers)}",
             )
             
         except dns.resolver.NXDOMAIN:
@@ -194,6 +217,10 @@ async def check_dronebl_batch(
         nonlocal checked
         async with semaphore:
             result = await check_dronebl(ip)
+            if result.error:
+                # One retry after a short pause: a single DNS timeout shouldn't leave the IP unverified
+                await asyncio.sleep(RETRY_BACKOFF_SECONDS)
+                result = await check_dronebl(ip)
             checked += 1
             if progress_callback:
                 progress_callback(checked, total)

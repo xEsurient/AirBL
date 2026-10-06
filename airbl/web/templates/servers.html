@@ -19,6 +19,7 @@
             <option value="clean" selected>Clean</option>
             <option value="">All</option>
             <option value="blocked">Banned</option>
+            <option value="unknown">Unverified</option>
         </select>
     </div>
     <div class="filter-group">
@@ -67,6 +68,10 @@
                 <h3>Server Info</h3>
                 <div class="info-grid" id="modalServerInfo"></div>
             </div>
+            <div class="modal-section" id="modalBlockNotesSection" style="display: none;">
+                <h3>🚫 Block Notes</h3>
+                <div id="modalBlockNotes" class="ip-list"></div>
+            </div>
             <div class="modal-section">
                 <h3>Performance</h3>
                 <div class="info-grid" id="modalPerformance"></div>
@@ -88,6 +93,4 @@
 </div>
 {% endblock %}
 
-{% block scripts %}
-<script src="/static/js/app.js"></script>
-{% endblock %}
+{% block scripts %}{% endblock %}

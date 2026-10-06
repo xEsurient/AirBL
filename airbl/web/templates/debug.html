@@ -287,6 +287,7 @@
         try {
             const response = await fetch('/api/debug/logs');
             const data = await response.json();
+            if (isPaused) return;  // paused while the request was in flight
             allLogs = data;
             renderLogs();
         } catch (e) {
@@ -359,9 +360,9 @@
         const clickHandler = isLong ? ' onclick="this.classList.toggle(\'truncated\');this.classList.toggle(\'expanded\')"' : '';
 
         return `<div class="log-entry ${cls}">
-            <span class="log-time" title="${entry.timestamp || ''}">${time}</span>
-            <span class="log-level">${level}</span>
-            <span class="log-module" title="${module}${entry.funcName ? '.' + entry.funcName : ''}:${entry.lineno || ''}">${module}</span>
+            <span class="log-time" title="${escapeHtml(entry.timestamp || '')}">${escapeHtml(time)}</span>
+            <span class="log-level">${escapeHtml(level)}</span>
+            <span class="log-module" title="${escapeHtml(module)}${entry.funcName ? '.' + escapeHtml(entry.funcName) : ''}:${escapeHtml(entry.lineno || '')}">${escapeHtml(module)}</span>
             <span class="${msgClass}"${clickHandler}>${highlightMsg(escapeHtml(rawMsg))}</span>
         </div>`;
     }
@@ -403,30 +404,18 @@
         renderLogs();
     }
 
-    function escapeHtml(text) {
-        if (!text) return '';
-        return text
-            .replace(/&/g, "&amp;")
-            .replace(/</g, "&lt;")
-            .replace(/>/g, "&gt;")
-            .replace(/"/g, "&quot;")
-            .replace(/'/g, "&#039;");
-    }
+    // escapeHtml comes from app.js
 
-    async function togglePause() {
+    // Pause is per-tab: just stop polling/rendering here
+    function togglePause() {
         const btn = document.getElementById('pauseDebugBtn');
         const dot = document.getElementById('liveDot');
-        try {
-            const response = await fetch('/api/debug/pause', { method: 'POST' });
-            const data = await response.json();
-            isPaused = data.paused;
-            btn.textContent = isPaused ? 'Resume' : 'Pause';
-            btn.classList.toggle('btn-warning', isPaused);
-            btn.classList.toggle('btn-secondary', !isPaused);
-            dot.classList.toggle('paused', isPaused);
-        } catch (e) {
-            console.error('Failed to toggle pause:', e);
-        }
+        isPaused = !isPaused;
+        btn.textContent = isPaused ? 'Resume' : 'Pause';
+        btn.classList.toggle('btn-warning', isPaused);
+        btn.classList.toggle('btn-secondary', !isPaused);
+        dot.classList.toggle('paused', isPaused);
+        if (!isPaused) fetchLogs();
     }
 
     async function clearLogs() {

@@ -1,25 +1,20 @@
 """
 Speedtest Module with Country-Specific Server Pinning.
 
-Uses speedtest-cli --list to find nearest servers dynamically,
+Uses Ookla speedtest CLI to find nearest servers dynamically,
 with failover support for consistent results.
 """
 
 import asyncio
 import json
 import logging
-import re
-import subprocess
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Optional, Dict, List
 
-from .config import settings, config_manager
+from .config import config_manager
 
 logger = logging.getLogger("airbl.speedtest")
-
-# Cache for country -> server IDs (with failover list)
-_country_server_cache: Dict[str, List[int]] = {}
 
 # Server blacklist: server_id -> (failure_count, blacklisted_until)
 _server_blacklist: Dict[int, tuple[int, datetime]] = {}
@@ -32,7 +27,7 @@ class SpeedTestServer:
     name: str
     location: str
     country: str
-    country_code: str
+    country_code: Optional[str]  # None when the country name is unknown
     distance_km: Optional[float] = None
 
 
@@ -47,6 +42,7 @@ class SpeedTestResult:
     server_location: Optional[str] = None
     server_country: Optional[str] = None
     client_ip: Optional[str] = None
+    external_ip: Optional[str] = None  # Ookla's view of our public IP (VPN egress check)
     client_isp: Optional[str] = None
     tested_at: datetime = field(default_factory=datetime.now)
     duration_seconds: float = 0.0
@@ -90,6 +86,8 @@ class SpeedTestResult:
             "server_id": self.server_id,
             "server_name": self.server_name,
             "server_location": self.server_location,
+            "server_country": self.server_country,
+            "external_ip": self.external_ip,
             "client_ip": self.client_ip,
             "tested_at": self.tested_at.isoformat() if self.tested_at else None,
             "score": round(self.score, 2),
@@ -97,87 +95,69 @@ class SpeedTestResult:
         }
 
 
-def _get_country_code_from_name(country_name: str) -> str:
-    """Simple mapping from country name to ISO code."""
-    # Common country name mappings
-    country_map = {
-        "germany": "DE",
-        "united states": "US",
-        "usa": "US",
-        "united kingdom": "GB",
-        "uk": "GB",
-        "france": "FR",
-        "italy": "IT",
-        "spain": "ES",
-        "netherlands": "NL",
-        "belgium": "BE",
-        "switzerland": "CH",
-        "austria": "AT",
-        "sweden": "SE",
-        "norway": "NO",
-        "denmark": "DK",
-        "finland": "FI",
-        "poland": "PL",
-        "portugal": "PT",
-        "greece": "GR",
-        "czech republic": "CZ",
-        "czechia": "CZ",
-        "romania": "RO",
-        "hungary": "HU",
-        "ireland": "IE",
-        "canada": "CA",
-        "australia": "AU",
-        "japan": "JP",
-        "south korea": "KR",
-        "singapore": "SG",
-        "hong kong": "HK",
-        "brazil": "BR",
-        "mexico": "MX",
-        "india": "IN",
-        "thailand": "TH",
-        "malaysia": "MY",
-        "indonesia": "ID",
-        "philippines": "PH",
-        "vietnam": "VN",
-        "taiwan": "TW",
-        "new zealand": "NZ",
-        "south africa": "ZA",
-        "turkey": "TR",
-        "israel": "IL",
-        "uae": "AE",
-        "united arab emirates": "AE",
-        "luxembourg": "LU",
-        "latvia": "LV",
-        "lithuania": "LT",
-        "slovakia": "SK",
-        "slovenia": "SI",
-        "croatia": "HR",
-        "serbia": "RS",
-        "ukraine": "UA",
-        "bulgaria": "BG",
-    }
-    
-    country_lower = country_name.lower().strip()
-    return country_map.get(country_lower, country_name[:2].upper() if len(country_name) >= 2 else "XX")
+# Country names as Ookla reports them (plus common variants) -> ISO 3166-1 alpha-2.
+# Guessing from the first two letters picks the wrong country (Estonia -> "ES",
+# Chile -> "CH"), so unknown names map to None instead.
+_COUNTRY_NAME_TO_CODE = {
+    "albania": "AL", "algeria": "DZ", "argentina": "AR", "armenia": "AM", "australia": "AU",
+    "austria": "AT", "azerbaijan": "AZ", "bahrain": "BH", "bangladesh": "BD", "belarus": "BY",
+    "belgium": "BE", "bolivia": "BO", "bosnia and herzegovina": "BA", "brazil": "BR",
+    "bulgaria": "BG", "cambodia": "KH", "canada": "CA", "chile": "CL", "china": "CN",
+    "colombia": "CO", "costa rica": "CR", "croatia": "HR", "cyprus": "CY",
+    "czech republic": "CZ", "czechia": "CZ", "denmark": "DK", "dominican republic": "DO",
+    "ecuador": "EC", "egypt": "EG", "estonia": "EE", "finland": "FI", "france": "FR",
+    "georgia": "GE", "germany": "DE", "greece": "GR", "guatemala": "GT", "hong kong": "HK",
+    "hong kong sar": "HK", "hungary": "HU", "iceland": "IS", "india": "IN", "indonesia": "ID",
+    "iraq": "IQ", "ireland": "IE", "isle of man": "IM", "israel": "IL", "italy": "IT",
+    "japan": "JP", "jordan": "JO", "kazakhstan": "KZ", "kenya": "KE", "kosovo": "XK",
+    "kuwait": "KW", "latvia": "LV", "lebanon": "LB", "liechtenstein": "LI", "lithuania": "LT",
+    "luxembourg": "LU", "macau": "MO", "macao": "MO", "malaysia": "MY", "malta": "MT",
+    "mexico": "MX", "moldova": "MD", "republic of moldova": "MD", "monaco": "MC",
+    "mongolia": "MN", "montenegro": "ME", "morocco": "MA", "netherlands": "NL",
+    "the netherlands": "NL", "new zealand": "NZ", "nigeria": "NG", "north macedonia": "MK",
+    "macedonia": "MK", "norway": "NO", "oman": "OM", "pakistan": "PK", "panama": "PA",
+    "paraguay": "PY", "peru": "PE", "philippines": "PH", "poland": "PL", "portugal": "PT",
+    "puerto rico": "PR", "qatar": "QA", "romania": "RO", "russia": "RU",
+    "russian federation": "RU", "saudi arabia": "SA", "serbia": "RS", "singapore": "SG",
+    "slovakia": "SK", "slovenia": "SI", "south africa": "ZA", "south korea": "KR",
+    "korea": "KR", "republic of korea": "KR", "korea, republic of": "KR", "spain": "ES",
+    "sri lanka": "LK", "sweden": "SE", "switzerland": "CH", "taiwan": "TW", "thailand": "TH",
+    "tunisia": "TN", "turkey": "TR", "turkiye": "TR", "türkiye": "TR", "ukraine": "UA",
+    "united arab emirates": "AE", "uae": "AE", "united kingdom": "GB", "uk": "GB",
+    "great britain": "GB", "england": "GB", "scotland": "GB", "wales": "GB",
+    "northern ireland": "GB", "united states": "US", "united states of america": "US",
+    "usa": "US", "us": "US", "uruguay": "UY", "uzbekistan": "UZ", "venezuela": "VE",
+    "vietnam": "VN", "viet nam": "VN",
+}
+
+
+def _get_country_code_from_name(country_name: Optional[str]) -> Optional[str]:
+    """ISO code for a country name as Ookla reports it, or None when unknown."""
+    code = _COUNTRY_NAME_TO_CODE.get((country_name or "").lower().strip())
+    if code is None and country_name:
+        logger.debug(f"Unknown speedtest country name: {country_name!r}")
+    return code
 
 
 async def list_speedtest_servers(secure: bool = True, max_retries: int = 3) -> List[SpeedTestServer]:
     """
-    Get list of available speedtest servers using --list.
+    Get list of available speedtest servers using official Ookla CLI.
     
     Args:
-        secure: Use HTTPS for server list retrieval
+        secure: Use HTTPS for server list retrieval (ignored for Ookla CLI)
         max_retries: Maximum number of retry attempts for DNS/network failures
         
     Returns:
-        List of SpeedTestServer objects sorted by distance
+        List of SpeedTestServer objects in the CLI's order (Ookla lists the
+        servers nearest to the current public IP first; -L has no distance field)
     """
-    cmd = ["speedtest-cli", "--list"]
-    if secure:
-        cmd.append("--secure")
+    import shutil
+    speedtest_bin = shutil.which("speedtest") or "speedtest"
+    cmd = [speedtest_bin, "-L", "-f", "json", "--accept-license", "--accept-gdpr"]
     
-    last_exception = None
+    stdout = None
     for attempt in range(max_retries):
+        process = None
         try:
             process = await asyncio.create_subprocess_exec(
                 *cmd,
@@ -185,73 +165,70 @@ async def list_speedtest_servers(secure: bool = True, max_retries: int = 3) -> L
                 stderr=asyncio.subprocess.PIPE,
             )
             
-            stdout, stderr = await asyncio.wait_for(
+            out, stderr = await asyncio.wait_for(
                 process.communicate(),
                 timeout=30,
             )
             
             if process.returncode != 0:
-                error_msg = stderr.decode().strip()
+                error_msg = _ookla_error(out, stderr)
                 raise Exception(f"Failed to list servers: {error_msg}")
             
-            # Success - break out of retry loop
-            break
+            stdout = out
+            break  # success: earlier failures no longer matter
             
+        except asyncio.CancelledError:
+            await _kill_process(process)
+            raise
         except asyncio.TimeoutError:
-            last_exception = Exception("Timeout while listing speedtest servers")
+            await _kill_process(process)  # don't leave the CLI running
             if attempt < max_retries - 1:
                 wait_time = 2 ** attempt  # Exponential backoff: 1s, 2s, 4s
                 logger.warning(f"Timeout listing servers, retrying in {wait_time}s (attempt {attempt+1}/{max_retries})")
                 await asyncio.sleep(wait_time)
                 continue
-            raise last_exception
+            raise Exception("Timeout while listing speedtest servers")
         except FileNotFoundError:
-            raise Exception("speedtest-cli not installed. Run: pip install speedtest-cli")
+            raise Exception("speedtest binary not installed in PATH.")
         except Exception as e:
             error_str = str(e).lower()
             # Check for DNS/network errors that might be transient
-            if any(keyword in error_str for keyword in ["name resolution", "dns", "temporary failure", "network", "connection"]):
-                last_exception = e
-                if attempt < max_retries - 1:
-                    wait_time = 2 ** attempt  # Exponential backoff
-                    logger.warning(f"DNS/network error listing servers: {e}, retrying in {wait_time}s (attempt {attempt+1}/{max_retries})")
-                    await asyncio.sleep(wait_time)
-                    continue
+            transient = any(keyword in error_str for keyword in
+                            ["name resolution", "dns", "temporary failure", "network", "connection"])
+            if transient and attempt < max_retries - 1:
+                wait_time = 2 ** attempt  # Exponential backoff
+                logger.warning(f"DNS/network error listing servers: {e}, retrying in {wait_time}s (attempt {attempt+1}/{max_retries})")
+                await asyncio.sleep(wait_time)
+                continue
             # Non-retryable error or out of retries
             raise
     
-    # If we get here, we had success on last attempt
-    if last_exception:
-        raise last_exception
+    if stdout is None:  # max_retries < 1
+        raise Exception("Failed to list speedtest servers")
     
     # Parse the output
-    output = stdout.decode("utf-8", errors="ignore")
+    try:
+        data = json.loads(stdout.decode())
+    except json.JSONDecodeError as e:
+        logger.error(f"Failed to parse speedtest JSON output: {e}")
+        logger.debug(f"Raw stdout: {stdout.decode()[:500]}")
+        raise Exception(f"Failed to parse server list JSON: {e}")
+    
     servers = []
     
-    # Parse output format: "12345) Server Name (Location, Country) [distance] km"
-    # Example: "4018) Vodafone GmbH (Frankfurt, Germany) [12.34] km"
-    pattern = re.compile(
-        r'(\d+)\)\s+(.+?)\s+\(([^,]+),\s+([^)]+)\)\s+(?:\[([\d.]+)\s*km\])?',
-        re.IGNORECASE
-    )
+    server_list = data.get("servers", [])
     
-    for line in output.splitlines():
-        line = line.strip()
-        if not line or line.startswith("Retrieving") or line.startswith("Selecting"):
-            continue
+    for s in server_list:
+        server_id = s.get("id")
+        name = s.get("name", "")
+        location = s.get("location", "")
+        country = s.get("country", "")
+        distance = s.get("distance")
         
-        match = pattern.match(line)
-        if match:
-            server_id = int(match.group(1))
-            name = match.group(2).strip()
-            location = match.group(3).strip()
-            country = match.group(4).strip()
-            distance_str = match.group(5)
-            distance = float(distance_str) if distance_str else None
-            
-            # Extract country code from country name
-            country_code = _get_country_code_from_name(country)
-            
+        # Extract country code from country name
+        country_code = _get_country_code_from_name(country)
+        
+        if server_id is not None:
             servers.append(SpeedTestServer(
                 server_id=server_id,
                 name=name,
@@ -261,9 +238,7 @@ async def list_speedtest_servers(secure: bool = True, max_retries: int = 3) -> L
                 distance_km=distance,
             ))
     
-    # Sort by distance (closest first), then by server ID
-    servers.sort(key=lambda s: (s.distance_km or float('inf'), s.server_id))
-    
+    # Keep the CLI's order: it is already nearest-first, and -L has no distance to sort by
     return servers
 
 
@@ -316,63 +291,38 @@ def _clear_expired_blacklist():
 
 
 async def get_speedtest_servers_for_country(
-    country_code: str,
+    country_code: Optional[str],
     max_servers: int = 3,
     secure: bool = True,
-    use_cache: bool = True,
 ) -> List[int]:
     """
-    Get list of speedtest server IDs for a country, sorted by distance.
+    Get list of speedtest server IDs for a country, nearest first.
     
-    Uses --list to find nearest servers dynamically, with caching.
-    Filters out blacklisted servers.
+    Lists servers fresh every time (no cache): Ookla's list depends on the current
+    public IP, which changes with every VPN server. Filters out blacklisted servers.
     
     Args:
-        country_code: ISO country code (e.g., "DE", "US")
+        country_code: ISO country code (e.g., "DE", "US"); None/unknown -> []
         max_servers: Maximum number of servers to return (for failover)
         secure: Use HTTPS
-        use_cache: Use cached results if available
         
     Returns:
         List of server IDs, closest first (excluding blacklisted servers)
     """
+    if not country_code:
+        return []
     country_code = country_code.upper()
     
     # Clear expired blacklist entries
     _clear_expired_blacklist()
     
-    # Check cache first
-    if use_cache and country_code in _country_server_cache:
-        cached = _country_server_cache[country_code]
-        # Filter out blacklisted servers
-        filtered = [sid for sid in cached if not _is_server_blacklisted(sid)]
-        return filtered[:max_servers]
-    
     try:
-        # Get all servers
         all_servers = await list_speedtest_servers(secure=secure)
         
-        # Filter by country code
-        country_servers = [
-            s for s in all_servers
-            if s.country_code.upper() == country_code
-        ]
-        
-        if not country_servers:
-            # Fallback: try to find by country name similarity
-            # This is a simple fallback - could be improved
-            return []
-        
-        # Extract server IDs, sorted by distance, excluding blacklisted
-        server_ids = [
-            s.server_id for s in country_servers
-            if not _is_server_blacklisted(s.server_id)
+        return [
+            s.server_id for s in all_servers
+            if s.country_code == country_code and not _is_server_blacklisted(s.server_id)
         ][:max_servers]
-        
-        # Cache the results (including blacklisted for future reference)
-        _country_server_cache[country_code] = [s.server_id for s in country_servers[:max_servers * 2]]
-        
-        return server_ids
         
     except Exception as e:
         # If listing fails, return empty list (will fall back to manual selection)
@@ -384,58 +334,36 @@ async def run_speedtest(
     server_id: Optional[int] = None,
     secure: bool = True,
     timeout: int = 180,
-    namespace = None,
 ) -> SpeedTestResult:
     """
-    Run speedtest-cli and return results.
+    Run official Ookla speedtest CLI and return results.
     
     Args:
         server_id: Specific speedtest server ID to use
-        secure: Use HTTPS for test (recommended)
+        secure: Ignored (Ookla CLI defaults to HTTPS)
         timeout: Maximum test duration in seconds
-        namespace: Optional NetworkNamespace to run inside
         
     Returns:
         SpeedTestResult with download/upload/ping
     """
     start_time = datetime.now()
     
-    # Get full path to speedtest-cli (in case we're in a venv)
+    # Get full path to speedtest
     import shutil
     import os
-    speedtest_bin = shutil.which("speedtest-cli") or "speedtest-cli"
+    speedtest_bin = shutil.which("speedtest") or "speedtest"
     
-    cmd = [speedtest_bin, "--json"]
-    if secure:
-        cmd.append("--secure")
+    cmd = [speedtest_bin, "-f", "json", "--accept-license", "--accept-gdpr"]
     if server_id:
-        cmd.extend(["--server", str(server_id)])
+        cmd.extend(["-s", str(server_id)])
     
     # Prepare environment - preserve PATH for venv
     env = os.environ.copy()
     
-    # Wrap in namespace if provided
-    original_cmd = list(cmd)
-    if namespace and getattr(namespace, 'exists', False):
-        # We need to run speedtest-cli inside the namespace using ip netns exec
-        
-        # Check if running as root or sudo is available
-        import shutil
-        is_root = os.geteuid() == 0
-        sudo_path = shutil.which("sudo")
-        
-        ns_cmd = ["ip", "netns", "exec", namespace.name]
-        
-        if not is_root and sudo_path:
-            # Use sudo if not root
-            cmd = [sudo_path, "-E"] + ns_cmd + cmd
-        else:
-            # If root or no sudo, try running directly
-            cmd = ns_cmd + cmd
-    
-    logger.debug(f"Starting speedtest: server_id={server_id}, secure={secure}, timeout={timeout}s")
+    logger.debug(f"Starting speedtest: server_id={server_id}, timeout={timeout}s")
     logger.debug(f"Command: {' '.join(cmd)}")
     
+    process = None
     try:
         process = await asyncio.create_subprocess_exec(
             *cmd,
@@ -452,10 +380,10 @@ async def run_speedtest(
         duration = (datetime.now() - start_time).total_seconds()
         
         if process.returncode != 0:
-            error_msg = stderr.decode().strip()
+            error_msg = _ookla_error(stdout, stderr)
             logger.error(f"Speedtest failed (returncode={process.returncode}): {error_msg}")
-            # Check for "No matched servers" error
-            if "No matched servers" in error_msg or "ERROR: No matched servers" in error_msg:
+            # Check for common Ookla CLI errors
+            if "Configuration error" in error_msg or "No servers found" in error_msg:
                 error_msg = f"Server {server_id} not available"
             return SpeedTestResult(
                 download_mbps=0,
@@ -467,12 +395,12 @@ async def run_speedtest(
         
         data = json.loads(stdout.decode())
         
-        download_mbps = data["download"] / 1_000_000  # bits to Mbps
-        upload_mbps = data["upload"] / 1_000_000
-        ping_ms = data["ping"]
+        # Bandwidth is returned in bytes/s. Convert to Mbps.
+        download_mbps = (data.get("download", {}).get("bandwidth", 0) * 8) / 1_000_000
+        upload_mbps = (data.get("upload", {}).get("bandwidth", 0) * 8) / 1_000_000
+        ping_ms = data.get("ping", {}).get("latency", 0.0)
         
-        # Speedtest-cli sometimes returns astronomical pings (e.g. 1000000) when latency tests fail.
-        # Mark these as failed tests rather than letting them pass with perfect deviation scores.
+        # Impossible pings guard
         if ping_ms > 10000:
             return SpeedTestResult(
                 download_mbps=download_mbps,
@@ -482,16 +410,23 @@ async def run_speedtest(
                 error=f"Speedtest latency test failed (impossible ping: {ping_ms}ms)",
             )
             
+        server_info = data.get("server", {})
+        client_info = data.get("interface", {})
+        isp_info = data.get("isp", "")
+        
+        server_country_name = server_info.get("country", "")
+        
         result = SpeedTestResult(
             download_mbps=download_mbps,
             upload_mbps=upload_mbps,
             ping_ms=ping_ms,
-            server_id=data["server"]["id"],
-            server_name=data["server"]["sponsor"],
-            server_location=f"{data['server']['name']}, {data['server']['country']}",
-            server_country=data["server"]["cc"],
-            client_ip=data["client"]["ip"],
-            client_isp=data["client"]["isp"],
+            server_id=server_info.get("id"),
+            server_name=server_info.get("name"),
+            server_location=f"{server_info.get('location')}, {server_country_name}",
+            server_country=_get_country_code_from_name(server_country_name),
+            client_ip=client_info.get("externalIp") or client_info.get("internalIp"),
+            external_ip=client_info.get("externalIp"),
+            client_isp=isp_info,
             duration_seconds=duration,
         )
         
@@ -510,7 +445,12 @@ async def run_speedtest(
         
         return result
         
+    except asyncio.CancelledError:
+        # Job cancelled: never leave the CLI running past VPN teardown
+        await _kill_process(process)
+        raise
     except asyncio.TimeoutError:
+        await _kill_process(process)  # a surviving CLI would keep measuring over the direct line
         duration = (datetime.now() - start_time).total_seconds()
         logger.error(f"Speedtest timed out after {timeout}s")
         return SpeedTestResult(
@@ -521,12 +461,12 @@ async def run_speedtest(
             error=f"Speedtest timed out after {timeout}s",
         )
     except FileNotFoundError:
-        logger.error("speedtest-cli not found in PATH")
+        logger.error("speedtest binary not found in PATH")
         return SpeedTestResult(
             download_mbps=0,
             upload_mbps=0,
             ping_ms=0,
-            error="speedtest-cli not installed. Run: pip install speedtest-cli",
+            error="speedtest binary not installed.",
         )
     except json.JSONDecodeError as e:
         logger.error(f"Failed to parse speedtest JSON output: {e}")
@@ -547,12 +487,51 @@ async def run_speedtest(
         )
 
 
+def _ookla_error(stdout: bytes, stderr: bytes) -> str:
+    """Readable error from a failed Ookla run.
+
+    With -f json the CLI reports errors as JSON log lines on stdout; stderr only
+    holds the licence banner on a fresh install, which hid the real cause.
+    """
+    messages = []
+    for line in (stdout or b"").decode(errors="ignore").splitlines():
+        try:
+            entry = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(entry, dict) and entry.get("type") == "log" and entry.get("message"):
+            messages.append(str(entry["message"]).strip())
+    if messages:
+        return "; ".join(messages)
+    text = (stderr or b"").decode(errors="ignore")
+    if "License acceptance recorded" in text or "=====" in text:
+        text = text.split("Continuing.")[-1] if "Continuing." in text else ""
+    if text.strip():
+        return text.strip()
+    # Nothing recognisable: show what the CLI did print, so failures can be diagnosed
+    raw = " ".join((stdout or b"").decode(errors="ignore").split())
+    return f"Speedtest failed: {raw[:300]}" if raw else "Speedtest failed (no error output)"
+
+
+async def _kill_process(process) -> None:
+    """Kill and reap a subprocess if it is still running."""
+    if process is None or process.returncode is not None:
+        return
+    try:
+        process.kill()
+    except ProcessLookupError:
+        return
+    try:
+        await asyncio.wait_for(process.wait(), timeout=5)
+    except asyncio.TimeoutError:
+        logger.warning(f"Speedtest process {process.pid} did not exit after kill")
+
+
 async def run_speedtest_for_country(
-    country_code: str,
+    country_code: Optional[str],
     secure: bool = True,
     timeout: int = 180,
     max_retries: int = 2,
-    namespace = None,
 ) -> SpeedTestResult:
     """
     Run speedtest using the nearest server for a specific country.
@@ -564,27 +543,24 @@ async def run_speedtest_for_country(
         secure: Use HTTPS
         timeout: Test timeout
         max_retries: Maximum number of servers to try (failover)
-        namespace: Optional namespace
         
     Returns:
         SpeedTestResult
     """
-    country_code = country_code.upper()
+    country_code = (country_code or "").upper() or None
     
     logger.debug(f"Getting speedtest servers for country: {country_code}")
-    # Get list of servers for this country (sorted by distance)
-    # Disable cache when running through VPN to ensure we get servers available from VPN exit IP
+    # Servers for this country, nearest first (listed via the current VPN exit)
     server_ids = await get_speedtest_servers_for_country(
         country_code,
         max_servers=max_retries + 1,  # Get one extra for failover
         secure=secure,
-        use_cache=False,  # Don't use cache when running through VPN
     )
     
     if not server_ids:
         logger.warning(f"No servers found for {country_code}, falling back to auto-select")
-        # Fallback: try without server pinning (let speedtest-cli choose)
-        return await run_speedtest(server_id=None, secure=secure, timeout=timeout, namespace=namespace)
+        # Fallback: try without server pinning (let Ookla CLI choose)
+        return await run_speedtest(server_id=None, secure=secure, timeout=timeout)
     
     logger.info(f"Found {len(server_ids)} servers for {country_code}, trying up to {max_retries + 1}")
     
@@ -593,7 +569,7 @@ async def run_speedtest_for_country(
     last_result = None
     for i, server_id in enumerate(server_ids[:max_retries + 1]):
         logger.debug(f"Attempting speedtest {i+1}/{min(len(server_ids), max_retries + 1)} with server {server_id}")
-        result = await run_speedtest(server_id=server_id, secure=secure, timeout=timeout, namespace=namespace)
+        result = await run_speedtest(server_id=server_id, secure=secure, timeout=timeout)
         last_result = result
         
         if result.is_success:
@@ -606,9 +582,10 @@ async def run_speedtest_for_country(
         # Ensure error is set for logging
         error_msg = result.error or "Unknown error"
         
-        # Check if it's a "server not available" error
-        if result.error and ("not available" in result.error.lower() or 
-                           "No matched servers" in result.error):
+        # Only Ookla's own "server not available" (No servers / Configuration error)
+        # blames the server. Timeouts, 0 Mbps and network errors are usually our tunnel,
+        # so they must not blacklist a working Ookla server for days.
+        if result.error and "not available" in result.error.lower():
             last_error = result.error
             logger.warning(f"Server {server_id} not available: {result.error}, trying next server")
             _blacklist_server(server_id)
@@ -619,15 +596,12 @@ async def run_speedtest_for_country(
             # 0.00 download is a partial failure - try next server
             last_error = result.error
             logger.warning(f"Server {server_id} returned 0.00 Mbps download: {result.error}, trying next server")
-            _blacklist_server(server_id)
             continue
         else:
             # Other error (timeout, network, etc.) - try next server if available, otherwise return
             last_error = error_msg
             logger.warning(f"Speedtest failed with server {server_id}: {error_msg}")
             if i < len(server_ids) - 1:
-                # Try next server
-                _blacklist_server(server_id)
                 continue
             else:
                 # Last server, return the error
@@ -648,23 +622,10 @@ async def run_speedtest_for_country(
     )
 
 
-def clear_server_cache():
-    """Clear the server ID cache (useful for testing or refresh)."""
-    global _country_server_cache
-    _country_server_cache.clear()
-
-
 def clear_server_blacklist():
     """Clear the server blacklist (useful for testing or manual reset)."""
-    global _server_blacklist
     _server_blacklist.clear()
     logger.info("Server blacklist cleared")
-
-
-def get_available_countries() -> list[str]:
-    """Get list of countries with configured speedtest servers."""
-    # This is now dynamic, but we keep it for backward compatibility
-    return list(_country_server_cache.keys())
 
 
 # Synchronous wrapper

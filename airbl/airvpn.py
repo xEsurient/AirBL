@@ -41,11 +41,8 @@ class AirVPNServer:
     
     @property
     def all_ipv4(self) -> list[str]:
-        """Get all IPv4 addresses for this server (Entry 1 and 3)."""
-        ips = [self.ip_v4_in1]
-        if self.ip_v4_in3:
-            ips.append(self.ip_v4_in3)
-        return ips
+        """Get all IPv4 addresses for this server (Entry 1 and 3), skipping empty ones."""
+        return [ip for ip in (self.ip_v4_in1, self.ip_v4_in3) if ip]
     
     @property
     def load_color(self) -> str:
@@ -172,7 +169,7 @@ class AirVPNClient:
                 bandwidth_max=s.get("bw_max", 0),
                 users=s.get("users", 0),
                 load_percent=s.get("currentload", 0),
-                ip_v4_in1=s.get("ip_v4_in1", ""),
+                ip_v4_in1=s.get("ip_v4_in1") or "",
                 ip_v4_in3=s.get("ip_v4_in3"),
                 ip_v6_in1=s.get("ip_v6_in1"),
                 ip_v6_in3=s.get("ip_v6_in3"),

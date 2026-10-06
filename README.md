@@ -7,56 +7,55 @@
 </div>
 
 ---
-> [!NOTE]  
-> This readme was AI generated (excluding the header!), whilst the information has been proofchecked, it looks like crap and is an info dump at the end of the day, hopefully I can condense this in the future but readme files are not my strong suit.
 
 **AirBL** is a comprehensive toolkit designed to optimize your AirVPN connections. It continuously scans AirVPN infrastructure, drops unresponsive or DroneBL-blacklisted endpoints, performs speed and latency tests, and actively generates routing configurations for your local network—all controlled through a beautiful, glassmorphism web dashboard.
 
 ## 🌟 Key Features
 
-- 🔍 **DNS-Guided Endpoints**: Uses direct DNS polling and rapid ICMP latency sampling to map accurate Entry and Exit IP pairs without generating legacy subnet noise.
-- 🚫 **DroneBL Verification**: Automatically drops Exit IPs logged on the [DroneBL](https://dronebl.org/) abuser blocklist.
-- 📡 **Port & Entry Discovery**: Intelligently cycles across all protocol combos (e.g. 1637, 47107) and entry IPs across a multi-day test window to discover the absolute fastest networking route for your ISP.
-- ⚡ **"Best Route" Discovery**: Logs historical latency database metrics to deduce the absolute fastest entry point (`AUTO` routing mode).
-- 🚀 **Automated Speedtesting**: Validates throughput inline via isolated namespaces and permanently bans under-performing routing chains.
-- 🌐 **RFC1918 Policy Routing**: Intelligent Docker bridge bypassing ensures you never lose access to the Web Interface. UI calls are automatically routed over the host while aggressive VPN benchmarks are encapsulated transparently in the background.
-- 📊 **Advanced Historic Metrics**: An isolated dashboard dedicated to long-term environment telemetry. Identify systemic latency shifts, map long-tail ban frequencies, and monitor aggregated DroneBL strikes dynamically on interactive Chart.js graphs.
-- 🔗 **Gluetun Supercharger**: Natively filters `servers.json` profiles for Gluetun and triggers smart internal control API restarts based on custom rules (e.g., `CLEAN_ONLY`, `NOT_TOP4`).
-- 🔒 **Dynamic Config Generation**: Say goodbye to mounting thousands of `wg0.conf` profiles! Provide *one* configuration or just your private key, and AirBL dynamically generates valid WireGuard structures on the fly mapped strictly to clean ping-priority endpoints.
-- 🖥️ **Sleek Web Interface**: Fully responsive, dark-mode real-time dashboard to manage server filters, thresholds, and view history.
-- 🐳 **Docker-Native**: Built precisely for Docker, with embedded `wg-quick` policy routing that isolates test payloads.
+- 🔍 **DNS-Guided Endpoints**: Looks up each server's exit IPs via AirVPN DNS (IPv4 and IPv6) and pings entry and exit IPs over both ICMP and TCP, keeping the lower latency (some hosts block one or the other).
+- 🚫 **DroneBL Verification**: Checks every exit IP against the [DroneBL](https://dronebl.org/) blocklist. A server is **Clean** only when every exit IP was verified unlisted; any listing makes it **Blocked**, and failed lookups make it **Unverified** (never treated as clean). Blocked servers show the DroneBL reason.
+- 🚀 **Verified Speedtesting**: Brings up its own WireGuard tunnel, waits for a real handshake and confirms traffic leaves via AirVPN before measuring. A kill switch, a fallback route and a per-result exit-IP check make sure nothing is measured over your normal connection. Servers that stay below your thresholds are auto-disabled.
+- 📡 **Port & Entry Discovery**: Over a multi-day window, tests every port × entry combination (1637, 47107, 51820 × Entry 1/3) on your best servers. Combos are compared within the same scan, and the winner becomes your preferred port/entry.
+- 🔗 **Gluetun Integration**: Writes a filtered AirVPN server list for Gluetun (current `servers/airvpn.json` or legacy `servers.json` format). It can also switch a running local or remote Gluetun to clean servers through its control API (API key supported), using rules like *Clean Only* or *Reset if not Top 4*.
+- 🔒 **WireGuard Profile Generation**: Generates `.conf` files per server, the best server per country or city, or just the fastest one, plus an always-current `wg0.conf`.
+- 📊 **History & Metrics**: Scan history, speedtests and ban frequency are kept in SQLite and charted on the dashboard.
+- 🖥️ **Web Dashboard**: Live dashboard with server filters, settings, discovery results and a debug log.
+- 🐳 **Docker-Native**: Policy routing keeps the dashboard reachable while tests run inside the container. Schedules use your local time zone (`TZ`).
 
 > Need to see it to believe it? Check out `https://xesurient.github.io/AirBL/`.
 
 ## 🚀 Quick Start (Docker)
 
-AirBL is designed to run isolated inside a container with `wg-quick` routing correctly sequestered via policy routing.
+### 1. Add your AirVPN WireGuard configs
+Put the AirVPN WireGuard `.conf` files for the servers you want to scan into `docker/conf/` (generate them in the AirVPN Config Generator). **Each scanned server needs its own `.conf`.** AirBL also reads your client identity (keys and address) from them to generate extra configs for port/entry discovery.
 
-### 1. Mount Configuration Identity
-Drop **just one** standard AirVPN WireGuard `.conf` file into the `/conf` directory. AirBL will parse it to safely extract your `PrivateKey`, `PublicKey`, and internal `Address` parameters without leaking your credentials. After capturing your identity, the system dynamically synthesizes all future port combinations and entry server connections in real time into its internal isolated `/confgen` directory!
+### 2. Optional: set your time zone
+Create `docker/.env` with e.g. `TZ=Europe/London` so schedules like "05:00" use your local time (default UTC).
 
-### 2. Start the Stack
+### 3. Start the stack
 ```bash
-docker-compose -f docker/docker-compose.yml up -d
+cd docker && docker compose up -d --build
 ```
 
-### 3. Access Dashboard
-Navigate to `http://localhost:5665` in your browser.
+### 4. Open the dashboard
+`http://<host>:5665`, then choose countries/servers and schedules under **Settings**.
 
-## 🔗 Integrated VPN Generation
+## 🔗 Outputs
 
-### Gluetun Generation
-AirBL replaces Gluetun's static configuration methodology. You can natively inject a rebuilt `servers.json` packed strictly with latency-optimized endpoints. Furthermore, AirBL can ping Gluetun's control API to trigger a smart container restart only when your active endpoint drops out of the "Top 4" safe list.
+### Gluetun
+Mount a folder shared with Gluetun at `/app/gluetun` and enable a Gluetun profile. See [Gluetun Integration](docs/Gluetun-Integration.md) for which file your Gluetun version reads and how to set up the control API.
 
 ### WireGuard Profiles
-Build perfect WireGuard sub-configs using `AUTO` Entry-IP resolution, MTU clamping, and split-layer IPv4/IPv6 exit behavior, all injected with your secure private key directly from the dashboard.
+Generated configs are written to `/app/wireguard` (mounted as `docker/wireguard`). See [WireGuard Generation](docs/WireGuard-Integration.md).
 
 ## 📚 Documentation
-For detailed guidance on configuration filters, network routing, and deployment architecture, please check the [Wiki pages](https://github.com/xEsurient/AirBL/wiki/Home.md):
 - [Installation instructions](https://github.com/xEsurient/AirBL/wiki/Installation.md)
 - [Configuration options](https://github.com/xEsurient/AirBL/wiki/Configuration.md)
 - [Gluetun Integration](https://github.com/xEsurient/AirBL/wiki/Gluetun-Integration.md)
 - [WireGuard Generation](https://github.com/xEsurient/AirBL/wiki/WireGuard-Integration.md)
+
+## 🧪 Tests
+`pip install -r requirements.txt pytest pytest-asyncio && python -m pytest -q` (about 1 s, no network). Browser checks for a running instance are in `tests/browser/`.
 
 ## 📝 License
 Built under the GNU General Public License v3.0 (GPL-3.0). This project is community-supported and unaffiliated directly with AirVPN.

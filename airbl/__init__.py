@@ -24,7 +24,6 @@ __all__ = [
     "PingResult",
     # VPN Controllers
     "WireGuardController",
-    "HummingbirdController",
     # Config
     "settings",
     "Settings",

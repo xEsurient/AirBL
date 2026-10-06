@@ -6,6 +6,7 @@ based on user performance thresholds, and generates a custom servers.json for Gl
 """
 
 import json
+import os
 import logging
 import time
 from pathlib import Path
@@ -18,17 +19,23 @@ logger = logging.getLogger("airbl.gluetun")
 
 WG_PUBKEY = "PyLCXAQT8KkM4T+dUsOQfn+Ub3pGxfGlxkIApuig+hk="
 
+# Country code -> region, covering every country AirVPN has (had) servers in plus neighbours,
+# so no exported server ends up in region "Unknown".
 REGION_MAP = {
-    "US": "Americas", "CA": "Americas", "BR": "Americas", "MX": "Americas",
+    "US": "Americas", "CA": "Americas", "BR": "Americas", "MX": "Americas", "AR": "Americas",
+    "CL": "Americas", "CO": "Americas", "PE": "Americas", "PA": "Americas", "CR": "Americas",
     "GB": "Europe", "UK": "Europe", "DE": "Europe", "NL": "Europe", "FR": "Europe", "CH": "Europe",
     "SE": "Europe", "ES": "Europe", "IT": "Europe", "RO": "Europe", "BG": "Europe", "AT": "Europe",
     "BE": "Europe", "CZ": "Europe", "DK": "Europe", "FI": "Europe", "HU": "Europe", "IE": "Europe",
     "LV": "Europe", "LT": "Europe", "LU": "Europe", "NO": "Europe", "PL": "Europe", "PT": "Europe",
-    "RS": "Europe", "SK": "Europe", "UA": "Europe",
+    "RS": "Europe", "SK": "Europe", "UA": "Europe", "EE": "Europe", "IS": "Europe", "GR": "Europe",
+    "HR": "Europe", "SI": "Europe", "CY": "Europe", "MT": "Europe", "MD": "Europe", "AL": "Europe",
+    "BA": "Europe", "MK": "Europe", "ME": "Europe", "LI": "Europe", "MC": "Europe", "IM": "Europe",
     "AU": "Oceania", "NZ": "Oceania",
     "JP": "Asia", "SG": "Asia", "HK": "Asia", "IN": "Asia", "TW": "Asia", "TH": "Asia", "MY": "Asia",
-    "ZA": "Africa",
-    "IL": "Middle East", "AE": "Middle East", "TR": "Middle East"
+    "KR": "Asia", "ID": "Asia", "PH": "Asia", "VN": "Asia", "KH": "Asia",
+    "ZA": "Africa", "EG": "Africa", "NG": "Africa", "KE": "Africa",
+    "IL": "Middle East", "AE": "Middle East", "TR": "Middle East", "SA": "Middle East", "QA": "Middle East",
 }
 
 
@@ -110,243 +117,320 @@ async def _get_servers_for_gluetun_generation():
     servers = []
     for s_raw in last_servers:
         name = s_raw["server_name"]
-        is_clean = not s_raw.get("is_blocked", False)
+        from .database import row_is_clean
+        is_clean = row_is_clean(s_raw)
         score = s_raw.get("score", 0)
         servers.append(MockServer(name, is_clean, score))
         
     return servers
 
 
+def _gluetun_name(server) -> str:
+    """Server name as Gluetun knows it (no 'AirVPN ' prefix)."""
+    return server.server_name.replace("AirVPN ", "").strip()
+
+
+def _server_ips(server) -> set:
+    """All known IPs of a server: entry IPs plus scanned exit IPs."""
+    ips = set()
+    for ping in (getattr(server, "entry1_ping", None), getattr(server, "entry3_ping", None),
+                 getattr(server, "exit_ping", None)):
+        if ping and ping.ip:
+            ips.add(ping.ip)
+    for scanned in getattr(server, "scanned_ips", None) or []:
+        ips.add(scanned.ip)
+    return ips
+
+
+def _endpoint_ips(server, strategy: str) -> list:
+    """Pick entry IPs to export according to the profile endpoint strategy."""
+    entry1 = server.entry1_ping
+    entry3 = server.entry3_ping
+    e1_ok = bool(entry1 and entry1.is_alive and entry1.ip)
+    e3_ok = bool(entry3 and entry3.is_alive and entry3.ip)
+
+    if strategy == "ENTRY1":
+        return [entry1.ip] if e1_ok else []
+    if strategy == "ENTRY3":
+        return [entry3.ip] if e3_ok else []
+    if strategy == "PING_PRIORITY":
+        candidates = [p for p, ok in ((entry1, e1_ok), (entry3, e3_ok)) if ok and p.avg_rtt_ms is not None]
+        if not candidates:
+            return []
+        return [min(candidates, key=lambda p: p.avg_rtt_ms).ip]
+    # ALL
+    return [p.ip for p, ok in ((entry1, e1_ok), (entry3, e3_ok)) if ok]
+
+
+def _filter_profile_servers(profile, servers) -> list:
+    """Apply a profile's thresholds. Returns [(server, [endpoint ips])]."""
+    strategy = getattr(profile, 'endpoint_strategy', 'ALL')
+    allowed_countries = {c.upper() for c in profile.allowed_countries}
+    allowed_cities = {c.lower() for c in profile.allowed_cities}
+
+    result = []
+    for server in servers:
+        if profile.require_clean and not server.is_clean:
+            continue
+        if allowed_countries and server.country_code.upper() not in allowed_countries:
+            continue
+        if allowed_cities and server.location.lower() not in allowed_cities:
+            continue
+
+        speedtest = server.speedtest_result
+        if not speedtest:
+            if profile.min_download_mbps > 0 or profile.min_upload_mbps > 0:
+                continue
+        else:
+            dl = speedtest.get("download_mbps") or 0
+            ul = speedtest.get("upload_mbps") or 0
+            if dl < profile.min_download_mbps or ul < profile.min_upload_mbps:
+                continue
+
+        ips = _endpoint_ips(server, strategy)
+        if not ips:
+            logger.debug(f"Skipping {server.server_name}: no alive endpoint for strategy {strategy}.")
+            continue
+        result.append((server, ips))
+    return result
+
+
+def _write_servers_json(profile, filtered) -> bool:
+    """Write a Gluetun-compatible servers.json (same schema as Gluetun's own file)."""
+    output_path = Path(profile.output_path)
+    entries = []
+    for server, ips in filtered:
+        entries.append({
+            "vpn": "wireguard",
+            "country": server.country_name,
+            "region": REGION_MAP.get(server.country_code.upper(), "Unknown"),
+            "city": server.location,
+            "server_name": _gluetun_name(server),
+            "hostname": f"{server.country_code.lower()}.vpn.airdns.org",
+            "wgpubkey": server.wg_pubkey or WG_PUBKEY,
+            "ips": ips,
+        })
+
+    if not entries:
+        # An empty-but-newer file would make Gluetun drop every AirVPN server.
+        logger.warning(f"Profile '{profile.name}' matched no servers; keeping previous {output_path}.")
+        return False
+
+    # Schema versions must match Gluetun's built-in ones (top-level 1, airvpn 1),
+    # otherwise Gluetun silently discards the file. "preferred" makes newer Gluetun
+    # use this list even if its built-in list has a newer timestamp.
+    provider_data = {
+        "version": 1,
+        "timestamp": int(time.time()),
+        "preferred": True,
+        "servers": entries,
+    }
+    # Newer Gluetun migrates /gluetun/servers.json once into /gluetun/servers/<provider>.json
+    # and ignores servers.json afterwards; a file named airvpn.json gets that per-provider format.
+    if output_path.name == "airvpn.json":
+        custom_data = provider_data
+    else:
+        custom_data = {"version": 1, "airvpn": provider_data}
+
+    try:
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        temp_path = output_path.with_name(output_path.name + ".tmp")
+        with open(temp_path, 'w', encoding='utf-8') as f:
+            json.dump(custom_data, f, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        temp_path.replace(output_path)
+        logger.info(f"Profile '{profile.name}': wrote {len(entries)} servers to {output_path}")
+        return True
+    except Exception as e:
+        logger.error(f"Error writing Gluetun servers.json for '{profile.name}': {e}")
+        return False
+
+
+def _control_profile(cfg):
+    """Profile whose server list is pushed to Gluetun: named control_profile, else first enabled."""
+    enabled = [p for p in cfg.profiles if p.enabled]
+    if cfg.control_profile:
+        for p in enabled:
+            if p.name == cfg.control_profile:
+                return p
+    return enabled[0] if enabled else None
+
+
 async def generate_gluetun_servers_json():
     """
-    Generate the custom servers.json for Gluetun based natively on the live scanner state payload.
-    Supports dynamic endpoint filtering strategies (ENTRY1, ENTRY3, PING_PRIORITY, ALL).
+    Generate a custom servers.json per enabled profile, then (optionally) point a
+    local or remote Gluetun at the chosen servers via its control server API.
     """
-    config = config_manager.config.gluetun
-    profiles = config.profiles
-    
-    active_profiles = [p for p in profiles if p.enabled]
+    cfg = config_manager.config.gluetun
+    active_profiles = [p for p in cfg.profiles if p.enabled]
     if not active_profiles:
         logger.debug("No active Gluetun profiles. Generation disabled.")
         return
-        
+
     servers = await _get_servers_for_gluetun_generation()
     if not servers:
         logger.warning("Cannot generate Gluetun servers.json: No scan results available yet.")
         return
-        
-    # Process each profile
+
+    filtered_by_profile = {}
     for profile in active_profiles:
-        logger.info(f"Processing Gluetun profile: {profile.name}")
-        output_path = Path(profile.output_path)
-        strategy = getattr(profile, 'endpoint_strategy', 'ALL')
-        
-        filtered_servers = []
-        for server in servers:
-            # Threshold filtering
-            if profile.require_clean and not server.is_clean:
-                continue
-                
-            if profile.allowed_countries and server.country_code.upper() not in [c.upper() for c in profile.allowed_countries]:
-                continue
-                
-            if profile.allowed_cities and server.location.lower() not in [c.lower() for c in profile.allowed_cities]:
-                continue
-                
-            speedtest = server.speedtest_result
-            if not speedtest:
-                if profile.min_download_mbps > 0 or profile.min_upload_mbps > 0:
-                    continue
-            else:
-                dl = speedtest.get("download_mbps", 0)
-                ul = speedtest.get("upload_mbps", 0)
-                if dl < profile.min_download_mbps or ul < profile.min_upload_mbps:
-                    continue
-                    
-            # Determine mapping ips based on endpoint route strategy
-            entry1 = server.entry1_ping
-            entry3 = server.entry3_ping
-            ips_to_export = []
-            
-            if strategy == "ALL":
-                if entry1 and entry1.is_alive: ips_to_export.append(entry1.ip)
-                if entry3 and entry3.is_alive: ips_to_export.append(entry3.ip)
-            elif strategy == "ENTRY1":
-                if entry1 and entry1.is_alive: ips_to_export.append(entry1.ip)
-            elif strategy == "ENTRY3":
-                if entry3 and entry3.is_alive: ips_to_export.append(entry3.ip)
-            elif strategy == "PING_PRIORITY":
-                best_ping = None
-                best_ip = None
-                
-                if entry1 and entry1.is_alive and entry1.avg_rtt_ms is not None:
-                    best_ping = entry1.avg_rtt_ms
-                    best_ip = entry1.ip
-                    
-                if entry3 and entry3.is_alive and entry3.avg_rtt_ms is not None:
-                    if best_ping is None or entry3.avg_rtt_ms < best_ping:
-                        best_ip = entry3.ip
-                        
-                if best_ip:
-                    ips_to_export.append(best_ip)
-            
-            # If no alive endpoints map, bypass generating node
-            if not ips_to_export:
-                logger.debug(f"Skipping {server.server_name} due to endpoint routing conditions failing or IPs offline.")
-                continue
+        filtered = _filter_profile_servers(profile, servers)
+        filtered_by_profile[profile.name] = filtered
+        _write_servers_json(profile, filtered)
 
-            # Inject the strictly formatted OpenVPN/Wireguard JSON wrapper schema expected by qdm12/gluetun
-            region_str = REGION_MAP.get(server.country_code.upper(), "Unknown")
-            
-            for ip in ips_to_export:
-                filtered_servers.append({
-                    "vpn": "wireguard",
-                    "country": server.country_name,
-                    "region": region_str,
-                    "city": server.location,
-                    "name": server.server_name,
-                    "hostname": f"{server.country_code.lower()}.vpn.airdns.org",
-                    "wgpubkey": server.wg_pubkey or WG_PUBKEY,
-                    "ips": [ip]
-                })
+    if not cfg.force_update_enabled or cfg.force_update_mode == "DISABLED":
+        return
 
-        logger.info(f"Profile '{profile.name}' natively generated {len(filtered_servers)} server endpoints.")
-        
-        # Wrapping into expected root framework
-        custom_data = {
-            "version": 2,
-            "airvpn": {
-                "version": 1,
-                "timestamp": int(time.time()),
-                "servers": filtered_servers
-            }
-        }
-        
-        try:
-            output_path.parent.mkdir(parents=True, exist_ok=True)
-            
-            temp_path = output_path.with_suffix('.tmp')
-            with open(temp_path, 'w', encoding='utf-8') as f:
-                json.dump(custom_data, f, indent=2)
-                f.flush()
-                import os
-                os.fsync(f.fileno())
-                
-            temp_path.replace(output_path)
-            logger.info(f"Successfully generated offline Gluetun servers.json to {output_path}")
-        except Exception as e:
-            logger.error(f"Error persisting native Gluetun generation for '{profile.name}': {e}")
-
-    # After all profiles are written, smart force restart Gluetun if enabled
-    gluetun_cfg = config_manager.config.gluetun
-    if gluetun_cfg.force_update_enabled and active_profiles:
-        mode = gluetun_cfg.force_update_mode
-        if mode == "DISABLED":
-            logger.info("Gluetun force update is disabled by mode setting.")
-        elif mode == "ALWAYS":
-            await force_restart_gluetun(gluetun_cfg.control_server_host, gluetun_cfg.control_server_port)
-        else:
-            # Smart restart: check if current server is still good enough
-            should_restart = await _should_smart_restart(
-                gluetun_cfg.control_server_host,
-                gluetun_cfg.control_server_port,
-                mode
-            )
-            if should_restart:
-                await force_restart_gluetun(gluetun_cfg.control_server_host, gluetun_cfg.control_server_port)
-            else:
-                logger.info("Gluetun smart restart: current server is still ranked well, skipping restart.")
+    profile = _control_profile(cfg)
+    if profile is None:
+        return
+    await update_gluetun_server_selection(filtered_by_profile.get(profile.name, []))
 
 
-async def get_gluetun_status(host: str, port: int) -> dict:
+async def update_gluetun_server_selection(filtered) -> dict:
     """
-    Get the current Gluetun VPN status including public IP.
-    Returns dict with 'ip', 'country', 'city', 'server_name' if resolvable.
+    Decide (per force_update_mode) whether Gluetun should move, and if so push the
+    target server names via PUT /v1/vpn/settings. Gluetun only reads servers.json at
+    startup, so the API is the only way to change servers on a running instance.
+    """
+    cfg = config_manager.config.gluetun
+    mode = cfg.force_update_mode
+
+    # Never steer Gluetun onto a blocklisted server, whatever the profile allows.
+    ranked = sorted((s for s, _ in filtered if s.is_clean), key=lambda s: s.score or 0, reverse=True)
+    if not ranked:
+        logger.warning("Gluetun control: control profile has no clean servers, not changing selection.")
+        return {"applied": False, "reason": "no clean servers in control profile"}
+
+    if mode == "NOT_BEST":
+        targets = ranked[:1]
+    elif mode == "NOT_TOP4":
+        targets = ranked[:4]
+    else:  # ALWAYS, CLEAN_ONLY
+        targets = ranked
+
+    if mode != "ALWAYS":
+        status = await get_gluetun_status(cfg)
+        if status.get("error"):
+            logger.warning(f"Gluetun control: {status['error']}; not changing selection.")
+            return {"applied": False, "reason": status["error"]}
+        current_ip = status.get("ip")
+        if current_ip:
+            if mode == "CLEAN_ONLY":
+                current = _find_server_by_ip(current_ip)
+                # Stay unless there is evidence of a listing; a failed lookup is not a ban
+                if current is not None and not current.is_blocked:
+                    logger.info(f"Gluetun control: {current.server_name} is not listed, staying connected.")
+                    return {"applied": False, "reason": "current server still clean"}
+            elif any(current_ip in _server_ips(s) for s in targets):
+                logger.info(f"Gluetun control: current server is within target set ({mode}), staying connected.")
+                return {"applied": False, "reason": "current server within target set"}
+
+    names = sorted({_gluetun_name(s) for s in targets})
+    return await set_gluetun_server_names(cfg, names)
+
+
+def _find_server_by_ip(ip: str):
+    if not state.current_scan or not state.current_scan.servers:
+        return None
+    for server in state.current_scan.servers:
+        if ip in _server_ips(server):
+            return server
+    return None
+
+
+def _base_url(cfg) -> str:
+    host = cfg.control_server_host.strip()
+    if host.startswith(("http://", "https://")):
+        return host.rstrip("/")
+    if ":" in host and not host.startswith("["):
+        host = f"[{host}]"  # bare IPv6
+    return f"http://{host}:{cfg.control_server_port}"
+
+
+def _headers(cfg) -> dict:
+    return {"X-API-Key": cfg.api_key} if cfg.api_key else {}
+
+
+def _http_error(resp) -> str:
+    if resp.status_code == 401:
+        return "Gluetun rejected the API key (401). Check the key and the role routes in Gluetun's auth config.toml."
+    if resp.status_code == 403:
+        return "Gluetun API key lacks access to this route (403). Add it to the role's routes."
+    return f"Gluetun returned HTTP {resp.status_code}: {resp.text.strip()[:200]}"
+
+
+async def get_gluetun_status(cfg) -> dict:
+    """
+    Get the current Gluetun public IP and, if it matches scanned data, the server.
+    Gluetun reports the exit IP, so we match against exit IPs as well as entry IPs.
     """
     import httpx
 
-    base_url = f"http://{host}:{port}"
-    result = {"connected": False, "ip": None, "server_name": None, "country": None, "city": None}
-
+    result = {"connected": False, "ip": None, "server_name": None, "country": None,
+              "city": None, "vpn_status": None, "error": None}
     try:
-        async with httpx.AsyncClient(timeout=5.0) as client:
-            resp = await client.get(f"{base_url}/v1/publicip/ip")
-            if resp.status_code == 200:
-                data = resp.json() if resp.headers.get("content-type", "").startswith("application/json") else {"public_ip": resp.text.strip()}
-                public_ip = data.get("public_ip", resp.text.strip())
-                result["connected"] = True
-                result["ip"] = public_ip
+        async with httpx.AsyncClient(timeout=5.0, headers=_headers(cfg)) as client:
+            resp = await client.get(f"{_base_url(cfg)}/v1/vpn/status")
+            if resp.status_code != 200:
+                result["error"] = _http_error(resp)
+                return result
+            result["vpn_status"] = resp.json().get("status")
 
-                # Try to resolve which server this IP belongs to
-                if state.current_scan and state.current_scan.servers:
-                    for server in state.current_scan.servers:
-                        for ping in (server.entry1_ping, server.entry3_ping):
-                            if ping and ping.ip == public_ip:
-                                result["server_name"] = server.server_name.replace("AirVPN ", "")
-                                result["country"] = server.country_code
-                                result["city"] = server.location
-                                return result
-    except Exception as e:
-        logger.debug(f"Could not get Gluetun status: {e}")
+            resp = await client.get(f"{_base_url(cfg)}/v1/publicip/ip")
+            if resp.status_code != 200:
+                result["error"] = _http_error(resp)
+                return result
+            # Gluetun sends JSON without an application/json content-type.
+            try:
+                public_ip = (resp.json() or {}).get("public_ip")
+            except ValueError:
+                public_ip = resp.text.strip()
+    except httpx.HTTPError as e:
+        result["error"] = f"Could not reach Gluetun control server at {_base_url(cfg)}: {e.__class__.__name__}"
+        return result
 
+    if not public_ip:
+        return result  # VPN up but public IP not fetched yet
+
+    result["connected"] = result["vpn_status"] == "running"
+    result["ip"] = public_ip
+    server = _find_server_by_ip(public_ip)
+    if server is not None:
+        result["server_name"] = _gluetun_name(server)
+        result["country"] = server.country_code
+        result["city"] = server.location
     return result
 
 
-async def _should_smart_restart(host: str, port: int, mode: str) -> bool:
-    """
-    Determine if Gluetun should be restarted based on the current connected server's rank.
-    """
-    status = await get_gluetun_status(host, port)
-    if not status["connected"] or not status["ip"]:
-        logger.info("Cannot determine current Gluetun server — will restart.")
-        return True
+async def set_gluetun_server_names(cfg, names: list) -> dict:
+    """Restrict Gluetun to the given server names; Gluetun reconnects on change."""
+    import httpx
 
-    if not state.current_scan or not state.current_scan.servers:
-        return True
+    url = f"{_base_url(cfg)}/v1/vpn/settings"
+    # Gluetun ANDs all filters, so names alone would still be limited by its own
+    # SERVER_COUNTRIES/CITIES/... and a mismatch leaves no server (VPN stops).
+    # Its settings override (gosettings.OverrideWithSlice) replaces any non-null list,
+    # so sending [] clears those filters and the names alone decide.
+    payload = {"provider": {"server_selection": {
+        "names": names, "countries": [], "regions": [], "cities": [], "hostnames": [],
+    }}}
+    try:
+        async with httpx.AsyncClient(timeout=15.0, headers=_headers(cfg)) as client:
+            resp = await client.put(url, json=payload)
+    except httpx.HTTPError as e:
+        msg = f"Could not reach Gluetun control server at {_base_url(cfg)}: {e.__class__.__name__}"
+        logger.error(msg)
+        return {"applied": False, "reason": msg}
 
-    current_ip = status["ip"]
+    if resp.status_code != 200:
+        msg = _http_error(resp)
+        logger.error(f"Gluetun server selection update failed: {msg}")
+        return {"applied": False, "reason": msg}
 
-    if mode == "CLEAN_ONLY":
-        # Only restart if the current server is banned
-        for server in state.current_scan.servers:
-            for ping in (server.entry1_ping, server.entry3_ping):
-                if ping and ping.ip == current_ip:
-                    if server.is_clean:
-                        logger.info(f"CLEAN_ONLY: Current server {server.server_name} is still clean, staying connected.")
-                        return False
-                    else:
-                        logger.info(f"CLEAN_ONLY: Current server {server.server_name} is BANNED, will switch.")
-                        return True
-        # IP not found in scan results — can't verify, restart to be safe
-        logger.info("CLEAN_ONLY: Current IP not found in scan data, restarting.")
-        return True
-
-    # Build ranked list of top servers (same logic as overview top servers)
-    ranked = sorted(
-        [s for s in state.current_scan.servers if s.is_clean and s.score > 0],
-        key=lambda s: s.score,
-        reverse=True
-    )
-
-    if mode == "NOT_BEST":
-        # Restart if current server is not the #1 ranked server
-        if ranked:
-            best = ranked[0]
-            for ping in (best.entry1_ping, best.entry3_ping):
-                if ping and ping.ip == current_ip:
-                    return False  # Currently on best server
-        return True
-
-    elif mode == "NOT_TOP4":
-        # Restart if current server is not in top 4
-        top4 = ranked[:4]
-        for server in top4:
-            for ping in (server.entry1_ping, server.entry3_ping):
-                if ping and ping.ip == current_ip:
-                    return False  # Currently on a top 4 server
-        return True
-
-    return True
+    logger.info(f"Gluetun server selection set to {len(names)} server(s): {', '.join(names)} ({resp.text.strip()})")
+    return {"applied": True, "names": names, "outcome": resp.text.strip()}
 
 
 def get_stability_ranked_servers():
@@ -365,39 +449,3 @@ def get_stability_ranked_servers():
         clean_servers,
         key=lambda s: (ban_history.get(s.server_name, 0), -s.score if s.score else 0)
     )
-
-
-async def force_restart_gluetun(host: str, port: int):
-    """
-    Force Gluetun to reload by cycling the VPN via the control server API.
-    Sends PUT /v1/vpn/status {"status":"stopped"} then {"status":"running"}.
-    """
-    import httpx
-
-    base_url = f"http://{host}:{port}"
-    url = f"{base_url}/v1/vpn/status"
-
-    try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            # Stop VPN
-            resp = await client.put(url, json={"status": "stopped"})
-            if resp.status_code == 200:
-                logger.info("Gluetun VPN stopped via control server.")
-            else:
-                logger.warning(f"Gluetun stop returned status {resp.status_code}: {resp.text}")
-                return
-
-            # Wait for VPN to fully stop
-            await asyncio.sleep(2)
-
-            # Start VPN
-            resp = await client.put(url, json={"status": "running"})
-            if resp.status_code == 200:
-                logger.info("Gluetun VPN restarted via control server. Force update complete.")
-            else:
-                logger.warning(f"Gluetun start returned status {resp.status_code}: {resp.text}")
-    except httpx.ConnectError:
-        logger.error(f"Could not connect to Gluetun control server at {base_url}. Is it running?")
-    except Exception as e:
-        logger.error(f"Gluetun force restart failed: {e}")
-

@@ -1,13 +1,14 @@
 """
 Ping Checker Module.
 
-Cross-platform ping implementation using icmplib.
-On macOS, privileged ICMP requires root, so we use UDP-based ping as fallback.
+Cross-platform ping: system ICMP ping and a TCP connect probe run together,
+since servers may block either protocol. The lower average wins.
 """
 
 import asyncio
-import subprocess
+import math
 import platform
+import re
 from dataclasses import dataclass, field
 from typing import Optional
 from datetime import datetime
@@ -28,6 +29,9 @@ class PingResult:
     packets_received: int = 0
     tested_at: datetime = field(default_factory=datetime.now)
     error: Optional[str] = None
+    method: Optional[str] = None          # "icmp" or "tcp": which probe avg_rtt_ms came from
+    icmp_avg_ms: Optional[float] = None   # Per-protocol averages (None = no reply)
+    tcp_avg_ms: Optional[float] = None
     
     @property
     def status_color(self) -> str:
@@ -51,9 +55,15 @@ class PingResult:
         return "N/A"
 
 
+# A refusal faster than this is almost certainly a local or middlebox REJECT,
+# not a round trip to the remote host.
+MIN_REFUSED_RTT_MS = 1.0
+
+
 async def tcp_ping(ip: str, count: int = 1, timeout: float = 2.0, port: int = 443) -> PingResult:
     import time
     latencies = []
+    fast_refusals = 0
     for _ in range(count):
         start = time.perf_counter()
         try:
@@ -64,11 +74,22 @@ async def tcp_ping(ip: str, count: int = 1, timeout: float = 2.0, port: int = 44
             latencies.append((time.perf_counter() - start) * 1000.0)
             writer.close()
             await writer.wait_closed()
+        except ConnectionRefusedError:
+            # RST from a closed port is still a full round trip to the host.
+            rtt = (time.perf_counter() - start) * 1000.0
+            if rtt >= MIN_REFUSED_RTT_MS:
+                latencies.append(rtt)
+            else:
+                fast_refusals += 1
         except Exception:
             pass
     
     if not latencies:
-        return PingResult(ip=ip, is_alive=False, packets_sent=count, packets_received=0, packet_loss=100.0)
+        error = f"No TCP reply on port {port}"
+        if fast_refusals:
+            error += f" ({fast_refusals} instant refusal(s) ignored: likely local/middlebox reject)"
+        return PingResult(ip=ip, is_alive=False, packets_sent=count, packets_received=0, packet_loss=100.0,
+                          error=error)
     
     return PingResult(
         ip=ip,
@@ -81,40 +102,23 @@ async def tcp_ping(ip: str, count: int = 1, timeout: float = 2.0, port: int = 44
         packets_received=len(latencies)
     )
 
-async def ping_ip(
-    ip: str,
-    count: int = None,
-    timeout: float = None,
-) -> PingResult:
-    """
-    Ping an IP address using system ping command, falling back to TCP ping.
-    
-    Uses subprocess to call system ping, which works without root on macOS.
-    If ICMP is blocked, falls back to a TCP ping on port 443.
-    
-    Args:
-        ip: IP address to ping
-        count: Number of ping packets
-        timeout: Timeout per packet in seconds
-        
-    Returns:
-        PingResult with latency statistics
-    """
-    if count is None:
-        count = settings.ping_count
-    if timeout is None:
-        timeout = settings.ping_timeout
-    
+async def _icmp_ping(ip: str, count: int, timeout: float) -> PingResult:
+    """ICMP ping via the system ping command (works without root on macOS)."""
     system = platform.system().lower()
+    
+    # Whole seconds, at least 1: int(0.5) would be 0 (= wait forever / invalid)
+    wait_s = str(max(1, math.ceil(timeout)))
     
     # Build ping command based on OS
     if system == "darwin":  # macOS
-        cmd = ["ping", "-c", str(count), "-t", str(int(timeout)), ip]
+        cmd = ["ping", "-c", str(count), "-t", wait_s, ip]
     elif system == "windows":
         cmd = ["ping", "-n", str(count), "-w", str(int(timeout * 1000)), ip]
     else:  # Linux
-        cmd = ["ping", "-c", str(count), "-W", str(int(timeout)), ip]
+        cmd = ["ping", "-c", str(count), "-W", wait_s, ip]
     
+    process = None
+    error = None
     try:
         process = await asyncio.create_subprocess_exec(
             *cmd,
@@ -128,35 +132,67 @@ async def ping_ip(
         )
         
         output = stdout.decode("utf-8", errors="ignore")
-        
-        # Parse ping output
-        result = parse_ping_output(ip, output, count)
-        if not result.is_alive:
-            tcp_res = await tcp_ping(ip, count, timeout)
-            if tcp_res.is_alive:
-                return tcp_res
-        return result
+        return parse_ping_output(ip, output, count)
         
     except asyncio.TimeoutError:
-        tcp_res = await tcp_ping(ip, count, timeout)
-        if tcp_res.is_alive:
-            return tcp_res
-        return PingResult(
-            ip=ip,
-            is_alive=False,
-            packets_sent=count,
-            error="Ping timeout",
-        )
+        error = "Ping timeout"
     except Exception as e:
-        tcp_res = await tcp_ping(ip, count, timeout)
-        if tcp_res.is_alive:
-            return tcp_res
-        return PingResult(
-            ip=ip,
-            is_alive=False,
-            packets_sent=count,
-            error=str(e),
-        )
+        error = str(e)
+    finally:
+        # Also runs on CancelledError, so the ping child is never orphaned
+        if process and process.returncode is None:
+            try:
+                process.kill()
+            except (OSError, ProcessLookupError):
+                pass
+            try:
+                await process.wait()
+            except Exception:
+                pass
+    return PingResult(ip=ip, is_alive=False, packets_sent=count, error=error)
+
+
+async def ping_ip(
+    ip: str,
+    count: int = None,
+    timeout: float = None,
+) -> PingResult:
+    """
+    Ping an IP with both ICMP and TCP (port 443) at the same time.
+    
+    Hosts may block either protocol, so the IP counts as alive if either replies,
+    and avg_rtt_ms is the lower of the two averages (method says which one).
+    
+    Args:
+        ip: IP address to ping
+        count: Number of probes per protocol
+        timeout: Timeout per probe in seconds
+        
+    Returns:
+        PingResult with latency statistics of the faster protocol
+    """
+    if count is None:
+        count = settings.ping_count
+    if timeout is None:
+        timeout = settings.ping_timeout
+    
+    icmp, tcp = await asyncio.gather(
+        _icmp_ping(ip, count, timeout),
+        tcp_ping(ip, count, timeout),
+    )
+    icmp.method, tcp.method = "icmp", "tcp"
+    
+    replied = [r for r in (icmp, tcp) if r.is_alive]
+    if not replied:
+        icmp.error = "; ".join(e for e in (icmp.error, tcp.error) if e) or "No ICMP or TCP reply"
+        best = icmp
+    else:
+        # Prefer a result with a measured RTT, then the lowest average.
+        best = min(replied, key=lambda r: r.avg_rtt_ms if r.avg_rtt_ms is not None else float("inf"))
+    
+    best.icmp_avg_ms = icmp.avg_rtt_ms if icmp.is_alive else None
+    best.tcp_avg_ms = tcp.avg_rtt_ms if tcp.is_alive else None
+    return best
 
 
 def parse_ping_output(ip: str, output: str, count: int) -> PingResult:
@@ -167,16 +203,8 @@ def parse_ping_output(ip: str, output: str, count: int) -> PingResult:
     """
     lines = output.lower().strip().split("\n")
     
-    # Check if host is unreachable
-    if any("unreachable" in line or "100% packet loss" in line or "100.0% packet loss" in line for line in lines):
-        return PingResult(
-            ip=ip,
-            is_alive=False,
-            packets_sent=count,
-            packets_received=0,
-            packet_loss=100.0,
-        )
-    
+    # Alive is decided by the received count below, not by "unreachable" lines:
+    # one ICMP unreachable among real replies doesn't make the host dead.
     # Try to find RTT statistics line
     # macOS/Linux: "round-trip min/avg/max/stddev = 10.123/15.456/20.789/1.234 ms"
     # or "rtt min/avg/max/mdev = 10.123/15.456/20.789/1.234 ms"
@@ -187,10 +215,9 @@ def parse_ping_output(ip: str, output: str, count: int) -> PingResult:
     for line in lines:
         # Parse packet statistics
         if "packets transmitted" in line or "received" in line:
-            import re
             # macOS/Linux: "3 packets transmitted, 3 received, 0% packet loss"
             # or "3 packets transmitted, 3 packets received, 0.0% packet loss"
-            match = re.search(r"(\d+)\s+(?:packets\s+)?received", line)
+            match = re.search(r"(\d+)\s+(?:packets\s+)?received", line) or re.search(r"received\s*=\s*(\d+)", line)
             if match:
                 packets_received = int(match.group(1))
             
@@ -198,9 +225,13 @@ def parse_ping_output(ip: str, output: str, count: int) -> PingResult:
             if match:
                 packet_loss = float(match.group(1))
         
+        # Windows: "Minimum = 10ms, Maximum = 20ms, Average = 15ms"
+        win = re.search(r"minimum\s*=\s*(\d+)ms.*maximum\s*=\s*(\d+)ms.*average\s*=\s*(\d+)ms", line)
+        if win:
+            min_rtt, max_rtt, avg_rtt = float(win.group(1)), float(win.group(2)), float(win.group(3))
+        
         # Parse RTT statistics
         if "min/avg/max" in line or "rtt" in line:
-            import re
             # Extract numbers from patterns like "10.123/15.456/20.789"
             match = re.search(r"(\d+\.?\d*)/(\d+\.?\d*)/(\d+\.?\d*)", line)
             if match:

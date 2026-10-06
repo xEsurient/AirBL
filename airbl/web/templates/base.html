@@ -6,7 +6,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>{% block title %}AirVPN DroneBL Scanner{% endblock %}</title>
     <link rel="icon" href="data:image/svg+xml,{% raw %}<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🌐</text></svg>{% endraw %}">
-    <link rel="stylesheet" href="/static/css/style.css">
+    <link rel="stylesheet" href="/static/css/style.css?v={{ asset_version }}">
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
     <style>
         body {
@@ -52,8 +52,9 @@
         {% endblock %}
     </footer>
 
+    <!-- Loaded once, before page scripts, so pages can use its helpers -->
+    <script src="/static/js/app.js?v={{ asset_version }}"></script>
     {% block scripts %}{% endblock %}
-    <script src="/static/js/app.js"></script>
     <script>
         async function pollGluetunStatus() {
             try {
@@ -84,8 +85,7 @@
         // Check WG key availability
         (async function checkWgKeys() {
             try {
-                const res = await fetch('/api/status');
-                const data = await res.json();
+                const data = await getStatusOnce();  // shared with app.js
                 if (data.wg_keys_available === false) {
                     document.getElementById('wgKeysBanner').style.display = 'flex';
                 }

@@ -29,6 +29,17 @@ class ClientIdentity:
 
 
 _cached_identity: Optional[ClientIdentity] = None
+_cached_identity_key: Optional[tuple] = None
+
+
+def _conf_dir_key(conf_dir: Path) -> tuple:
+    """Changes when .conf files are added, removed or edited (or the dir itself changes)."""
+    try:
+        files = list(conf_dir.glob("*.conf"))
+        mtimes = [f.stat().st_mtime_ns for f in files]
+        return (str(conf_dir), conf_dir.stat().st_mtime_ns, len(files), max(mtimes, default=0))
+    except OSError:
+        return (str(conf_dir), None, 0, 0)
 
 
 def extract_client_identity(conf_dir: Path) -> Optional[ClientIdentity]:
@@ -67,15 +78,18 @@ def extract_client_identity(conf_dir: Path) -> Optional[ClientIdentity]:
 def get_client_identity() -> ClientIdentity:
     """
     Get client identity from existing configs, falling back to WireGuard profile settings.
-    Caches the identity in memory to prevent continuous disk reads.
+    Caches the identity in memory until the conf dir changes.
     
     Raises ValueError if no identity can be found anywhere.
     """
-    global _cached_identity
-    if _cached_identity is not None:
-        return _cached_identity
-    
+    global _cached_identity, _cached_identity_key
     from .config import settings
+    
+    key = _conf_dir_key(settings.config_dir)
+    if _cached_identity is not None and _cached_identity_key == key:
+        return _cached_identity
+    _cached_identity = None
+    _cached_identity_key = key
     
     # Try extracting from existing configs first
     identity = extract_client_identity(settings.config_dir)
@@ -92,7 +106,7 @@ def get_client_identity() -> ClientIdentity:
                 private_key=profile.private_key,
                 address="10.128.0.2/10",  # Default AirVPN address if not extractable
             )
-            _cached_identity = identity
+            # Not cached: profile keys can change in Settings at any time
             return identity
     
     raise ValueError(
@@ -156,7 +170,8 @@ def generate_config(
     filename = _make_filename(country_code, city, server_name, port, entry_number)
     conf_path = confgen_dir / filename
     
-    mtu = config_manager.config.scan.preferred_mtu
+    # Same MTU for every generated config so discovery combos are comparable
+    mtu = max(1280, min(1500, int(config_manager.config.scan.preferred_mtu or 1320)))
     lines = [
         "[Interface]",
         f"PrivateKey = {identity.private_key}",
@@ -177,7 +192,7 @@ def generate_config(
     ])
     
     if identity.preshared_key:
-        lines.insert(-2, f"PresharedKey = {identity.preshared_key}")
+        lines.append(f"PresharedKey = {identity.preshared_key}")
     
     conf_path.write_text("\n".join(lines) + "\n")
     logger.debug(f"Generated config: {filename}")
@@ -202,25 +217,23 @@ def get_or_generate_config(
     """
     from .config import settings
     
-    # Check user-supplied configs (match by server name + port + entry)
-    for conf_file in settings.config_dir.glob("*.conf"):
-        name = conf_file.stem.lower()
-        # Match: server name, port, and entry number in the filename
-        if (server_name.lower().replace(" ", "") in name.replace("-", "").replace("_", "") and
-            str(port) in name and
-            f"entry{entry_number}" in name.lower()):
+    # Check user-supplied configs: exact match on the parsed filename fields.
+    # (A substring match picked other servers' files: "Ran" matched every Frankfurt
+    # config, "Taurus" matched "Centaurus", ...)
+    from .wireguard import parse_filename
+    wanted = server_name.replace("AirVPN ", "").replace(" ", "").lower()
+    for conf_file in sorted(settings.config_dir.glob("*.conf")):
+        try:
+            meta = parse_filename(conf_file.name)
+        except Exception:
+            continue
+        if (meta["server_name"].replace(" ", "").lower() == wanted
+                and int(meta["port"]) == int(port)
+                and int(meta["entry_number"]) == int(entry_number)):
             logger.debug(f"Found existing user config: {conf_file.name}")
             return conf_file
     
-    # Check generated configs
-    confgen_dir = Path(config_manager.config.scan.confgen_dir)
-    expected_filename = _make_filename(country_code, city, server_name, port, entry_number)
-    expected_path = confgen_dir / expected_filename
-    
-    if expected_path.exists():
-        return expected_path
-    
-    # Generate new config
+    # Always (re)generate: reusing an old file would keep a stale MTU, entry IP or identity
     return generate_config(
         server_name=server_name,
         country_code=country_code,

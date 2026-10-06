@@ -81,8 +81,17 @@
 {% block scripts %}
 <script>
     let metricsCountryChart, pingCountryChart, pingServerChart, banHistoryChart, wgPortChart, wgEntryChart;
-    Chart.defaults.color = '#6b7280';
-    Chart.defaults.borderColor = '#1f1f1f';
+    const chartsOk = typeof Chart !== 'undefined';
+    if (chartsOk) {
+        Chart.defaults.color = '#6b7280';
+        Chart.defaults.borderColor = '#1f1f1f';
+    } else {
+        chartsUnavailable();
+    }
+    // Returns null when Chart.js failed to load (offline); the rest of the page still works
+    function makeChart(canvas, cfg) {
+        return chartsOk ? new Chart(canvas, cfg) : null;
+    }
 
     function filterMetrics(category) {
         document.querySelectorAll('#metricsTabs .tab-btn').forEach(btn => {
@@ -108,16 +117,21 @@
             // Country-grouped stacked bar chart
             if (metricsData.country_stats && metricsData.country_stats.length > 0) {
                 const countryLabels = metricsData.country_stats.map(c => c.country_code);
+                const countryDatasets = [
+                    { label: 'Clean', data: metricsData.country_stats.map(c => c.clean), backgroundColor: '#10b981' },
+                    { label: 'Blocked', data: metricsData.country_stats.map(c => c.blocked), backgroundColor: '#ef4444' }
+                ];
+                // Only when the API reports unverified counts
+                if (metricsData.country_stats.some(c => c.unknown !== undefined)) {
+                    countryDatasets.push({ label: 'Unverified', data: metricsData.country_stats.map(c => c.unknown || 0), backgroundColor: '#6b7280' });
+                }
+                countryDatasets.push({ label: 'Disabled', data: metricsData.country_stats.map(c => c.disabled), backgroundColor: '#f59e0b' });
                 if (metricsCountryChart) metricsCountryChart.destroy();
-                metricsCountryChart = new Chart(document.getElementById('metricsCountryChart'), {
+                metricsCountryChart = makeChart(document.getElementById('metricsCountryChart'), {
                     type: 'bar',
                     data: {
                         labels: countryLabels,
-                        datasets: [
-                            { label: 'Clean', data: metricsData.country_stats.map(c => c.clean), backgroundColor: '#10b981' },
-                            { label: 'Blocked', data: metricsData.country_stats.map(c => c.blocked), backgroundColor: '#ef4444' },
-                            { label: 'Disabled', data: metricsData.country_stats.map(c => c.disabled), backgroundColor: '#f59e0b' }
-                        ]
+                        datasets: countryDatasets
                     },
                     options: {
                         responsive: true,
@@ -133,7 +147,7 @@
                 const pbc = metricsData.ping_by_country.filter(c => c.avg_entry1 != null || c.avg_entry3 != null);
                 if (pbc.length > 0) {
                     if (pingCountryChart) pingCountryChart.destroy();
-                    pingCountryChart = new Chart(document.getElementById('pingCountryChart'), {
+                    pingCountryChart = makeChart(document.getElementById('pingCountryChart'), {
                         type: 'bar',
                         data: {
                             labels: pbc.map(c => c.country_code),
@@ -157,7 +171,7 @@
                 const pbs = metricsData.ping_by_server.filter(s => s.entry1_ping != null || s.entry3_ping != null);
                 if (pbs.length > 0) {
                     if (pingServerChart) pingServerChart.destroy();
-                    pingServerChart = new Chart(document.getElementById('pingServerChart'), {
+                    pingServerChart = makeChart(document.getElementById('pingServerChart'), {
                         type: 'bar',
                         data: {
                             labels: pbs.map(s => s.server_name),
@@ -182,7 +196,7 @@
                 const bh = metricsData.ban_history.slice(0, 30); // Top 30
                 document.getElementById('banHistoryPlaceholder').style.display = 'none';
                 if (banHistoryChart) banHistoryChart.destroy();
-                banHistoryChart = new Chart(document.getElementById('banHistoryChart'), {
+                banHistoryChart = makeChart(document.getElementById('banHistoryChart'), {
                     type: 'bar',
                     data: {
                         labels: bh.map(s => s.server_name),
@@ -240,7 +254,7 @@
                     const portLabels = Object.keys(byPort).sort();
                     document.getElementById('wgPortPlaceholder').style.display = 'none';
                     if (wgPortChart) wgPortChart.destroy();
-                    wgPortChart = new Chart(document.getElementById('wgPortChart'), {
+                    wgPortChart = makeChart(document.getElementById('wgPortChart'), {
                         type: 'bar',
                         data: {
                             labels: portLabels.map(p => `Port ${p}`),
@@ -262,7 +276,7 @@
                     const entryLabels = Object.keys(byEntry).sort();
                     document.getElementById('wgEntryPlaceholder').style.display = 'none';
                     if (wgEntryChart) wgEntryChart.destroy();
-                    wgEntryChart = new Chart(document.getElementById('wgEntryChart'), {
+                    wgEntryChart = makeChart(document.getElementById('wgEntryChart'), {
                         type: 'bar',
                         data: {
                             labels: entryLabels.map(e => e.replace('E', 'Entry ')),
@@ -307,17 +321,17 @@
                 section.innerHTML = `
                     <div style="margin-bottom: 20px; padding-bottom: 15px; border-bottom: 1px solid var(--border);">
                         <h2 style="margin: 0; color: var(--accent); font-size: 1.25rem;">${p.title}</h2>
-                        <span style="color: var(--text-secondary); font-size: 0.9rem;">${p.desc} (${metrics.total_scans} scans recorded)</span>
+                        <span style="color: var(--text-secondary); font-size: 0.9rem;">${p.desc} (${escapeHtml(metrics.total_scans ?? 0)} scans recorded)</span>
                     </div>
                     
                     <div class="stats-grid" style="display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 20px;">
                         <div class="summary-card success" style="padding: 25px;">
-                            <div class="summary-value" style="font-size: 2.5rem; text-align: center;">${metrics.avg_clean}</div>
+                            <div class="summary-value" style="font-size: 2.5rem; text-align: center;">${escapeHtml(metrics.avg_clean ?? '-')}</div>
                             <div class="summary-label" style="text-align: center;">Average Clean Servers</div>
                         </div>
                         
                         <div class="summary-card danger" style="padding: 25px;">
-                            <div class="summary-value" style="font-size: 2.5rem; text-align: center;">${metrics.avg_blocked}</div>
+                            <div class="summary-value" style="font-size: 2.5rem; text-align: center;">${escapeHtml(metrics.avg_blocked ?? '-')}</div>
                             <div class="summary-label" style="text-align: center;">Average Blocked Servers</div>
                         </div>
                     </div>

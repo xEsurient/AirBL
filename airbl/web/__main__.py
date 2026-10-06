@@ -15,8 +15,12 @@ def main():
     # Read from environment variables (set by Docker)
     config_dir = Path(os.getenv("AIRBL_CONFIG_DIR", "/app/conf"))
     port = int(os.getenv("PORT", "5665"))
-    interval = int(os.getenv("SCAN_INTERVAL", "120"))
-    auto_scan = os.getenv("AUTO_SCAN", "true").lower() == "true"
+    # None = not set: keep the value saved in the UI (0 or less also means not set)
+    interval = int(os.getenv("SCAN_INTERVAL", "").strip() or 0) or None
+    if interval is not None and interval < 0:
+        interval = None
+    auto_scan_env = os.getenv("AUTO_SCAN", "").strip().lower()
+    auto_scan = (auto_scan_env in ("true", "1", "yes", "on")) if auto_scan_env else None
     host = os.getenv("HOST", "0.0.0.0")
     
     # Parse command line args (override env vars)
@@ -46,8 +50,8 @@ def main():
     
     print(f"Starting AirBL web server on {host}:{port}")
     print(f"Config directory: {config_dir}")
-    print(f"Scan interval: {interval} minutes")
-    print(f"Auto-scan: {auto_scan}")
+    print(f"Scan interval: {f'{interval} minutes' if interval is not None else 'saved setting'}")
+    print(f"Auto-scan: {auto_scan if auto_scan is not None else 'saved setting'}")
     
     asyncio.run(run_server(
         host=host,

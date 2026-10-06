@@ -5,7 +5,7 @@ WebSocket management for AirBL Web UI.
 from fastapi import WebSocket, WebSocketDisconnect
 import asyncio
 import logging
-from .state import state, set_broadcast_func
+from .state import state
 
 logger = logging.getLogger("airbl.web.ws")
 
@@ -44,10 +44,6 @@ async def broadcast_update(update_type: str, data: dict):
                 pass
     except Exception as e:
         logger.error(f"Error during broadcast: {e}")
-
-
-# Register broadcast function with state module
-set_broadcast_func(broadcast_update)
 
 
 async def websocket_handler(websocket: WebSocket):

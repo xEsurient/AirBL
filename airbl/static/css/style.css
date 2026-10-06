@@ -401,6 +401,10 @@ header h1::before {
     color: var(--danger);
 }
 
+.stat.unknown {
+    color: var(--warning);
+}
+
 .server-list {
     padding: 10px;
 }
@@ -429,6 +433,10 @@ header h1::before {
 
 .server-item.blocked {
     border: 1px inset var(--danger);
+}
+
+.server-item.unknown {
+    border-left: 4px solid var(--warning);
 }
 
 .server-item.clean {

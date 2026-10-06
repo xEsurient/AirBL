@@ -65,30 +65,42 @@ COUNTRY_CODE_MAP = {
     "USA": "United States",
 }
 
-# US cities closer to Europe (allowed for scanning)
+# US cities closer to Europe, kept by the opt-in regions.us_near_europe_only
+# setting. Each entry is matched as whole word(s) of the city name.
 US_ALLOWED_LOCATIONS = [
-    "newyork", "new york", "ny",
-    "chicago", "chi",
+    "new york", "newyork", "ny",
+    "chicago",
     "dallas", "texas", "tx",
-    "atlanta", "atl",
-    "washington", "dc",
+    "atlanta",
+    "washington dc", "dc", "ashburn",
     "boston",
     "philadelphia",
 ]
 
-# US cities to exclude (too far from Europe)
-US_EXCLUDED_LOCATIONS = [
-    "miami", "fl", "florida",
-    "losangeles", "los angeles", "la", "california", "ca",
-    "seattle", "wa", "washington state",
-    "portland", "oregon", "or",
-    "phoenix", "az", "arizona",
-    "denver", "co", "colorado",
-    "sanfrancisco", "san francisco", "sf",
-    "sanjose", "san jose",
-    "lasvegas", "las vegas", "nevada", "nv",
-    "honolulu", "hawaii", "hi",
-]
+
+def _city_tokens(city: str) -> list[str]:
+    """Split "NewYorkCity" / "Atlanta Georgia" / "Los-Angeles" into lowercase words."""
+    return [t.lower() for t in re.findall(r"[A-Z]+(?![a-z])|[A-Z]?[a-z]+|\d+", city or "")]
+
+
+def is_us_city_near_europe(city: str) -> bool:
+    """True if the city name contains an allowed location as whole word(s)."""
+    tokens = _city_tokens(city)
+    for loc in US_ALLOWED_LOCATIONS:
+        want = loc.split()
+        n = len(want)
+        if any(tokens[i:i + n] == want for i in range(len(tokens) - n + 1)):
+            return True
+    return False
+
+
+def _us_filter_enabled() -> bool:
+    """Current regions.us_near_europe_only setting (off by default)."""
+    try:
+        from .config import config_manager
+        return bool(config_manager.config.regions.us_near_europe_only)
+    except Exception:
+        return False
 
 
 @dataclass
@@ -115,6 +127,7 @@ class WireGuardConfig:
     address: Optional[str] = None
     dns: Optional[str] = None
     allowed_ips: Optional[str] = None
+    mtu: Optional[int] = None
     
     # Computed
     subnet: Optional[str] = None
@@ -129,24 +142,25 @@ class WireGuardConfig:
         except ValueError:
             self.subnet = None
         
-        # Check if US server is Europe-friendly
+        # Informational unless regions.us_near_europe_only is enabled
         if self.country_code.upper() in ["US", "USA"]:
-            city_lower = self.city.lower().replace(" ", "").replace("-", "")
-            self.is_us_europe_friendly = any(
-                loc in city_lower for loc in US_ALLOWED_LOCATIONS
-            )
+            self.is_us_europe_friendly = is_us_city_near_europe(self.city)
     
     @property
     def display_name(self) -> str:
         """Human-readable display name."""
         return f"{self.server_name} ({self.city}, {self.country_code})"
     
-    @property
-    def should_scan(self) -> bool:
-        """Whether this server should be scanned (US filtering)."""
-        if self.country_code.upper() in ["US", "USA"]:
+    def passes_us_filter(self, us_near_europe_only: bool) -> bool:
+        """False only for a far-from-Europe US server when the filter is on."""
+        if us_near_europe_only and self.country_code.upper() in ["US", "USA"]:
             return self.is_us_europe_friendly
         return True
+
+    @property
+    def should_scan(self) -> bool:
+        """Whether this server should be scanned (opt-in US filter from settings)."""
+        return self.passes_us_filter(_us_filter_enabled())
 
 
 def parse_filename(filename: str) -> dict:
@@ -194,34 +208,71 @@ def parse_filename(filename: str) -> dict:
     }
 
 
+# key (lowercase) -> (result field, section it belongs to)
+_CONF_KEYS = {
+    "privatekey": ("private_key", "interface"),
+    "address": ("address", "interface"),
+    "dns": ("dns", "interface"),
+    "mtu": ("mtu", "interface"),
+    "publickey": ("public_key", "peer"),
+    "presharedkey": ("preshared_key", "peer"),
+    "allowedips": ("allowed_ips", "peer"),
+    "endpoint": ("endpoint", "peer"),
+}
+
+
+def _split_endpoint(value: str) -> Optional[tuple[str, int]]:
+    """"1.2.3.4:1637" or "[2001:db8::1]:1637" -> (host, port)."""
+    m = re.fullmatch(r"\[([^\]]+)\]:(\d+)", value) or re.fullmatch(r"([^:\s\[\]]+):(\d+)", value)
+    if not m:
+        return None
+    return m.group(1), int(m.group(2))
+
+
 def parse_config_content(content: str) -> dict:
     """
     Parse WireGuard config file content.
     
-    Extracts: Endpoint, PrivateKey, PublicKey, Address, DNS, AllowedIPs
+    Line-based and section-aware: comments (# or ;) are ignored, Interface keys
+    are only read from [Interface], peer keys from the first [Peer].
+    Extracts: Endpoint, PrivateKey, PublicKey, PresharedKey, Address, DNS, AllowedIPs, MTU
     """
     result = {}
+    section = None
+    peers_seen = 0
     
-    # Extract Endpoint (IP:Port)
-    endpoint_match = re.search(r"Endpoint\s*=\s*([^:\s]+):(\d+)", content)
-    if endpoint_match:
-        result["endpoint_ip"] = endpoint_match.group(1)
-        result["endpoint_port"] = int(endpoint_match.group(2))
-    
-    # Extract other fields
-    patterns = {
-        "private_key": r"PrivateKey\s*=\s*(.+)",
-        "public_key": r"PublicKey\s*=\s*(.+)",
-        "preshared_key": r"PresharedKey\s*=\s*(.+)",
-        "address": r"Address\s*=\s*(.+)",
-        "dns": r"DNS\s*=\s*(.+)",
-        "allowed_ips": r"AllowedIPs\s*=\s*(.+)",
-    }
-    
-    for key, pattern in patterns.items():
-        match = re.search(pattern, content, re.IGNORECASE)
-        if match:
-            result[key] = match.group(1).strip()
+    for raw in content.splitlines():
+        line = re.split(r"[#;]", raw, maxsplit=1)[0].strip()
+        if not line:
+            continue
+        if line.startswith("[") and line.endswith("]"):
+            section = line[1:-1].strip().lower()
+            if section == "peer":
+                peers_seen += 1
+            continue
+        if "=" not in line:
+            continue
+        key, value = (part.strip() for part in line.split("=", 1))
+        spec = _CONF_KEYS.get(key.lower())
+        if not spec or not value:
+            continue
+        field_name, wanted_section = spec
+        # Keys outside any section are accepted for headerless snippets
+        if section is not None and section != wanted_section:
+            continue
+        if wanted_section == "peer" and peers_seen > 1:
+            continue
+        if field_name in result or (field_name == "endpoint" and "endpoint_ip" in result):
+            continue  # first occurrence wins
+        if field_name == "endpoint":
+            parsed = _split_endpoint(value)
+            if parsed:
+                result["endpoint_ip"], result["endpoint_port"] = parsed
+        elif field_name == "mtu":
+            if value.isdigit():
+                result["mtu"] = int(value)
+        else:
+            result[field_name] = value
     
     return result
 
@@ -297,13 +348,19 @@ def get_unique_subnets(configs: list[WireGuardConfig]) -> set[str]:
     return {c.subnet for c in configs if c.subnet}
 
 
-def get_scannable_configs(configs: list[WireGuardConfig]) -> list[WireGuardConfig]:
+def get_scannable_configs(
+    configs: list[WireGuardConfig],
+    us_near_europe_only: Optional[bool] = None,
+) -> list[WireGuardConfig]:
     """
     Filter configs to only those that should be scanned.
     
-    Applies US Europe-friendly filter.
+    Applies the US "close to Europe" filter only when enabled
+    (None = use the regions.us_near_europe_only setting, off by default).
     """
-    return [c for c in configs if c.should_scan]
+    if us_near_europe_only is None:
+        us_near_europe_only = _us_filter_enabled()
+    return [c for c in configs if c.passes_us_filter(us_near_europe_only)]
 
 
 def get_all_endpoint_ips(configs: list[WireGuardConfig]) -> list[str]:

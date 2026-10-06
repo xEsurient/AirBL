@@ -5,79 +5,106 @@ Uses dig commands to query AirVPN DNS servers for server exit IPs.
 """
 
 import asyncio
+import ipaddress
 import logging
-import re
-from typing import Set
+from typing import Optional, Set, Tuple
 
 logger = logging.getLogger("airbl.dns_lookup")
+
+DNS_SERVERS = ["dns1.airvpn.org", "dns2.airvpn.org"]
+DIG_TIMEOUT_SECONDS = 10.0  # Whole dig run; dig itself gets +time=3 +tries=2
+
+
+class DNSLookupError(Exception):
+    """Every exit-IP query failed (dig missing, timeout, resolver error)."""
+
+
+async def _dig(query_name: str, rdtype: str, dns_server: str) -> Set[str]:
+    """Run one dig query; return valid IPs, raise DNSLookupError on failure."""
+    cmd = ["dig", rdtype, query_name, f"@{dns_server}", "+short", "+time=3", "+tries=2"]
+    try:
+        process = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+    except FileNotFoundError:
+        raise DNSLookupError("dig command not found (install bind-utils or dnsutils)")
+
+    try:
+        stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=DIG_TIMEOUT_SECONDS)
+    except asyncio.TimeoutError:
+        raise DNSLookupError(f"dig timed out after {DIG_TIMEOUT_SECONDS:.0f}s")
+    finally:
+        # Kill and reap on timeout or cancellation so no dig child is left behind
+        if process.returncode is None:
+            try:
+                process.kill()
+            except ProcessLookupError:
+                pass
+            await process.wait()
+
+    if process.returncode != 0:
+        # dig +short prints errors like ";; connection timed out" on stdout
+        msg = (stderr.decode("utf-8", "ignore") or stdout.decode("utf-8", "ignore")).strip()
+        raise DNSLookupError(f"dig exit {process.returncode}: {msg.splitlines()[-1] if msg else 'no output'}")
+
+    ips = set()
+    for line in stdout.decode("utf-8", "ignore").splitlines():
+        line = line.strip()
+        if not line or line.startswith(";"):
+            continue
+        try:
+            # +short also prints CNAME targets; keep only real addresses
+            ips.add(str(ipaddress.ip_address(line)))
+        except ValueError:
+            continue
+    return ips
+
+
+async def lookup_exit_ips(server_name: str) -> Tuple[Set[str], Optional[str]]:
+    """
+    Lookup exit IPs (IPv4 and IPv6) for a server.
+
+    Queries A and AAAA (not ANY: RFC 8482 resolvers refuse or minimise it) for
+    SERVERNAME_exit.airservers.org at dns1/dns2.airvpn.org.
+
+    Returns:
+        (ips, error): error is None when at least one query got an answer
+        (possibly empty = no records); otherwise a reason why every query failed.
+    """
+    query_name = f"{server_name.lower()}_exit.airservers.org"
+    jobs = [(srv, rd) for srv in DNS_SERVERS for rd in ("A", "AAAA")]
+    results = await asyncio.gather(
+        *[_dig(query_name, rd, srv) for srv, rd in jobs],
+        return_exceptions=True,
+    )
+
+    all_ips: Set[str] = set()
+    errors = []
+    answered = False
+    for (srv, rd), res in zip(jobs, results):
+        if isinstance(res, BaseException):
+            if isinstance(res, asyncio.CancelledError):
+                raise res
+            errors.append(str(res))
+            logger.warning(f"DNS query failed for {query_name} {rd} @{srv}: {res}")
+        else:
+            answered = True
+            all_ips.update(res)
+
+    if not answered:
+        return set(), "; ".join(sorted(set(errors)))  # usually one shared reason
+    return all_ips, None
 
 
 async def lookup_server_exit_ips(server_name: str) -> Set[str]:
     """
-    Lookup exit IPs for a server using dig commands.
-    
-    Queries both dns1.airvpn.org and dns2.airvpn.org for:
-    dig ANY SERVERNAME_exit.airservers.org @dns1.airvpn.org +short
-    dig ANY SERVERNAME_exit.airservers.org @dns2.airvpn.org +short
-    
-    Args:
-        server_name: Server name (e.g., "adhil")
-        
-    Returns:
-        Set of IPv4 addresses found
+    Lookup exit IPs for a server.
+
+    Returns the set of IPs; raises DNSLookupError if every query failed.
     """
-    dns_servers = ["dns1.airvpn.org", "dns2.airvpn.org"]
-    query_name = f"{server_name.lower()}_exit.airservers.org"
-    all_ips = set()
-    
-    # IPv4 regex pattern
-    ipv4_pattern = re.compile(r'^(\d{1,3}\.){3}\d{1,3}$')
-    
-    async def query_dns(dns_server: str) -> Set[str]:
-        """Query a single DNS server."""
-        ips = set()
-        try:
-            # Run dig command: dig ANY SERVERNAME_exit.airservers.org @DNS_SERVER +short
-            cmd = [
-                "dig",
-                "ANY",
-                query_name,
-                f"@{dns_server}",
-                "+short"
-            ]
-            
-            process = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE
-            )
-            
-            stdout, stderr = await process.communicate()
-            
-            if process.returncode == 0:
-                output = stdout.decode('utf-8').strip()
-                # Parse output - dig +short returns one IP per line
-                for line in output.split('\n'):
-                    line = line.strip()
-                    if line and ipv4_pattern.match(line):
-                        ips.add(line)
-            else:
-                error = stderr.decode('utf-8').strip()
-                logger.warning(f"dig query failed for {query_name} @{dns_server}: {error}")
-        except FileNotFoundError:
-            logger.error("dig command not found. Please install bind-utils or dnsutils.")
-        except Exception as e:
-            logger.warning(f"Error querying {query_name} @{dns_server}: {e}")
-        
-        return ips
-    
-    # Query both DNS servers concurrently
-    results = await asyncio.gather(*[query_dns(server) for server in dns_servers])
-    
-    # Combine all IPs from both servers
-    for ips in results:
-        all_ips.update(ips)
-    
-    return all_ips
-
-
+    ips, error = await lookup_exit_ips(server_name)
+    if error:
+        raise DNSLookupError(error)
+    return ips

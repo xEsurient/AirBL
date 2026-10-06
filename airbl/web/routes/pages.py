@@ -2,6 +2,7 @@ from fastapi import APIRouter, Request
 from fastapi.responses import HTMLResponse
 from fastapi.templating import Jinja2Templates
 from pathlib import Path
+import hashlib
 
 router = APIRouter()
 
@@ -10,6 +11,19 @@ router = APIRouter()
 # Templates are in airbl/web/templates/
 BASE_DIR = Path(__file__).resolve().parent.parent
 templates = Jinja2Templates(directory=str(BASE_DIR / "templates"))
+
+
+def _asset_version() -> str:
+    """Short hash of the static files. Used as ?v= on CSS/JS links so a deploy
+    changes the URLs and browsers fetch the new files instead of a cached copy."""
+    digest = hashlib.sha256()
+    for f in sorted((BASE_DIR.parent / "static").rglob("*")):
+        if f.is_file():
+            digest.update(f.read_bytes())
+    return digest.hexdigest()[:10]
+
+
+templates.env.globals["asset_version"] = _asset_version()
 
 @router.get("/", response_class=HTMLResponse)
 async def index(request: Request):

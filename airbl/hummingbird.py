@@ -1,31 +1,18 @@
 """
-Hummingbird VPN Control Module.
+VPN Control Module.
 
-Controls AirVPN's Hummingbird client for programmatic VPN connections.
-Hummingbird is AirVPN's lightweight WireGuard-based client for Linux/macOS.
+Brings up an AirVPN WireGuard tunnel with plain wg/ip commands (WireGuardController)
+for speedtests. (The module name is historical: the Hummingbird client wrapper is gone.)
 """
 
 import asyncio
+import logging
 import os
-import signal
-import subprocess
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
 import re
-
-
-@dataclass
-class HummingbirdStatus:
-    """Status of Hummingbird connection."""
-    is_connected: bool = False
-    server_name: Optional[str] = None
-    server_ip: Optional[str] = None
-    public_ip: Optional[str] = None
-    connected_at: Optional[datetime] = None
-    config_file: Optional[str] = None
-    error: Optional[str] = None
 
 
 @dataclass
@@ -39,255 +26,23 @@ class ConnectionResult:
     error: Optional[str] = None
 
 
-class HummingbirdController:
-    """
-    Controller for Hummingbird VPN client.
-    
-    Hummingbird can be controlled via:
-    1. Direct execution with config file
-    2. WireGuard interface management
-    
-    On macOS, Hummingbird requires sudo for network operations.
-    In Docker, it runs as root with NET_ADMIN capability.
-    """
-    
-    def __init__(
-        self,
-        hummingbird_path: str = "/usr/local/bin/hummingbird",
-        config_dir: Path = None,
-        use_sudo: bool = True,
-    ):
-        self.hummingbird_path = hummingbird_path
-        self.config_dir = config_dir or Path("./conf")
-        self.use_sudo = use_sudo
-        self._process: Optional[asyncio.subprocess.Process] = None
-        self._current_config: Optional[Path] = None
-    
-    async def check_installed(self) -> bool:
-        """Check if Hummingbird is installed."""
-        try:
-            # Try hummingbird --version or just check if binary exists
-            if os.path.exists(self.hummingbird_path):
-                return True
-            
-            # Try which command
-            process = await asyncio.create_subprocess_exec(
-                "which", "hummingbird",
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            stdout, _ = await process.communicate()
-            if stdout.strip():
-                self.hummingbird_path = stdout.decode().strip()
-                return True
-            
-            return False
-        except Exception:
-            return False
-    
-    async def connect(
-        self,
-        config_file: Path,
-        timeout: int = 30,
-    ) -> ConnectionResult:
-        """
-        Connect to VPN using specified config file.
-        
-        Args:
-            config_file: Path to .conf file
-            timeout: Connection timeout in seconds
-            
-        Returns:
-            ConnectionResult with status
-        """
-        start_time = datetime.now()
-        
-        if not config_file.exists():
-            return ConnectionResult(
-                success=False,
-                config_file=str(config_file),
-                error=f"Config file not found: {config_file}",
-            )
-        
-        # Disconnect any existing connection
-        await self.disconnect()
-        
-        try:
-            # Build command
-            cmd = []
-            if self.use_sudo:
-                cmd.append("sudo")
-            cmd.extend([self.hummingbird_path, str(config_file)])
-            
-            # Start Hummingbird
-            self._process = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            self._current_config = config_file
-            
-            # Wait for connection to establish
-            # Hummingbird outputs connection status to stdout
-            connected = False
-            error_msg = None
-            
-            try:
-                # Read output with timeout
-                async def read_output():
-                    nonlocal connected, error_msg
-                    while True:
-                        line = await self._process.stdout.readline()
-                        if not line:
-                            break
-                        line_str = line.decode().strip()
-                        
-                        # Check for success indicators
-                        if "connected" in line_str.lower() or "handshake" in line_str.lower():
-                            connected = True
-                            break
-                        if "error" in line_str.lower() or "failed" in line_str.lower():
-                            error_msg = line_str
-                            break
-                
-                await asyncio.wait_for(read_output(), timeout=timeout)
-                
-            except asyncio.TimeoutError:
-                # Timeout waiting for connection confirmation
-                # Check if process is still running (might be connected anyway)
-                if self._process.returncode is None:
-                    connected = True  # Assume connected if still running
-                else:
-                    error_msg = "Connection timed out"
-            
-            duration = (datetime.now() - start_time).total_seconds()
-            
-            if connected:
-                # Get public IP to confirm VPN is working
-                public_ip = await self._get_public_ip()
-                
-                return ConnectionResult(
-                    success=True,
-                    server_name=config_file.stem,
-                    config_file=str(config_file),
-                    public_ip=public_ip,
-                    connect_time_seconds=duration,
-                )
-            else:
-                await self.disconnect()
-                return ConnectionResult(
-                    success=False,
-                    config_file=str(config_file),
-                    connect_time_seconds=duration,
-                    error=error_msg or "Connection failed",
-                )
-                
-        except Exception as e:
-            duration = (datetime.now() - start_time).total_seconds()
-            await self.disconnect()
-            return ConnectionResult(
-                success=False,
-                config_file=str(config_file),
-                connect_time_seconds=duration,
-                error=str(e),
-            )
-    
-    async def disconnect(self) -> bool:
-        """
-        Disconnect from VPN.
-        
-        Returns:
-            True if disconnected successfully
-        """
-        try:
-            if self._process and self._process.returncode is None:
-                # Send SIGTERM
-                self._process.terminate()
+async def get_public_ip(timeout: float = 10) -> Optional[str]:
+    """Current public IP via a few plain-text lookup services, or None."""
+    try:
+        import httpx
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            for service in ("https://api.ipify.org", "https://ifconfig.me/ip", "https://icanhazip.com"):
                 try:
-                    await asyncio.wait_for(self._process.wait(), timeout=5)
-                except asyncio.TimeoutError:
-                    # Force kill if graceful termination fails
-                    self._process.kill()
-                    await self._process.wait()
-            
-            self._process = None
-            self._current_config = None
-            
-            # Also try to clean up any WireGuard interfaces
-            await self._cleanup_wg_interfaces()
-            
-            return True
-        except Exception:
-            return False
-    
-    async def _cleanup_wg_interfaces(self):
-        """Clean up any lingering WireGuard interfaces."""
-        try:
-            # List WireGuard interfaces
-            cmd = ["sudo", "wg", "show", "interfaces"] if self.use_sudo else ["wg", "show", "interfaces"]
-            process = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            stdout, _ = await process.communicate()
-            
-            interfaces = stdout.decode().strip().split()
-            for iface in interfaces:
-                if iface.startswith(("wg", "hb", "airvpn")):
-                    # Remove interface
-                    rm_cmd = ["sudo", "ip", "link", "delete", iface] if self.use_sudo else ["ip", "link", "delete", iface]
-                    await asyncio.create_subprocess_exec(*rm_cmd)
-        except Exception:
-            pass  # Ignore cleanup errors
-    
-    async def _get_public_ip(self, timeout: float = 10) -> Optional[str]:
-        """Get current public IP address."""
-        try:
-            import httpx
-            async with httpx.AsyncClient(timeout=timeout) as client:
-                # Try multiple services
-                services = [
-                    "https://api.ipify.org",
-                    "https://ifconfig.me/ip",
-                    "https://icanhazip.com",
-                ]
-                for service in services:
-                    try:
-                        response = await client.get(service)
-                        if response.status_code == 200:
-                            return response.text.strip()
-                    except Exception:
-                        continue
-        except Exception:
-            pass
-        return None
-    
-    async def get_status(self) -> HummingbirdStatus:
-        """Get current connection status."""
-        is_connected = self._process is not None and self._process.returncode is None
-        
-        status = HummingbirdStatus(
-            is_connected=is_connected,
-            config_file=str(self._current_config) if self._current_config else None,
-        )
-        
-        if is_connected:
-            status.public_ip = await self._get_public_ip()
-            status.connected_at = datetime.now()  # Approximate
-            if self._current_config:
-                status.server_name = self._current_config.stem
-        
-        return status
-    
-    def get_config_files(self) -> list[Path]:
-        """List all available config files."""
-        if not self.config_dir.exists():
-            return []
-        return sorted(self.config_dir.glob("*.conf"))
+                    response = await client.get(service)
+                    if response.status_code == 200:
+                        return response.text.strip()
+                except Exception:
+                    continue
+    except Exception:
+        pass
+    return None
 
 
-# Alternative: WireGuard native control (without Hummingbird)
 def _should_use_sudo() -> bool:
     """
     Determine if sudo should be used for WireGuard operations.
@@ -301,7 +56,6 @@ def _should_use_sudo() -> bool:
     - Running as non-root user and sudo is available
     """
     import shutil
-    import logging
     
     logger = logging.getLogger("airbl.hummingbird")
     
@@ -327,8 +81,6 @@ class WireGuardController:
     Unlike wg-quick, this approach never calls sysctl at runtime,
     so it works with just NET_ADMIN capability (no privileged mode needed).
     The required sysctl values are set via docker-compose sysctls directive.
-    
-    Use this if Hummingbird is not available.
     """
     
     def __init__(self, use_sudo: Optional[bool] = None):
@@ -340,7 +92,6 @@ class WireGuardController:
                      If True, uses sudo (will fail if not available).
                      If False, runs without sudo (requires root).
         """
-        import logging
         logger = logging.getLogger("airbl.hummingbird")
         
         if use_sudo is None:
@@ -352,8 +103,10 @@ class WireGuardController:
         self._current_interface: Optional[str] = None
         self._temp_config_path: Optional[Path] = None  # Stores temp stripped config path
         self._fwmark: int = 51820  # WireGuard fwmark (matches wg-quick default)
+        self._resolv_backup: Optional[str] = None  # original /etc/resolv.conf if we overwrote it
+        self._kill_switch_on: bool = False
     
-    async def connect(self, config_file: Path, interface_name: str = "wg0", namespace = None) -> ConnectionResult:
+    async def connect(self, config_file: Path, interface_name: str = "wg0") -> ConnectionResult:
         """
         Connect using manual wg/ip commands (Gluetun approach).
         
@@ -372,12 +125,7 @@ class WireGuardController:
         Args:
             config_file: Path to config
             interface_name: Interface name to use
-            namespace: DEPRECATED - ignored, kept for backward compatibility
         """
-        # NOTE: namespace parameter is ignored - we always connect directly
-            
-        import logging
-        import tempfile
         from .wireguard import parse_config_file
         
         logger = logging.getLogger("airbl.hummingbird")
@@ -401,17 +149,7 @@ class WireGuardController:
             
             # Check if interface exists in the system (regardless of our state)
             try:
-                check_cmd = []
-                if self.use_sudo:
-                    check_cmd.append("sudo")
-                check_cmd.extend(["wg", "show", "interfaces"])
-                check_process = await asyncio.create_subprocess_exec(
-                    *check_cmd,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE,
-                )
-                stdout, stderr = await check_process.communicate()
-                interfaces = stdout.decode().strip()
+                interfaces = (await self._run_sudo_output(["wg", "show", "interfaces"])).split()
                 
                 if interface_name in interfaces:
                     logger.info(f"Interface {interface_name} already exists, force removing")
@@ -437,7 +175,9 @@ class WireGuardController:
                 "[Peer]",
                 f"PublicKey = {wg_conf.public_key}",
                 f"Endpoint = {wg_conf.endpoint_ip}:{wg_conf.endpoint_port}",
-                f"AllowedIPs = {wg_conf.allowed_ips or '0.0.0.0/0'}",
+                # The tester always routes all IPv4 through the tunnel (route below is 0.0.0.0/0),
+                # so the peer must accept it too; a split AllowedIPs would blackhole traffic.
+                "AllowedIPs = 0.0.0.0/0",
                 "PersistentKeepalive = 15",
             ]
             
@@ -451,6 +191,10 @@ class WireGuardController:
                     stripped_conf.insert(-2, f"PresharedKey = {psk}")
             except Exception:
                 pass
+            
+            if wg_conf.allowed_ips and "0.0.0.0/0" not in wg_conf.allowed_ips:
+                logger.info(f"{config_file.name} has split AllowedIPs ({wg_conf.allowed_ips}); "
+                            "testing uses a full IPv4 tunnel instead")
             
             # Write stripped config to temp file
             temp_conf_path = Path(f"/tmp/{interface_name}_stripped.conf")
@@ -466,53 +210,57 @@ class WireGuardController:
                     temp_conf_path.unlink()
                     self._temp_config_path = None
             
-            # 5. Add address and bring interface up
-            if wg_conf.address:
-                # Ensure address has a prefix length
-                addr = wg_conf.address.strip()
+            # 5. Add address and bring interface up.
+            # IPv6-enabled AirVPN configs list "v4/32, v6/128"; the tunnel is IPv4-only
+            # (routes, AllowedIPs, kill switch), so only the IPv4 entries are added.
+            for addr in (a.strip() for a in (wg_conf.address or "").split(",")):
+                if not addr:
+                    continue
+                if ":" in addr:
+                    logger.debug(f"Skipping IPv6 address {addr} (IPv6 tunnel not supported)")
+                    continue
                 if '/' not in addr:
                     addr = f"{addr}/32"
                 await self._run_sudo(["ip", "-4", "address", "add", addr, "dev", interface_name])
                 logger.debug(f"Added address {addr} to {interface_name}")
             
-            # Set MTU and bring up
-            await self._run_sudo(["ip", "link", "set", "mtu", "1420", "up", "dev", interface_name])
-            logger.debug(f"Interface {interface_name} is UP with MTU 1420")
+            # Set MTU (from config when sane, else WireGuard's usual 1420) and bring up
+            mtu = wg_conf.mtu if wg_conf.mtu and 1280 <= wg_conf.mtu <= 1500 else 1420
+            await self._run_sudo(["ip", "link", "set", "mtu", str(mtu), "up", "dev", interface_name])
+            logger.debug(f"Interface {interface_name} is UP with MTU {mtu}")
             
             # 6. Configure DNS via resolvconf (if available)
-            if wg_conf.dns:
-                dns_servers = [d.strip() for d in wg_conf.dns.split(',')]
+            dns_servers = [d.strip() for d in (wg_conf.dns or "").split(',')
+                           if re.fullmatch(r"[0-9a-fA-F:.]+", d.strip())]
+            if wg_conf.dns and not dns_servers:
+                # Writing no nameserver at all would break every lookup; keep the current DNS
+                logger.warning(f"{config_file.name}: no valid nameserver in DNS = {wg_conf.dns!r}; "
+                               "keeping the current resolv.conf")
+            if dns_servers:
                 try:
                     # Build resolvconf input: one "nameserver" per line
                     dns_input = "\n".join(f"nameserver {d}" for d in dns_servers) + "\n"
-                    resolvconf_cmd = []
-                    if self.use_sudo:
-                        resolvconf_cmd.append("sudo")
-                    resolvconf_cmd.extend(["resolvconf", "-a", interface_name, "-m", "0", "-x"])
-                    proc = await asyncio.create_subprocess_exec(
-                        *resolvconf_cmd,
-                        stdin=asyncio.subprocess.PIPE,
-                        stdout=asyncio.subprocess.PIPE,
-                        stderr=asyncio.subprocess.PIPE,
-                    )
-                    await proc.communicate(input=dns_input.encode())
-                    if proc.returncode == 0:
-                        logger.debug(f"Configured DNS via resolvconf: {dns_servers}")
-                    else:
-                        raise RuntimeError("resolvconf failed")
+                    await self._run_sudo(["resolvconf", "-a", interface_name, "-m", "0", "-x"],
+                                         input_data=dns_input.encode())
+                    logger.debug(f"Configured DNS via resolvconf: {dns_servers}")
                 except Exception as dns_err:
                     # Fallback: write /etc/resolv.conf directly
                     logger.debug(f"resolvconf not available ({dns_err}), writing /etc/resolv.conf directly")
                     resolv_content = "\n".join(f"nameserver {d}" for d in dns_servers) + "\n"
                     try:
-                        write_cmd = ["sh", "-c", f"echo '{resolv_content}' > /etc/resolv.conf"]
-                        await self._run_sudo(write_cmd)
+                        resolv = Path("/etc/resolv.conf")
+                        if self._resolv_backup is None:
+                            self._resolv_backup = resolv.read_text()  # restored on disconnect
+                        resolv.write_text(resolv_content)
                     except Exception as resolv_err:
                         logger.warning(f"Failed to configure DNS: {resolv_err}")
             
             # 7. Set fwmark and routing rules (replicates what wg-quick does)
             await self._run_sudo(["wg", "set", interface_name, "fwmark", fwmark])
             await self._run_sudo(["ip", "-4", "route", "add", "0.0.0.0/0", "dev", interface_name, "table", table])
+            # Fallback when wg0 vanishes (its route goes with it): drop instead of falling
+            # through to the main table and measuring over the direct line.
+            await self._run_sudo(["ip", "-4", "route", "add", "blackhole", "0.0.0.0/0", "table", table, "metric", "4096"])
             
             # Pin AirVPN internal DNS/address range through the tunnel BEFORE the broad RFC1918 bypasses
             # AirVPN uses 10.128.0.0/10 internally (DNS at 10.128.0.1, client addresses in 10.128-191.x.x)
@@ -533,14 +281,27 @@ class WireGuardController:
             # It is already set via docker-compose sysctls directive, and skipping it
             # is what allows us to run without privileged mode.
             
-            duration = (datetime.now() - start_time).total_seconds()
             self._current_interface = interface_name
-            logger.info(f"Successfully connected to VPN using {config_file.name} via {interface_name} (manual wg/ip)")
+            
+            # 8. Kill switch: block anything leaving outside the tunnel while connected
+            await self._enable_kill_switch(interface_name, wg_conf.endpoint_ip, wg_conf.endpoint_port)
+            
+            # 9. Verify: a completed WireGuard handshake, then traffic leaving via AirVPN.
+            # Interface/route setup alone doesn't prove the tunnel works.
+            if not await self._wait_for_handshake(interface_name):
+                raise RuntimeError(f"No WireGuard handshake within {self.HANDSHAKE_TIMEOUT}s "
+                                   "(wrong key, endpoint unreachable, or UDP blocked)")
+            public_ip = await self._verify_egress()
+            
+            duration = (datetime.now() - start_time).total_seconds()
+            logger.info(f"Connected and verified via {interface_name} using {config_file.name} "
+                        f"(egress {public_ip}, {duration:.1f}s)")
             
             return ConnectionResult(
                 success=True,
                 server_name=config_file.stem,
                 config_file=str(config_file),
+                public_ip=public_ip,
                 connect_time_seconds=duration,
             )
                 
@@ -548,11 +309,15 @@ class WireGuardController:
             duration = (datetime.now() - start_time).total_seconds()
             logger.exception(f"Exception during VPN connection: {e}")
             
-            # Best-effort cleanup on failure
+            # Best-effort cleanup on failure: interface, routes/rules and DNS
             try:
-                await self._run_sudo(["ip", "link", "delete", interface_name])
+                self._current_interface = interface_name
+                await self.disconnect()
             except Exception:
-                pass
+                try:
+                    await self._run_sudo(["ip", "link", "delete", interface_name])
+                except Exception:
+                    pass
             
             return ConnectionResult(
                 success=False,
@@ -561,17 +326,145 @@ class WireGuardController:
                 error=str(e),
             )
     
+    KILL_SWITCH_CHAIN = "AIRBL_KS"
+    PRIVATE_V4 = ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"]
+    PRIVATE_V6 = ["fe80::/10", "fc00::/7"]
+    KERNEL_FALLBACK_DEVICES = {"tunl0", "sit0", "ip6tnl0", "ip6gre0", "gre0", "gretap0",
+                               "erspan0", "ip_vti0", "ip6_vti0"}
+
+    @staticmethod
+    def kill_switch_blocker() -> Optional[str]:
+        """Reason the kill switch can't be used here, or None if it can."""
+        if os.environ.get("AIRBL_KILL_SWITCH", "1").lower() in ("0", "false", "no", "off"):
+            return "disabled via AIRBL_KILL_SWITCH"
+        try:
+            ifaces = os.listdir("/sys/class/net")
+        except OSError:
+            return "cannot list network interfaces"
+        # A container's own network namespace only has lo/eth*/wg*, plus the kernel's
+        # fallback tunnel devices that appear in every netns once their module is loaded.
+        # Anything else (wlan0, docker0, br-*, veth*) means we share the host's network
+        # (network_mode: host), where these rules would firewall the whole machine.
+        # (Comparing /proc/self/ns/net with /proc/1/ns/net can't tell: in a container
+        # PID 1 is the container's own init.)
+        foreign = [i for i in ifaces
+                   if not re.fullmatch(r"lo|eth\d+|wg\d+", i) and i not in WireGuardController.KERNEL_FALLBACK_DEVICES]
+        if foreign:
+            return f"host network namespace detected (interfaces: {', '.join(sorted(foreign)[:5])})"
+        return None
+
+    async def _iptables(self, binary: str, *args) -> bool:
+        try:
+            # Bounded lock wait: a held xtables lock must not hang connect
+            await self._run_sudo([binary, "-w", "5", *args])
+            return True
+        except Exception:
+            return False
+
+    async def _enable_kill_switch(self, interface_name: str, endpoint_ip: str, endpoint_port: int):
+        """Reject traffic leaving outside the tunnel while connected.
+
+        Allowed: loopback, the tunnel itself, WireGuard's UDP to the endpoint, private
+        networks (LAN, Docker, dashboard), and replies on dashboard connections.
+        Only affects this container's network namespace.
+        """
+        logger = logging.getLogger("airbl.hummingbird")
+        blocker = self.kill_switch_blocker()
+        if blocker:
+            logger.warning(f"VPN kill switch not enabled: {blocker}")
+            return
+        chain = self.KILL_SWITCH_CHAIN
+        dash_port = os.environ.get("PORT", "5665")
+        families = [("iptables", self.PRIVATE_V4, True)]
+        if Path("/proc/sys/net/ipv6/conf/all/disable_ipv6").exists() and \
+                Path("/proc/sys/net/ipv6/conf/all/disable_ipv6").read_text().strip() == "0":
+            families.append(("ip6tables", self.PRIVATE_V6, False))  # tunnel is IPv4-only: block v6 egress
+        for binary, private_nets, is_v4 in families:
+            await self._iptables(binary, "-N", chain)  # may already exist
+            if not await self._iptables(binary, "-F", chain):
+                raise RuntimeError(f"Kill switch: {binary} unavailable")
+            rules = [
+                ["-o", "lo", "-j", "RETURN"],
+                ["-o", interface_name, "-j", "RETURN"],
+            ]
+            if is_v4:
+                rules.append(["-p", "udp", "-d", endpoint_ip, "--dport", str(endpoint_port), "-j", "RETURN"])
+            rules += [["-d", net, "-j", "RETURN"] for net in private_nets]
+            rules += [
+                # Dashboard replies to clients on public addresses (connections they opened)
+                ["-p", "tcp", "--sport", dash_port, "-m", "conntrack", "--ctstate", "ESTABLISHED,RELATED", "-j", "RETURN"],
+                ["-j", "REJECT"],
+            ]
+            for rule in rules:
+                if not await self._iptables(binary, "-A", chain, *rule):
+                    raise RuntimeError(f"Kill switch: failed to add {binary} rule {' '.join(rule)}")
+            if not await self._iptables(binary, "-C", "OUTPUT", "-j", chain):
+                if not await self._iptables(binary, "-I", "OUTPUT", "1", "-j", chain):
+                    raise RuntimeError(f"Kill switch: failed to hook {binary} OUTPUT")
+        self._kill_switch_on = True
+        logger.debug("VPN kill switch enabled")
+
+    async def _disable_kill_switch(self):
+        """Remove the kill switch chain (safe to call when it isn't installed)."""
+        chain = self.KILL_SWITCH_CHAIN
+        for binary in ("iptables", "ip6tables"):
+            for _ in range(5):  # remove every jump (duplicates from a crashed run)
+                if not await self._iptables(binary, "-D", "OUTPUT", "-j", chain):
+                    break
+            await self._iptables(binary, "-F", chain)
+            await self._iptables(binary, "-X", chain)
+        self._kill_switch_on = False
+
+    HANDSHAKE_TIMEOUT = 15  # seconds; keepalive triggers the first handshake immediately
+
+    async def _wait_for_handshake(self, interface_name: str) -> bool:
+        """Poll `wg show <if> latest-handshakes` until the peer reports a handshake."""
+        deadline = asyncio.get_event_loop().time() + self.HANDSHAKE_TIMEOUT
+        while asyncio.get_event_loop().time() < deadline:
+            try:
+                out = await self._run_sudo_output(["wg", "show", interface_name, "latest-handshakes"])
+                # "<peer-pubkey>\t<unix-time>"; 0 means no handshake yet
+                if any(line.split()[-1] != "0" for line in out.strip().splitlines() if line.strip()):
+                    return True
+            except Exception:
+                pass
+            await asyncio.sleep(0.5)
+        return False
+
+    async def _verify_egress(self) -> str:
+        """Confirm traffic exits through AirVPN; returns the public IP.
+
+        Uses AirVPN's own IP API ("airvpn": true when the request came from an AirVPN exit).
+        If that API is unreachable but the internet is, accept with a warning rather than
+        failing every test because of one website.
+        """
+        import httpx
+        logger = logging.getLogger("airbl.hummingbird")
+        try:
+            async with httpx.AsyncClient(timeout=10) as client:
+                resp = await client.get("https://airvpn.org/api/whatismyip/")
+                data = resp.json()
+            if data.get("airvpn") is True:
+                return data.get("ip")
+            if data.get("airvpn") is False:
+                raise RuntimeError(f"Traffic is not leaving via AirVPN (egress {data.get('ip')}); refusing to measure")
+        except RuntimeError:
+            raise
+        except Exception as e:
+            logger.debug(f"AirVPN IP API check failed: {e}")
+        ip = await get_public_ip(timeout=10)
+        if not ip:
+            raise RuntimeError("Tunnel is up but no internet access through it")
+        logger.warning(f"Could not confirm AirVPN egress (API unavailable); public IP {ip}")
+        return ip
+
     async def _cleanup_routing(self, table: str, logger):
         """
         Clean up stale routes and rules in the given routing table.
         Fixes "RTNETLINK answers: File exists" errors on reconnect.
         """
-        try:
-            # Flush all routes in the table
-            await self._run_sudo(["ip", "route", "flush", "table", table])
-        except Exception:
-            pass
-        
+        # Rules first, table last: flushing first would briefly send traffic matching
+        # the rules into an empty table and on to the direct route.
         # Clean up ip rules for this table (run multiple times to delete all)
         for _ in range(5):
             try:
@@ -594,287 +487,49 @@ class WireGuardController:
                 except Exception:
                     break
         
+        try:
+            # Flush all routes in the table (VPN route and blackhole fallback)
+            await self._run_sudo(["ip", "route", "flush", "table", table])
+        except Exception:
+            pass
         
         logger.debug(f"Cleaned up stale routes and rules in table {table}")
     
-    async def _connect_namespace(self, config_file: Path, interface_name: str, namespace) -> ConnectionResult:
-        """Connect to VPN inside a network namespace using manual configuration."""
-        import logging
-        from .wireguard import parse_config_file  # Avoid circular import
-        
-        logger = logging.getLogger("airbl.hummingbird")
-        start_time = datetime.now()
-        
+    CMD_TIMEOUT = 20  # seconds per wg/ip/iptables call
+
+    async def _run_sudo_output(self, cmd, timeout: float = CMD_TIMEOUT, input_data: Optional[bytes] = None) -> str:
+        """Run a command (via `sudo -n` when needed) and return stdout; raises on failure.
+
+        `-n` makes sudo fail instead of waiting for a password; the timeout keeps a
+        stuck command (e.g. a held lock) from hanging connect/disconnect forever.
+        """
+        if self.use_sudo:
+            cmd = ["sudo", "-n"] + cmd
+        process = await asyncio.create_subprocess_exec(
+            *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+            stdin=asyncio.subprocess.PIPE if input_data is not None else asyncio.subprocess.DEVNULL,
+        )
         try:
-            logger.info(f"Setting up VPN {config_file.stem} in namespace {namespace.name}")
-            
-            # 1. Parse config to get keys and address
-            wg_conf = parse_config_file(config_file)
-            
-            # 2. Clean up any existing interface with the same name first
+            stdout, stderr = await asyncio.wait_for(process.communicate(input=input_data), timeout=timeout)
+        except (asyncio.TimeoutError, asyncio.CancelledError) as e:
             try:
-                cmd_del = ["ip", "link", "delete", "dev", interface_name]
-                await self._run_sudo(cmd_del)
-                logger.debug(f"Cleaned up existing interface {interface_name}")
+                process.kill()
+            except ProcessLookupError:
+                pass
+            try:
+                await asyncio.wait_for(process.wait(), timeout=5)  # reap
             except Exception:
-                pass  # Interface didn't exist, that's fine
-            
-            # 3. Create WireGuard Interface in HOST
-            cmd_add = ["ip", "link", "add", "dev", interface_name, "type", "wireguard"]
-            await self._run_sudo(cmd_add)
-            
-            # 3b. Set MTU to 1464 (User requested)
-            await self._run_sudo(["ip", "link", "set", "dev", interface_name, "mtu", "1464"])
-
-            # NOTE: Do NOT bring interface UP yet - it should only be UP after config and after moving
-
-            # Check host routing to endpoint (Debug)
-            if logger.isEnabledFor(logging.DEBUG):
-                try:
-                    route_get = await self._run_sudo_output(["ip", "route", "get", wg_conf.endpoint_ip])
-                    logger.debug(f"Host route to endpoint {wg_conf.endpoint_ip}:\n{route_get}")
-                except Exception as e:
-                    logger.warning(f"Failed to check route to endpoint: {e}")
-
-            # 4. Create Stripped Config for wg setconf (Keys + Peers only, no Address/DNS)
-            # wg setconf format is strict (no Interface Address)
-            stripped_conf = [
-                "[Interface]",
-                f"PrivateKey = {wg_conf.private_key}",
-                "ListenPort = 51820", # Force 51820 for debugging socket location
-                "",
-                "[Peer]",
-                f"PublicKey = {wg_conf.public_key}",
-                f"Endpoint = {wg_conf.endpoint_ip}:{wg_conf.endpoint_port}",
-                f"AllowedIPs = {wg_conf.allowed_ips or '0.0.0.0/0'}",
-                "PersistentKeepalive = 25",
-            ]
-            
-            # Use a temp file that is definitely accessible to root in host
-            temp_conf_path = Path(f"/tmp/{interface_name}_stripped.conf")
-            temp_conf_path.write_text("\n".join(stripped_conf))
-            
-            try:
-                # 5. Apply Config in HOST (This binds the socket in the Host Namespace)
-                # IMPORTANT: This must be done BEFORE moving to the namespace so the output UDP socket
-                # lives in the host (where it has internet access).
-                cmd_conf = ["wg", "setconf", interface_name, str(temp_conf_path)]
-                await self._run_sudo(cmd_conf)
-                
-                # Debug: Check WG status and Socket in Host
-                if logger.isEnabledFor(logging.DEBUG):
-                    wg_show = await self._run_sudo_output(["wg", "show", interface_name])
-                    logger.debug(f"WG status in HOST before move:\n{wg_show}")
-                    try:
-                        ss_out = await self._run_sudo_output(["ss", "-ulpn", "sport = :51820"])
-                        logger.debug(f"Socket status in HOST before move:\n{ss_out}")
-                    except Exception as e:
-                        logger.debug(f"Failed to run ss: {e}")
-                
-                # 6. Move to Namespace (interface is still DOWN)
-                cmd_move = ["ip", "link", "set", interface_name, "netns", namespace.name]
-                await self._run_sudo(cmd_move)
-                
-                # 7. Set Address inside NS
-                if wg_conf.address:
-                    await namespace.run(["ip", "address", "add", wg_conf.address, "dev", interface_name])
-                
-                # 8. Bring Up inside NS (first time interface is brought UP)
-                await namespace.run(["ip", "link", "set", interface_name, "up"])
-                
-                # Debug: Check Socket in Host AGAIN (Did it survive?)
-                if logger.isEnabledFor(logging.DEBUG):
-                    try:
-                        ss_out_after = await self._run_sudo_output(["ss", "-ulpn", "sport = :51820"])
-                        logger.debug(f"Socket status in HOST AFTER move/up:\n{ss_out_after}")
-                    except Exception:
-                        pass
-                    
-                    # Check WG status from INSIDE the namespace
-                    try:
-                        wg_show_ns = await namespace.run(["wg", "show", interface_name])
-                        logger.debug(f"WG status INSIDE namespace after up:\n{wg_show_ns}")
-                    except Exception as e:
-                        logger.debug(f"Failed to get wg show in namespace: {e}")
-                
-                # 9. Set Routes inside NS
-                # Default route through wg interface
-                await namespace.run(["ip", "route", "add", "default", "dev", interface_name])
-                
-                # Debug: Log namespace state
-                if logger.isEnabledFor(logging.DEBUG):
-                    ip_a = await namespace.run(["ip", "a"])
-                    ip_r = await namespace.run(["ip", "route"])
-                    logger.debug(f"Namespace {namespace.name} state:\nIPs:\n{ip_a}\nRoutes:\n{ip_r}")
-
-            finally:
-                # Cleanup temp config
-                if temp_conf_path.exists():
-                    temp_conf_path.unlink()
-            
-            # 9. Set up DNS
-            # Create /etc/netns/<ns>/resolv.conf so ip netns exec uses it
-            if wg_conf.dns:
-                netns_dir = Path(f"/etc/netns/{namespace.name}")
-                if not netns_dir.exists():
-                    # We might need sudo to create this if running as non-root (but in Docker we are root)
-                    # Ideally we use sudo if needed, but python's mkdir might fail permissions
-                    # Let's try to run mkdir with sudo if needed
-                    cmd_mkdir = ["mkdir", "-p", str(netns_dir)]
-                    await self._run_sudo(cmd_mkdir)
-                
-                # Create resolv.conf content
-                # Handle comma-separated DNS servers
-                dns_servers = [d.strip() for d in wg_conf.dns.split(',')]
-                
-                # Add Quad9 and Cloudflare as fallbacks if not already present
-                # Primary: 9.9.9.9 (Quad9), 1.1.1.1 (Cloudflare)
-                # Secondary: 149.112.112.112 (Quad9), 1.0.0.1 (Cloudflare)
-                fallbacks = ["9.9.9.9", "1.1.1.1", "149.112.112.112", "1.0.0.1"]
-                for fb in fallbacks:
-                    if fb not in dns_servers:
-                        dns_servers.append(fb)
-                
-                resolv_content = "\n".join([f"nameserver {d}" for d in dns_servers])
-                
-                # Add options for faster failover
-                resolv_content += "\noptions timeout:2 attempts:2 rotate"
-                
-                # Write to file (might need sudo)
-                resolv_path = netns_dir / "resolv.conf"
-                
-                # Write using shell echo to handle permissions via sudo
-                cmd_write = ["sh", "-c", f"echo '{resolv_content}' > {resolv_path}"]
-                await self._run_sudo(cmd_write)
-                
-                logger.debug(f"Configured DNS for namespace {namespace.name}: {wg_conf.dns}")
-
-            # Cleanup temp config
-            if temp_conf_path.exists():
-                temp_conf_path.unlink()
-            
-            # 10. Wait for Handshake (Verify Connectivity)
-            # This is critical for AirVPN: traffic won't flow until handshake completes
-            logger.debug(f"Waiting for VPN handshake in {namespace.name}...")
-            handshake_complete = False
-            handshake_start = datetime.now()
-            
-            # Start tcpdump in background to capture handshake traffic (first 5 packets)
-            tcpdump_output = None
-            if logger.isEnabledFor(logging.DEBUG):
-                try:
-                    # Capture UDP traffic to/from the VPN endpoint
-                    tcpdump_proc = await asyncio.create_subprocess_exec(
-                        "timeout", "5", "tcpdump", "-i", "eth0", "-c", "10", "-n",
-                        f"host {wg_conf.endpoint_ip} and udp",
-                        stdout=asyncio.subprocess.PIPE,
-                        stderr=asyncio.subprocess.PIPE
-                    )
-                except Exception as e:
-                    logger.debug(f"Failed to start tcpdump: {e}")
-                    tcpdump_proc = None
-            else:
-                tcpdump_proc = None
-            
-            while (datetime.now() - handshake_start).total_seconds() < 20:
-                # Check handshake status
-                # Output format: public_key    latest_handshake_epoch_seconds
-                hs_output = await namespace.run(["wg", "show", interface_name, "latest-handshakes"])
-                if hs_output.strip():
-                    logger.debug(f"Handshake status: {hs_output.strip()}")
-                    parts = hs_output.split()
-                    if len(parts) >= 2:
-                        last_hs = int(parts[1])
-                        # Check if handshake happened recently (within last 30 seconds)
-                        # Note: wg reports 0 if never moved
-                        if last_hs > 0 and (datetime.now().timestamp() - last_hs) < 180:
-                            handshake_complete = True
-                            break
-                else:
-                    logger.debug("Handshake status: <empty>")
-                    
-                await asyncio.sleep(1.0)
-            
-            # Get tcpdump output
-            if tcpdump_proc:
-                try:
-                    stdout, stderr = await asyncio.wait_for(tcpdump_proc.communicate(), timeout=2)
-                    tcpdump_output = stdout.decode() + stderr.decode()
-                    logger.debug(f"tcpdump output:\n{tcpdump_output}")
-                except Exception as e:
-                    logger.debug(f"Failed to get tcpdump output: {e}")
-            
-            if not handshake_complete:
-                # Get final WG status before failing
-                try:
-                    final_wg = await namespace.run(["wg", "show", interface_name])
-                    logger.debug(f"Final WG status before failure:\n{final_wg}")
-                except Exception:
-                    pass
-                raise RuntimeError("VPN handshake timed out (no response from server)")
-
-            # 11. Verify DNS Reachability (Optional but recommended)
-            # Try to ping the DNS server (if it's a private IP like 10.128.0.1)
-            # Or just assume it works if handshake worked
-            if wg_conf.dns:
-                primary_dns = dns_servers[0]
-                # Only check if it's the internal AirVPN DNS
-                if primary_dns.startswith("10."):
-                    logger.debug(f"Verifying reachability of DNS {primary_dns}...")
-                    try:
-                        # Ping with short timeout (1s)
-                        await namespace.run(["ping", "-c", "1", "-W", "2", primary_dns])
-                        logger.debug(f"DNS {primary_dns} is reachable")
-                    except Exception:
-                        logger.warning(f"DNS {primary_dns} not reachable via ping, but proceeding regardless")
-
-            duration = (datetime.now() - start_time).total_seconds()
-            
-            # Mark as connected (we don't track interface on host anymore, it's hidden in NS)
-            self._current_interface = f"{interface_name}@{namespace.name}"
-            
-            logger.info(f"VPN setup complete in namespace {namespace.name} (handshake verified)")
-            return ConnectionResult(
-                success=True,
-                server_name=wg_conf.server_name,
-                config_file=str(config_file),
-                connect_time_seconds=duration
-            )
-            
-        except Exception as e:
-            logger.error(f"Namespace connection failed: {e}")
-            # Try to cleanup interface if it exists stuck in host or partially in NS?
-            # If we fail, the namespace might be deleted by caller which cleans everything up automatically!
-            # That's the beauty of namespaces.
-            return ConnectionResult(
-                success=False,
-                config_file=str(config_file),
-                connect_time_seconds=(datetime.now() - start_time).total_seconds(),
-                error=str(e)
-            )
-
-    async def _run_sudo(self, cmd):
-        """Helper to run command with sudo."""
-        if self.use_sudo:
-            cmd = ["sudo"] + cmd
-        process = await asyncio.create_subprocess_exec(
-            *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
-        )
-        _, stderr = await process.communicate()
-        if process.returncode != 0:
-            raise RuntimeError(f"Command failed: {cmd} -> {stderr.decode()}")
-
-    async def _run_sudo_output(self, cmd) -> str:
-        """Helper to run command with sudo and return stdout."""
-        if self.use_sudo:
-            cmd = ["sudo"] + cmd
-        process = await asyncio.create_subprocess_exec(
-            *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
-        )
-        stdout, stderr = await process.communicate()
+                pass
+            if isinstance(e, asyncio.CancelledError):
+                raise
+            raise RuntimeError(f"Command timed out after {timeout}s: {cmd}")
         if process.returncode != 0:
             raise RuntimeError(f"Command failed: {cmd} -> {stderr.decode()}")
         return stdout.decode().strip()
+
+    async def _run_sudo(self, cmd, timeout: float = CMD_TIMEOUT, input_data: Optional[bytes] = None):
+        """Run a command (via `sudo -n` when needed); raises on failure or timeout."""
+        await self._run_sudo_output(cmd, timeout=timeout, input_data=input_data)
             
     async def disconnect(self, config_file: Path = None) -> bool:
         """
@@ -883,41 +538,29 @@ class WireGuardController:
         Mirrors wg-quick down: remove DNS, delete routing rules,
         flush routing table, delete interface.
         """
-        import logging
         logger = logging.getLogger("airbl.hummingbird")
         
         table = str(self._fwmark)
         
         try:
-            # Handle Namespace Interface (format: interface@namespace)
-            if self._current_interface and "@" in self._current_interface:
-                # We assume the caller destroys the namespace, which destroys the interface.
-                # So here we just clear our state.
-                logger.debug(f"Disconnecting namespace interface {self._current_interface} (caller should destroy NS)")
-                self._current_interface = None
-                return True
-                
             # Always try to disconnect the interface, even if we don't have it tracked
             interface_to_disconnect = self._current_interface or "wg0"
             
             # First check if interface actually exists
             try:
-                check_cmd = []
-                if self.use_sudo:
-                    check_cmd.append("sudo")
-                check_cmd.extend(["wg", "show", "interfaces"])
-                check_process = await asyncio.create_subprocess_exec(
-                    *check_cmd,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE,
-                )
-                stdout, _ = await check_process.communicate()
-                interfaces = stdout.decode().strip()
+                interfaces = (await self._run_sudo_output(["wg", "show", "interfaces"])).split()
                 
                 if interface_to_disconnect not in interfaces:
                     logger.debug(f"Interface {interface_to_disconnect} does not exist, cleaning up routes only")
-                    # Still clean up any stale routing rules
+                    # Still clean up any stale routing rules, DNS and the kill switch
+                    if self._resolv_backup is not None:
+                        try:
+                            Path("/etc/resolv.conf").write_text(self._resolv_backup)
+                            self._resolv_backup = None
+                        except Exception as e:
+                            logger.warning(f"Failed to restore /etc/resolv.conf: {e}")
                     await self._cleanup_routing(table, logger)
+                    await self._disable_kill_switch()
                     self._current_interface = None
                     self._temp_config_path = None
                     return True
@@ -928,18 +571,17 @@ class WireGuardController:
             
             # 1. Remove DNS via resolvconf (best-effort)
             try:
-                resolvconf_cmd = []
-                if self.use_sudo:
-                    resolvconf_cmd.append("sudo")
-                resolvconf_cmd.extend(["resolvconf", "-d", interface_to_disconnect, "-f"])
-                proc = await asyncio.create_subprocess_exec(
-                    *resolvconf_cmd,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE,
-                )
-                await proc.communicate()
+                await self._run_sudo(["resolvconf", "-d", interface_to_disconnect, "-f"])
             except Exception:
                 pass  # resolvconf may not be available
+            
+            # Restore /etc/resolv.conf if the direct-write fallback replaced it
+            if self._resolv_backup is not None:
+                try:
+                    Path("/etc/resolv.conf").write_text(self._resolv_backup)
+                    self._resolv_backup = None
+                except Exception as e:
+                    logger.warning(f"Failed to restore /etc/resolv.conf: {e}")
             
             # 2. Clean up routing rules and table
             await self._cleanup_routing(table, logger)
@@ -952,6 +594,9 @@ class WireGuardController:
                 logger.warning(f"Failed to delete interface {interface_to_disconnect}: {e}")
             
             await asyncio.sleep(0.3)  # Brief settle time
+            
+            # Last: lift the kill switch once nothing routes via the tunnel any more
+            await self._disable_kill_switch()
             
             self._current_interface = None
             self._temp_config_path = None

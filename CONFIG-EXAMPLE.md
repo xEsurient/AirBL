@@ -5,30 +5,17 @@ This document provides examples of how to configure AirBL using a JSON configura
 ## Setup
 
 1. Create a JSON configuration file (e.g., `airbl-config.json`)
-2. Mount it in your `docker-compose.yml`:
-   ```yaml
-   volumes:
-     - ./airbl-config.json:/app/data/airbl-config.json:ro
-   ```
-3. Set the environment variable:
-   ```yaml
-   environment:
-     - AIRBL_CONFIG_FILE=/app/data/airbl-config.json
-   ```
+2. Put it in `docker/conf/` (mounted as `/app/conf`). The default `AIRBL_CONFIG_FILE=/app/conf/airbl-config.json` picks it up. To use another path, set `AIRBL_CONFIG_FILE`.
+3. It's a read-only base: settings changed in the web UI are stored separately in `data/airbl-settings.json` (only the values that differ from this file), so later edits to this file still apply.
 
 ## Configuration Options
 
 ### Regions
 
-The `regions` section controls which countries to scan. Available modes:
-
-- **`"all"`** - Scan all countries (default behavior)
-- **`"none"`** - Don't scan any countries
-- **`"config_only"`** - Only scan countries that have config files
-- **`"us_only"`** - Scan only US servers
-- **`"asia_only"` - Scan only Asian countries (CN, JP, KR, IN, SG, HK, TW, TH, MY, PH, ID, VN)
-- **`"europe_only"`** - Scan only European countries (GB, DE, FR, IT, ES, NL, BE, CH, AT, SE, NO, DK, FI, PL, CZ, IE, PT, GR)
-- **`"manual"`** - Manually specify country codes (requires `countries` array)
+- **`countries`**: ISO 2-letter codes to scan. Empty or omitted means all countries that have config files.
+- **`excluded_countries`**: codes never scanned.
+- **`us_near_europe_only`** (default `false`): when `true`, only US cities close to Europe are scanned.
+- `mode`: accepted for compatibility but **not used**. Only the lists above decide. Older examples showed modes like `us_only`/`europe_only`; use `countries` instead.
 
 ### Servers
 
@@ -40,70 +27,37 @@ The `cities` section (optional) filters by cities within countries. Format: `cou
 
 ## Examples
 
-### Example 1: Scan All Regions
+### Scan everything that has a config file
+```json
+{}
+```
+
+### Selected countries
 ```json
 {
-  "regions": {
-    "mode": "all"
-  }
+  "regions": { "countries": ["DE", "GB", "US", "FR"] }
 }
 ```
 
-### Example 2: Scan Only Countries with Config Files
+### Everything except some countries
 ```json
 {
-  "regions": {
-    "mode": "config_only"
-  }
+  "regions": { "excluded_countries": ["US"] }
 }
 ```
 
-### Example 3: Scan Only US Servers
+### Filter by server names
 ```json
 {
-  "regions": {
-    "mode": "us_only"
-  }
-}
-```
-
-### Example 4: Scan Only European Servers
-```json
-{
-  "regions": {
-    "mode": "europe_only"
-  }
-}
-```
-
-### Example 5: Manual Country Selection
-```json
-{
-  "regions": {
-    "mode": "manual",
-    "countries": ["DE", "GB", "US", "FR"]
-  }
-}
-```
-
-### Example 6: Filter by Server Names
-```json
-{
-  "regions": {
-    "mode": "manual",
-    "countries": ["DE", "GB"]
-  },
+  "regions": { "countries": ["DE", "GB"] },
   "servers": ["Norma", "Segin", "Lupus"]
 }
 ```
 
-### Example 7: Filter by Cities
+### Filter by cities
 ```json
 {
-  "regions": {
-    "mode": "manual",
-    "countries": ["GB", "DE"]
-  },
+  "regions": { "countries": ["GB", "DE"] },
   "cities": {
     "GB": ["London"],
     "DE": ["Frankfurt"]
@@ -111,19 +65,16 @@ The `cities` section (optional) filters by cities within countries. Format: `cou
 }
 ```
 
-### Example 8: Complete Configuration
+### Complete
 ```json
 {
-  "regions": {
-    "mode": "manual",
-    "countries": ["DE", "GB", "US"]
-  },
+  "regions": { "countries": ["DE", "GB", "US"], "us_near_europe_only": true },
   "servers": ["Norma", "Segin", "Lupus"],
   "cities": {
     "GB": ["London"],
-    "DE": ["Frankfurt", "Berlin"],
-    "US": ["New York", "Chicago"]
-  }
+    "DE": ["Frankfurt", "Berlin"]
+  },
+  "scan": { "scan_mode": "schedule", "scan_schedule_time": "05:00", "scan_schedule_days": ["Mon", "Wed", "Sun"] }
 }
 ```
 
@@ -131,7 +82,8 @@ The `cities` section (optional) filters by cities within countries. Format: `cou
 
 - Country codes should be ISO 2-letter codes (e.g., "DE", "GB", "US")
 - Server names are case-insensitive
-- City names should match exactly as they appear in your config file names
+- City names should match the city part of your config file names (e.g. `Toronto-Ontario`)
 - If a section is omitted, that filter is not applied
-- Settings can also be changed via the web UI after the container starts
+- Settings can also be changed in the web UI; those changes are stored in `data/airbl-settings.json` and take precedence over this file
+- Only servers that have a `.conf` file in `conf/` are scanned
 

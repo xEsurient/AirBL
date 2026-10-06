@@ -33,11 +33,7 @@ setup_wireguard() {
     else
         echo "Note: /proc/sys/net/ipv4/conf/all/src_valid_mark is read-only (set via docker sysctls)"
     fi
-    
-    # Create WireGuard interface if not exists
-    if ! ip link show wg0 &>/dev/null; then
-        ip link add dev wg0 type wireguard 2>/dev/null || true
-    fi
+    # No wg0 here: the tester creates its own interface per test (cleanup removes stale ones)
 }
 
 # Verify config directory
@@ -70,13 +66,38 @@ setup_policy_routing() {
     if [ -z "$default_iface" ]; then
         default_iface="eth0" # fallback to eth0
     fi
-    local eth0_ip=$(ip -4 addr show "$default_iface" 2>/dev/null | grep -oP '(?<=inet\s)\d+(\.\d+){3}')
+    local eth0_ip=$(ip -4 addr show "$default_iface" 2>/dev/null | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | head -n 1 || true)
     
     if [ -n "$eth0_ip" ]; then
-        echo "Setting up policy routing for container IP: $eth0_ip on $default_iface"
+        local dash_port="${PORT:-5665}"
+        echo "Setting up policy routing for dashboard replies: $eth0_ip tcp/$dash_port on $default_iface"
         # Keep dashboard replies ahead of VPN rules, after the kernel's priority-0 local rule.
-        ip -4 rule add from "$eth0_ip" table main priority 1
+        # Only replies from the dashboard port: a rule for every packet from this IP would let
+        # any socket bound to it bypass the tunnel during tests.
+        ip -4 rule del from "$eth0_ip" table main priority 1 2>/dev/null || true
+        if ! ip -4 rule add from "$eth0_ip" ipproto tcp sport "$dash_port" table main priority 1 2>/dev/null; then
+            echo "WARNING: kernel lacks ipproto/sport rule support; using broad source rule (source-bound sockets can bypass the VPN)"
+            ip -4 rule add from "$eth0_ip" table main priority 1 \
+                || echo "WARNING: could not add dashboard routing rule (NET_ADMIN missing?); dashboard may be unreachable during VPN tests"
+        fi
     fi
+}
+
+# Remove VPN state left behind by a crash (kill switch chain, tunnel, policy rules)
+cleanup_stale_vpn_state() {
+    for ipt in iptables ip6tables; do
+        command -v "$ipt" >/dev/null 2>&1 || continue
+        while $ipt -w 5 -D OUTPUT -j AIRBL_KS 2>/dev/null; do :; done
+        $ipt -w 5 -F AIRBL_KS 2>/dev/null || true
+        $ipt -w 5 -X AIRBL_KS 2>/dev/null || true
+    done
+    ip link delete wg0 2>/dev/null || true
+    while ip -4 rule del table 51820 2>/dev/null; do :; done
+    while ip -4 rule del table main suppress_prefixlength 0 2>/dev/null; do :; done
+    for net in 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16; do
+        while ip -4 rule del to "$net" table main priority 10 2>/dev/null; do :; done
+    done
+    ip -4 route flush table 51820 2>/dev/null || true
 }
 
 # Initialize
@@ -85,6 +106,7 @@ check_capabilities
 setup_wireguard
 check_configs
 clean_python_cache
+cleanup_stale_vpn_state
 setup_policy_routing
 
 echo ""
@@ -98,40 +120,14 @@ case "$1" in
         # Run web server as module (now has proper __main__.py)
         exec python -m airbl.web "$@"
         ;;
-    scan)
-        shift
-        exec python main.py scan "$@"
-        ;;
-    check)
-        shift
-        exec python main.py check "$@"
-        ;;
     shell)
         exec /bin/bash
         ;;
+    "")
+        exec python -m airbl.web
+        ;;
     *)
-        # Default: run the web server
-        exec python -c "
-import asyncio
-from pathlib import Path
-from airbl.web.app import run_server
-
-config_dir = Path('${AIRBL_CONFIG_DIR:-/app/conf}')
-port = int('${PORT:-5665}')
-interval = int('${SCAN_INTERVAL:-120}')
-
-print(f'Starting web server on port {port}')
-print(f'Config directory: {config_dir}')
-print(f'Scan interval: {interval} minutes')
-
-asyncio.run(run_server(
-    host='0.0.0.0',
-    port=port,
-    config_dir=config_dir,
-    scan_interval_minutes=interval,
-    auto_scan=True,
-))
-"
+        # Any other CLI command (scan, check, configs, ping, speedtest, status, --help, ...)
+        exec python main.py "$@"
         ;;
 esac
-
