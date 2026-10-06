@@ -10,6 +10,8 @@
 
 **AirBL** is a comprehensive toolkit designed to optimize your AirVPN connections. It continuously scans AirVPN infrastructure, drops unresponsive or DroneBL-blacklisted endpoints, performs speed and latency tests, and actively generates routing configurations for your local network—all controlled through a beautiful, glassmorphism web dashboard.
 
+![AirBL Dashboard](https://github.com/xEsurient/AirBL/blob/8a61f0061c62e3712833903d1131ce1b1b39015f/assets/dashboard.png)
+
 ## 🌟 Key Features
 
 - 🔍 **DNS-Guided Endpoints**: Looks up each server's exit IPs via AirVPN DNS (IPv4 and IPv6) and pings entry and exit IPs over both ICMP and TCP, keeping the lower latency (some hosts block one or the other).
