@@ -59,5 +59,8 @@ Generated configs are written to `/app/wireguard` (mounted as `docker/wireguard`
 ## 🧪 Tests
 `pip install -r requirements.txt pytest pytest-asyncio && python -m pytest -q` (about 1 s, no network). Browser checks for a running instance are in `tests/browser/`.
 
+## 🤖 AI Disclosure
+AI tools were used to speed up parts of this project's development: writing and running the test suite, preparing and checking deployments, and keeping the changelog and documentation up to date. All changes were reviewed, tested and deployed prior to uploading.
+
 ## 📝 License
 Built under the GNU General Public License v3.0 (GPL-3.0). This project is community-supported and unaffiliated directly with AirVPN.
