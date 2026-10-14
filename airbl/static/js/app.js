@@ -1043,6 +1043,70 @@ function escapeHtml(value) {
     return String(value).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 }
 
+// --- Auto-disabled servers (Settings and Metrics pages) ---
+
+// Load /api/servers/disabled into the element. onEnabled(name, disabledNames) runs after a re-enable.
+async function loadDisabledServers(containerId, onEnabled) {
+    const el = document.getElementById(containerId);
+    if (!el) return;
+    try {
+        const res = await fetch('/api/servers/disabled');
+        if (!res.ok) throw new Error('HTTP ' + res.status);
+        renderDisabledServerList(el, await res.json(), onEnabled);
+    } catch (e) {
+        el.innerHTML = `<p class="setting-description">Could not load auto-disabled servers: ${escapeHtml(e.message)}</p>`;
+    }
+}
+
+function renderDisabledServerList(el, data, onEnabled) {
+    const servers = data.servers || [];
+    if (!servers.length) {
+        el.innerHTML = '<p class="setting-description" style="padding: 20px; text-align: center; color: var(--text-secondary);">No servers have been auto-disabled.</p>';
+        return;
+    }
+    const thDl = data.threshold_download, thUl = data.threshold_upload;
+    const mbps = v => (v == null ? '--' : Number(v).toFixed(1));
+    const val = (v, th) => `<span class="${v != null && v < th ? 'low' : ''}">${mbps(v)}</span>`;
+    const rows = servers.map(s => {
+        const where = [s.city, s.country_name].filter(Boolean).join(', ');
+        const results = (s.recent || []).map(r => {
+            const day = r.timestamp ? new Date(r.timestamp).toLocaleDateString(undefined, { day: 'numeric', month: 'short' }) : '';
+            return `<span class="disabled-result" title="${escapeHtml(r.timestamp || '')}">${escapeHtml(day)} ↓${val(r.download, thDl)} ↑${val(r.upload, thUl)}</span>`;
+        }).join('') || '<span class="disabled-meta">No recent results kept</span>';
+        return `<div class="disabled-row">
+            <div>
+                <div class="disabled-name">${/^[A-Za-z]{2}$/.test(s.country_code || '') ? getFlagEmoji(s.country_code) + ' ' : ''}${escapeHtml(s.name)}</div>
+                <div class="disabled-meta">${escapeHtml(where)}${s.avg_download_mbps != null ? ` · avg ↓${mbps(s.avg_download_mbps)} ↑${mbps(s.avg_upload_mbps)} Mbps` : ''}</div>
+            </div>
+            <div class="disabled-results">${results}</div>
+            <button class="btn btn-secondary" data-server="${escapeHtml(s.name)}">Re-enable</button>
+        </div>`;
+    }).join('');
+    el.innerHTML = `<p class="setting-description" style="margin: 0 0 10px;">Disabled after ${escapeHtml(data.check_count)} results in a row below ${escapeHtml(thDl)} Mbps down or ${escapeHtml(thUl)} Mbps up (low values in red). Disabled servers are skipped by scans.</p>
+        <div class="disabled-list">${rows}</div>`;
+    el.querySelectorAll('button[data-server]').forEach(btn => {
+        btn.addEventListener('click', () => reEnableDisabledServer(btn.dataset.server, el, onEnabled));
+    });
+}
+
+async function reEnableDisabledServer(name, el, onEnabled) {
+    if (!confirm(`Re-enable server "${name}"? It will be tested again in future scans.`)) return;
+    try {
+        // Dedicated endpoint: only this change is saved, other unsaved settings edits stay
+        const res = await fetch(`/api/servers/${encodeURIComponent(name)}/enable`, { method: 'POST' });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok || data.error || !Array.isArray(data.disabled_servers)) {
+            showToast(`Failed to re-enable ${name}: ${data.error || data.detail || 'HTTP ' + res.status}`, 'error');
+            return;
+        }
+        showToast(`Server "${name}" re-enabled`, 'success');
+        if (onEnabled) onEnabled(name, data.disabled_servers);
+        if (el && el.id) loadDisabledServers(el.id, onEnabled);
+    } catch (e) {
+        showToast('Failed to re-enable server: ' + e.message, 'error');
+    }
+}
+
 // Tooltip showing both probes; the displayed value is the lower of the two.
 function pingTitle(p) {
     if (!p) return '';
@@ -1120,7 +1184,12 @@ function updateCountdown() {
 
     const mins = Math.floor(diff / 60000);
     const secs = Math.floor((diff % 60000) / 1000);
-    el.textContent = `${mins}:${secs.toString().padStart(2, '0')}`;
+    // Scheduled scans are often hours away: "1d 3h 05m" / "3h 05m", else "12:34"
+    const days = Math.floor(mins / 1440), hours = Math.floor((mins % 1440) / 60);
+    const mm = (mins % 60).toString().padStart(2, '0');
+    if (days) el.textContent = `${days}d ${hours}h ${mm}m`;
+    else if (hours) el.textContent = `${hours}h ${mm}m`;
+    else el.textContent = `${mins}:${secs.toString().padStart(2, '0')}`;
 }
 
 document.addEventListener('DOMContentLoaded', () => {

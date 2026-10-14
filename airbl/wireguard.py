@@ -86,12 +86,106 @@ def _city_tokens(city: str) -> list[str]:
 def is_us_city_near_europe(city: str) -> bool:
     """True if the city name contains an allowed location as whole word(s)."""
     tokens = _city_tokens(city)
-    for loc in US_ALLOWED_LOCATIONS:
-        want = loc.split()
-        n = len(want)
-        if any(tokens[i:i + n] == want for i in range(len(tokens) - n + 1)):
-            return True
-    return False
+    return any(_city_matches(tokens, loc) for loc in US_ALLOWED_LOCATIONS)
+
+
+# Regions for grouping cities in the dashboard (display only), by time zone.
+# AirVPN's API has no coordinates, only names like "Fremont-California", so
+# every state/province is listed: new servers named "City-State" group
+# themselves. REGION_CITIES covers names without a state ("Miami").
+# Each entry is matched as whole word(s); states are checked before cities.
+REGION_STATES = {
+    "US": {
+        "East": [
+            # "washington dc" must come before the state of Washington (West).
+            "washington dc", "dc", "district of columbia",
+            "connecticut", "delaware", "florida", "georgia", "indiana",
+            "kentucky", "maine", "maryland", "massachusetts", "michigan",
+            "new hampshire", "new jersey", "new york", "north carolina",
+            "ohio", "pennsylvania", "rhode island", "south carolina",
+            "vermont", "virginia", "west virginia",
+        ],
+        "Central": [
+            "alabama", "arkansas", "illinois", "iowa", "kansas", "louisiana",
+            "minnesota", "mississippi", "missouri", "nebraska", "north dakota",
+            "oklahoma", "south dakota", "tennessee", "texas", "wisconsin",
+        ],
+        "Mountain": [
+            "arizona", "colorado", "idaho", "montana", "new mexico", "utah",
+            "wyoming",
+        ],
+        "West": [
+            "california", "nevada", "oregon", "washington", "alaska", "hawaii",
+        ],
+    },
+    "CA": {
+        "East": [
+            "ontario", "quebec", "new brunswick", "nova scotia",
+            "prince edward island", "newfoundland",
+        ],
+        "Central": ["manitoba", "saskatchewan"],
+        "West": ["alberta", "british columbia"],
+    },
+}
+
+REGION_CITIES = {
+    "US": {
+        "East": [
+            "newyork", "ny", "nyc", "newark", "secaucus", "boston",
+            "philadelphia", "ashburn", "baltimore", "atlanta", "miami",
+            "orlando", "tampa", "jacksonville", "raleigh", "charlotte",
+            "pittsburgh", "detroit", "columbus", "cleveland", "indianapolis",
+            "buffalo",
+        ],
+        "Central": [
+            "chicago", "dallas", "houston", "austin", "san antonio",
+            "sanantonio", "st louis", "stlouis", "minneapolis", "nashville",
+            "memphis", "new orleans", "neworleans", "omaha", "milwaukee",
+        ],
+        "Mountain": [
+            "phoenix", "denver", "salt lake", "saltlake", "albuquerque",
+            "boise",
+        ],
+        "West": [
+            "los angeles", "losangeles", "san jose", "sanjose", "fremont",
+            "san francisco", "sanfrancisco", "san diego", "sandiego",
+            "santa clara", "santaclara", "seattle", "portland", "las vegas",
+            "lasvegas",
+        ],
+    },
+    "CA": {
+        "East": ["montreal", "toronto", "ottawa"],
+        "Central": ["winnipeg", "regina"],
+        "West": ["vancouver", "calgary", "edmonton"],
+    },
+}
+
+
+def _city_matches(tokens: list[str], loc: str) -> bool:
+    want = loc.split()
+    n = len(want)
+    return any(tokens[i:i + n] == want for i in range(len(tokens) - n + 1))
+
+
+def city_region(country_code: str, city: str) -> str | None:
+    """Region name for a city ("East", "West", ...), or None if ungrouped."""
+    code = (country_code or "").upper()
+    tokens = _city_tokens(city)
+    for table in (REGION_STATES, REGION_CITIES):
+        for region, locs in table.get(code, {}).items():
+            if any(_city_matches(tokens, loc) for loc in locs):
+                return region
+    return None
+
+
+def city_regions_for(cities_by_country: dict) -> dict:
+    """{country: {city: region}} for the cities that belong to a region."""
+    out = {}
+    for code, cities in cities_by_country.items():
+        found = {c: r for c in cities if (r := city_region(code, c))}
+        if found:
+            out[code.upper()] = found
+    return out
 
 
 def _us_filter_enabled() -> bool:
@@ -326,6 +420,38 @@ def scan_config_directory(config_dir: Path) -> list[WireGuardConfig]:
             logger.warning(f"Failed to parse {conf_file.name}: {e}")
     
     return configs
+
+
+def unparsed_config_files(config_dir: Path) -> list[str]:
+    """Names of .conf files that aren't per-server AirVPN configs (skipped by the scan)."""
+    if not config_dir.exists():
+        return []
+    skipped = []
+    for conf_file in sorted(config_dir.glob("*.conf")):
+        try:
+            parse_filename(conf_file.name)
+        except ValueError:
+            skipped.append(conf_file.name)
+    return skipped
+
+
+def no_configs_message(config_dir: Path, api_failed: bool = False) -> str:
+    """Why nothing can be scanned: no per-server .conf files, and none could be built."""
+    skipped = unparsed_config_files(config_dir)
+    msg = f"No per-server AirVPN WireGuard configs found in {config_dir}."
+    if not skipped:
+        return msg + (" Add an AirVPN WireGuard config: one per server"
+                      " (e.g. AirVPN_AT-Vienna_Alderamin_UDP-1637-Entry3.conf) or a region config"
+                      " (e.g. AirVPN_Europe_UDP-1637-Entry3.conf).")
+    shown = ", ".join(skipped[:3]) + (f" (+{len(skipped) - 3} more)" if len(skipped) > 3 else "")
+    if api_failed:
+        return msg + (f" Server configs are built from {shown} using the AirVPN server list,"
+                      " which couldn't be loaded. Check the container's internet access and try again.")
+    from .confgen import extract_client_identity
+    if extract_client_identity(config_dir):
+        return msg + f" Building server configs from {shown} failed; see the Debug page for details."
+    return msg + (f" The skipped file(s) ({shown}) have no PrivateKey and Address to build server"
+                  " configs from. Use an unmodified config from AirVPN's Config Generator.")
 
 
 def get_unique_countries(configs: list[WireGuardConfig]) -> dict[str, list[WireGuardConfig]]:

@@ -193,4 +193,23 @@ async def run_server(
     state.auto_scan_loop_task = asyncio.create_task(auto_scan_loop())
     state.auto_scan_loop_task.add_done_callback(_loop_done)
     
+    async def gluetun_watchdog_loop():
+        """Every watchdog_interval_seconds, keep Gluetun on a server the switch mode allows."""
+        from ..gluetun import gluetun_watchdog_check
+        from ..config import config_manager
+        while True:
+            interval = config_manager.config.gluetun.watchdog_interval_seconds
+            await asyncio.sleep(interval if interval > 0 else 60)  # 0 = off; re-check the setting each minute
+            if interval <= 0 or state.db is None:  # state.db: startup finished
+                continue
+            try:
+                await gluetun_watchdog_check()
+            except Exception:
+                logger.exception("Gluetun watchdog check failed")
+
+    state.gluetun_watchdog_task = asyncio.create_task(gluetun_watchdog_loop())
+    state.gluetun_watchdog_task.add_done_callback(
+        lambda t: not t.cancelled() and t.exception()
+        and logger.error("Gluetun watchdog stopped unexpectedly", exc_info=t.exception()))
+
     await server.serve()

@@ -16,6 +16,7 @@ from ...database import row_is_clean
 from ..tasks import run_scan_task, run_speedtest_task, network_owner
 from ..websockets import websocket_handler, broadcast_update
 from ...airvpn import get_airvpn_status
+from ...wireguard import city_regions_for
 
 router = APIRouter()
 logger = logging.getLogger("airbl.web.api")
@@ -162,6 +163,23 @@ async def get_metrics():
                 "avg_entry3": round(sum(e3_pings_list) / len(e3_pings_list), 1) if e3_pings_list else None,
             })
 
+    # Disabled servers are skipped by scans, so add the ones the scan data doesn't include
+    if country_stats or state.current_scan or state._last_scan_servers:
+        scanned = ({s.server_name.lower() for s in state.current_scan.servers} if state.current_scan
+                   else {s["server_name"].lower() for s in state._last_scan_servers})
+        by_code = {c["country_code"]: c for c in country_stats}
+        for d in _disabled_server_details():
+            if d["name"].lower() in scanned:
+                continue
+            row = by_code.get(d["country_code"])
+            if row is None:
+                row = {"country_code": d["country_code"], "country_name": d["country_name"],
+                       "clean": 0, "blocked": 0, "disabled": 0, "unknown": 0}
+                by_code[d["country_code"]] = row
+                country_stats.append(row)
+            row["disabled"] += 1
+        country_stats.sort(key=lambda c: c["country_code"])
+
     total_servers = len(state.current_scan.servers) if state.current_scan else len(state._last_scan_servers)
     clean_count = len([s for s in state.current_scan.servers if s.is_clean]) if state.current_scan else len([s for s in state._last_scan_servers if row_is_clean(s)])
     blocked_count = len([s for s in state.current_scan.servers if s.is_blocked]) if state.current_scan else len([s for s in state._last_scan_servers if s.get("is_blocked")])
@@ -183,6 +201,105 @@ async def get_metrics():
             key=lambda x: x["ban_count"],
             reverse=True
         ),
+        **(await _wireguard_stats()),
+    }
+
+
+async def _wireguard_stats() -> dict:
+    """Speedtest averages per WireGuard port and per entry IP.
+
+    Uses every recorded speedtest (each stores the port and entry it used) plus
+    port-discovery results, which are kept separately.
+    """
+    rows = []
+    if state.db:
+        try:
+            rows = await state.db.get_speedtest_group_stats()
+        except Exception as e:
+            logger.debug(f"WireGuard stats query failed: {e}")
+
+    groups = {"port": {}, "entry": {}}
+
+    def add(kind, key, tests, ok, dl_sum, ul_sum, ping_sum, ping_n):
+        g = groups[kind].setdefault(key, {"tests": 0, "ok": 0, "dl": 0.0, "ul": 0.0, "ping": 0.0, "ping_n": 0})
+        g["tests"] += tests
+        g["ok"] += ok
+        g["dl"] += dl_sum
+        g["ul"] += ul_sum
+        g["ping"] += ping_sum
+        g["ping_n"] += ping_n
+
+    for r in rows:
+        sums = (r["tests"], r["ok"] or 0, r["dl_sum"] or 0.0, r["ul_sum"] or 0.0,
+                r["ping_sum"] or 0.0, r["ping_n"] or 0)
+        if r["vpn_port"] is not None:
+            add("port", str(r["vpn_port"]), *sums)
+        m = re.search(r"(\d+)", r["vpn_entry"] or "")
+        if m:
+            add("entry", f"Entry {m.group(1)}", *sums)
+
+    for rec in (state.port_discovery_results or {}).values():
+        if not isinstance(rec, dict) or rec.get("port") is None:
+            continue
+        tests = rec.get("tests", 0)
+        # Older records hold averages over all tests (failures counted as 0) instead of sums
+        sums = (tests, rec.get("success_tests", tests),
+                rec.get("dl_sum", (rec.get("download_mbps") or 0.0) * tests),
+                rec.get("ul_sum", (rec.get("upload_mbps") or 0.0) * tests),
+                rec.get("ping_sum", (rec.get("ping_ms") or 0.0) * tests))
+        sums += (sums[1],)  # pings counted over successful tests
+        add("port", str(rec["port"]), *sums)
+        if rec.get("entry") is not None:
+            add("entry", f"Entry {rec['entry']}", *sums)
+
+    def out(kind):
+        res = []
+        for key, g in groups[kind].items():
+            ok = g["ok"]
+            res.append({
+                "key": key, "tests": g["tests"], "success_tests": ok,
+                "success_rate": round(ok / g["tests"], 2) if g["tests"] else 0.0,
+                "download_mbps": round(g["dl"] / ok, 1) if ok else None,
+                "upload_mbps": round(g["ul"] / ok, 1) if ok else None,
+                "ping_ms": round(g["ping"] / g["ping_n"], 1) if g["ping_n"] else None,
+            })
+        return sorted(res, key=lambda x: (len(x["key"]), x["key"]))
+
+    return {"wg_port_stats": out("port"), "wg_entry_stats": out("entry")}
+
+
+def _disabled_server_details() -> list:
+    """Auto-disabled servers with location and the results that disabled them."""
+    perf = config_manager.config.performance
+    details = []
+    for name in sorted(perf.disabled_servers, key=str.lower):
+        short = name.replace("AirVPN ", "")
+        code = (state.servers_by_country.get(name) or state.servers_by_country.get(short) or "??").upper()
+        history = (state.server_performance_history.get(name) or perf.history.get(name) or [])[-perf.check_count:]
+        downloads = [h.get("download") or 0.0 for h in history]
+        uploads = [h.get("upload") or 0.0 for h in history]
+        details.append({
+            "name": name,
+            "country_code": code,
+            "country_name": state.all_countries.get(code, code),
+            "city": state.server_to_city_api.get(name) or state.server_to_city_api.get(short) or "",
+            "recent": history,
+            "avg_download_mbps": round(sum(downloads) / len(downloads), 1) if downloads else None,
+            "avg_upload_mbps": round(sum(uploads) / len(uploads), 1) if uploads else None,
+            "last_tested": history[-1].get("timestamp") if history else None,
+        })
+    return details
+
+
+@router.get("/servers/disabled")
+async def get_disabled_servers():
+    """Auto-disabled servers with details, plus the thresholds that disabled them."""
+    perf = config_manager.config.performance
+    return {
+        "servers": _disabled_server_details(),
+        "threshold_download": perf.threshold_download,
+        "threshold_upload": perf.threshold_upload,
+        "check_count": perf.check_count,
     }
 
 @router.get("/metrics/advanced")
@@ -410,19 +527,12 @@ async def test_gluetun_connection(request: Request):
     return status
 
 
-@router.post("/gluetun/apply")
-async def apply_gluetun_selection():
-    """Push the control profile's servers to Gluetun now, following the force update mode."""
-    cfg = config_manager.config.gluetun
-    from ...gluetun import (_control_profile, _filter_profile_servers,
-                            _get_servers_for_gluetun_generation, update_gluetun_server_selection)
-    profile = _control_profile(cfg)
-    if profile is None:
-        return {"applied": False, "reason": "No enabled Gluetun profile"}
-    servers = await _get_servers_for_gluetun_generation()
-    if not servers:
-        return {"applied": False, "reason": "No scan results available yet"}
-    return await update_gluetun_server_selection(_filter_profile_servers(profile, servers))
+@router.post("/gluetun/check")
+@router.post("/gluetun/apply")  # old name of the same action
+async def check_gluetun_now():
+    """Check Gluetun's server against the switch mode now and switch if needed (skips the watchdog cooldown)."""
+    from ...gluetun import gluetun_watchdog_check
+    return await gluetun_watchdog_check(force=True)
 
 
 # --- Discovery ---
@@ -493,6 +603,7 @@ async def get_settings():
         "enabled_servers": list(cfg.servers),
         "cities_by_country": {k: list(v) for k, v in state.cities_by_country.items()},
         "enabled_cities": {k: list(v) for k, v in cfg.cities.items()},
+        "city_regions": city_regions_for(state.cities_by_country),
         "performance_threshold_download": cfg.performance.threshold_download,
         "performance_threshold_upload": cfg.performance.threshold_upload,
         "performance_check_count": cfg.performance.check_count,
@@ -515,6 +626,7 @@ async def get_settings():
         # The key itself is never sent back to the browser.
         "gluetun_api_key_set": bool(cfg.gluetun.api_key),
         "gluetun_control_profile": cfg.gluetun.control_profile,
+        "gluetun_watchdog_interval": cfg.gluetun.watchdog_interval_seconds,
         "gluetun_profiles": [
             {
                 "name": p.name,
@@ -704,6 +816,8 @@ def _parse_settings(data: dict, cfg) -> tuple[dict, list[str]]:
         p["gluetun_api_key"] = str(data["gluetun_api_key"]).strip()
     if "gluetun_control_profile" in data:
         p["gluetun_control_profile"] = str(data["gluetun_control_profile"] or "").strip()
+    if "gluetun_watchdog_interval" in data:
+        p["gluetun_watchdog_interval"] = _as_int(data, "gluetun_watchdog_interval", 0, 3600)
 
     # Profiles: an invalid entry keeps the previous list (reported as a warning, not an error)
     if "gluetun_profiles" in data:
@@ -882,6 +996,8 @@ async def update_settings(request: Request):
         cfg.gluetun.api_key = p["gluetun_api_key"]
     if "gluetun_control_profile" in p:
         cfg.gluetun.control_profile = p["gluetun_control_profile"]
+    if "gluetun_watchdog_interval" in p:
+        cfg.gluetun.watchdog_interval_seconds = p["gluetun_watchdog_interval"]
     gluetun_changed = "gluetun_profiles" in p
     if gluetun_changed:
         cfg.gluetun.profiles = p["gluetun_profiles"]
@@ -901,7 +1017,8 @@ async def update_settings(request: Request):
         # Trigger generation asynchronously if Gluetun config changed
         if gluetun_changed:
             has_enabled = any(prof.enabled for prof in cfg.gluetun.profiles)
-            if has_enabled:
+            control_on = cfg.gluetun.force_update_enabled and cfg.gluetun.force_update_mode != "DISABLED"
+            if has_enabled or control_on:
                 from ...gluetun import generate_gluetun_servers_json
                 asyncio.create_task(generate_gluetun_servers_json())
     else:

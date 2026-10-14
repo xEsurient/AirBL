@@ -157,6 +157,8 @@ class GluetunConfig(BaseModel):
     control_server_port: int = 8000
     api_key: str = ""  # Gluetun control server API key (sent as X-API-Key)
     control_profile: str = ""  # Profile pushed to Gluetun; empty = first enabled
+    # Seconds between checks that Gluetun is on a server the switch mode allows; 0 = only after scans
+    watchdog_interval_seconds: int = 60
     # Same clean 120/120 profile for both Gluetun storage layouts; AirBL's
     # /app/gluetun is meant to be the same folder as Gluetun's /gluetun.
     profiles: List[GluetunProfileConfig] = Field(default_factory=lambda: [

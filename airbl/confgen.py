@@ -325,3 +325,50 @@ def list_generated_configs() -> list[dict]:
             })
     
     return configs
+
+
+def configs_from_api(servers, conf_dir: Path) -> list:
+    """
+    One generated config per AirVPN API server, using the account keys in conf_dir.
+
+    For a conf dir with only region/continent configs (e.g. AirVPN_Europe_...):
+    their names don't say which server to scan, but their keys work for every
+    server. Uses the region config's port and Entry 3 (Entry 1 if a server has
+    no Entry 3). Returns WireGuardConfig objects for files in confgen_dir.
+    """
+    from .gluetun import WG_PUBKEY
+    from .wireguard import parse_config_file
+
+    identity = extract_client_identity(conf_dir)
+    if not identity:
+        return []
+    template = {}
+    for conf_file in sorted(conf_dir.glob("*.conf")):
+        parsed = parse_config_content(conf_file.read_text())
+        if parsed.get("private_key") and parsed.get("address"):
+            template = parsed
+            break
+    # AirVPN uses one server key for all servers
+    pubkey = template.get("public_key") or WG_PUBKEY
+    port = template.get("endpoint_port") or 1637
+
+    configs = []
+    for server in servers:
+        entry_number, entry_ip = (3, server.ip_v4_in3) if server.ip_v4_in3 else (1, server.ip_v4_in1)
+        if not entry_ip or not server.public_name or " " in server.public_name:
+            continue
+        try:
+            path = generate_config(
+                server_name=server.public_name,
+                country_code=server.country_code.upper(),
+                city=server.location,
+                endpoint_ip=entry_ip,
+                server_pubkey=pubkey,
+                port=port,
+                entry_number=entry_number,
+                identity=identity,
+            )
+            configs.append(parse_config_file(path))
+        except Exception as e:
+            logger.warning(f"Could not generate a config for {server.public_name}: {e}")
+    return configs

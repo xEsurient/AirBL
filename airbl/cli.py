@@ -18,7 +18,7 @@ from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskPr
 
 from airbl.airvpn import get_airvpn_status
 from airbl.scanner import EnhancedScanner, ScanSummary
-from airbl.wireguard import scan_config_directory, get_scannable_configs
+from airbl.wireguard import scan_config_directory, get_scannable_configs, no_configs_message
 from airbl.speedtest import run_speedtest_for_country
 from airbl.hummingbird import WireGuardController
 
@@ -116,7 +116,7 @@ async def _scan_async(config_dir: Path, run_speedtest: bool, output: str):
     scannable = get_scannable_configs(configs)
     
     if not configs:
-        console.print(f"[red]Error: No .conf files found in {config_dir}[/]")
+        console.print(f"[red]Error: {no_configs_message(config_dir)}[/]")
         return
     
     console.print(f"[green]✓[/] Found {len(configs)} config files")

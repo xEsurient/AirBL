@@ -397,15 +397,10 @@
     <div class="section-content">
         <p class="setting-description" style="margin-bottom: 15px;">
             Servers that have been automatically disabled due to consistent underperformance. You can re-enable them
-            manually.
+            here or on the Metrics page.
         </p>
 
-        <div id="disabledServersList" style="margin-top: 15px;">
-            <p class="setting-description" id="disabledServersEmpty"
-                style="padding: 20px; text-align: center; color: var(--text-secondary);">
-                No servers have been auto-disabled.
-            </p>
-        </div>
+        <div id="disabledServersList" style="margin-top: 15px;"></div>
     </div>
 </div>
 
@@ -452,6 +447,19 @@
 
         <div class="setting-row">
             <div class="setting-info">
+                <div class="setting-label">Watchdog Interval (seconds)</div>
+                <div class="setting-description">Between scans, check this often that Gluetun is still on a server the
+                    Switch Mode allows, and switch it back if not (e.g. after Gluetun restarts and picks another
+                    server). Waits 3 minutes after each switch. 0 = only check after scans.</div>
+            </div>
+            <div class="setting-control">
+                <input type="number" id="gluetunWatchdogInterval" min="0" max="3600" value="60" onchange="markChanged()"
+                    style="width: 100px;">
+            </div>
+        </div>
+
+        <div class="setting-row">
+            <div class="setting-info">
                 <div class="setting-label">Control Server Host</div>
                 <div class="setting-description">Host or IP of the Gluetun control server (local or remote)</div>
             </div>
@@ -491,8 +499,8 @@
         <div class="setting-row">
             <div class="setting-info">
                 <div class="setting-label">Control Profile</div>
-                <div class="setting-description">Which profile's servers are pushed to Gluetun (enabled profiles only)
-                </div>
+                <div class="setting-description">Which profile's servers are pushed to Gluetun (enabled profiles only).
+                    With no profile enabled, every clean scanned server that isn't disabled is used.</div>
             </div>
             <div class="setting-control">
                 <select id="gluetunControlProfile" onchange="gluetunControlProfile = this.value; markChanged()" style="padding: 6px 10px;"></select>
@@ -503,11 +511,12 @@
             <div class="setting-info">
                 <div class="setting-label">Connection</div>
                 <div class="setting-description" id="gluetunTestResult">Test uses the values above (saved key if the
-                    field is empty). Apply pushes the selection now using saved settings.</div>
+                    field is empty). Apply Now checks Gluetun's server against the Switch Mode and switches it if
+                    needed, using saved settings.</div>
             </div>
             <div class="setting-control" style="display: flex; gap: 8px;">
                 <button class="btn btn-secondary" onclick="window.testGluetunConnection()">Test</button>
-                <button class="btn btn-secondary" onclick="window.applyGluetunNow()">Apply Now</button>
+                <button class="btn btn-secondary" onclick="window.checkGluetunNow()">Apply Now</button>
             </div>
         </div>
 
@@ -573,6 +582,12 @@
             <button class="btn btn-secondary" onclick="deselectAllCountries()">Deselect All</button>
             <button class="btn btn-secondary" onclick="selectConfigCountries()">Config Files Only</button>
             <button class="btn btn-secondary" onclick="selectEurope()">Europe Only</button>
+        </div>
+        <div class="select-all-row" style="margin-top: 8px;">
+            <span class="setting-label" style="align-self: center; margin: 0;">Europe (toggle):</span>
+            <button class="btn btn-secondary" onclick="toggleEuropeRegion('West')" title="UK, Ireland, France, Benelux, Iberia, Iceland">West</button>
+            <button class="btn btn-secondary" onclick="toggleEuropeRegion('Central')" title="Germany, Alps, Italy, Scandinavia, Poland, Czechia, Slovakia, Hungary, Slovenia, Croatia">Central</button>
+            <button class="btn btn-secondary" onclick="toggleEuropeRegion('East')" title="Finland, Baltics, Balkans, Romania, Bulgaria, Greece, Cyprus, Ukraine, Moldova">East</button>
         </div>
 
         <div id="countryGrid" class="country-grid">
@@ -677,7 +692,7 @@
         sel.innerHTML = '';
         const auto = document.createElement('option');
         auto.value = '';
-        auto.textContent = 'First enabled profile';
+        auto.textContent = currentGluetunProfiles.some(p => p.enabled) ? 'First enabled profile' : 'All clean servers (no profile enabled)';
         sel.appendChild(auto);
         currentGluetunProfiles.forEach(p => {
             const opt = document.createElement('option');
@@ -720,22 +735,35 @@
         }
     };
 
-    window.applyGluetunNow = async function () {
+    const GLUETUN_MODE_LABELS = { CLEAN_ONLY: 'Clean Only', NOT_TOP4: 'Top 4', NOT_BEST: 'Best', ALWAYS: 'Always Reset' };
+    window.checkGluetunNow = async function () {
         const out = document.getElementById('gluetunTestResult');
-        out.textContent = 'Applying (uses saved settings)...';
+        out.textContent = 'Checking (uses saved settings)...';
         try {
-            const res = await fetch('/api/gluetun/apply', { method: 'POST' });
+            const res = await fetch('/api/gluetun/check', { method: 'POST' });
             const d = await res.json();
-            out.textContent = d.applied
-                ? `✅ Gluetun limited to: ${d.names.join(', ')}`
-                : `ℹ️ Not applied: ${d.reason}`;
-            if (d.applied && window.refreshGluetunStatus) window.refreshGluetunStatus();
+            const on = d.current ? ` (on ${d.current})` : '';
+            const mode = GLUETUN_MODE_LABELS[d.mode] || d.mode || '';
+            if (d.applied) {
+                out.textContent = `🔄 Switched${d.current ? ' from ' + d.current : ''}. Gluetun limited to: ${(d.names || []).join(', ')}`;
+                if (window.refreshGluetunStatus) window.refreshGluetunStatus();
+            } else if (d.reason === 'current server still clean' || d.reason === 'current server within target set') {
+                out.textContent = `✅ OK${on}: fits ${mode}, no switch needed.`;
+            } else {
+                out.textContent = `ℹ️ No switch${on}: ${d.reason || 'unknown reason'}`;
+            }
         } catch (e) {
-            out.textContent = '❌ Apply failed: ' + e;
+            out.textContent = '❌ Check failed: ' + e;
         }
     };
 
-    const europeCountries = ['AT', 'BE', 'BG', 'CH', 'CZ', 'DE', 'DK', 'ES', 'FI', 'FR', 'GB', 'UK', 'HU', 'IE', 'IT', 'LU', 'LV', 'LT', 'NL', 'NO', 'PL', 'PT', 'RO', 'RS', 'SE', 'SK', 'UA'];
+    // Every European country code, so countries AirVPN adds later are already placed.
+    const EUROPE_REGIONS = {
+        West: ['GB', 'UK', 'IE', 'IS', 'FR', 'BE', 'NL', 'LU', 'MC', 'PT', 'ES', 'AD', 'GI', 'IM', 'JE', 'GG', 'FO'],
+        Central: ['DE', 'AT', 'CH', 'LI', 'IT', 'SM', 'VA', 'MT', 'DK', 'NO', 'SE', 'PL', 'CZ', 'SK', 'HU', 'SI', 'HR'],
+        East: ['FI', 'EE', 'LV', 'LT', 'RO', 'BG', 'RS', 'BA', 'ME', 'MK', 'AL', 'XK', 'GR', 'CY', 'MD', 'UA', 'BY', 'RU'],
+    };
+    const europeCountries = Object.values(EUROPE_REGIONS).flat();
 
     function getFlagEmoji(countryCode) {
         const codePoints = countryCode.toUpperCase().split('').map(char => 127397 + char.charCodeAt(0));
@@ -849,6 +877,7 @@
             document.getElementById('gluetunControlHost').value = data.gluetun_control_host || '127.0.0.1';
             document.getElementById('gluetunControlPort').value = data.gluetun_control_port || 8000;
             document.getElementById('gluetunForceUpdateMode').value = data.gluetun_force_update_mode || 'NOT_TOP4';
+            document.getElementById('gluetunWatchdogInterval').value = data.gluetun_watchdog_interval ?? 60;
             gluetunApiKeyClear = false;
             document.getElementById('gluetunApiKey').value = '';
             document.getElementById('gluetunApiKey').placeholder = data.gluetun_api_key_set ? '•••••• (saved)' : 'Not set';
@@ -881,7 +910,7 @@
             renderCountryGrid(data.all_countries, data.countries_with_configs, data.enabled_countries);
 
             // Render cities
-            renderCityGrid(data.cities_by_country || {}, data.enabled_cities || {}, data.all_countries || {});
+            renderCityGrid(data.cities_by_country || {}, data.enabled_cities || {}, data.all_countries || {}, data.city_regions || {});
 
             // Render servers (exclude disabled servers from the grid)
             renderServerGrid(data.all_servers, data.enabled_servers, data.disabled_servers || []);
@@ -955,66 +984,15 @@
         }
     }
 
-    function renderDisabledServers(disabledServers) {
-        const container = document.getElementById('disabledServersList');
-        const emptyMsg = document.getElementById('disabledServersEmpty');
-
-        if (!disabledServers || disabledServers.length === 0) {
-            emptyMsg.style.display = 'block';
-            container.innerHTML = '';
-            container.appendChild(emptyMsg);
-            return;
-        }
-
-        emptyMsg.style.display = 'none';
-        container.innerHTML = '';
-
-        const grid = document.createElement('div');
-        grid.className = 'country-grid';
-        grid.style.marginTop = '10px';
-
-        disabledServers.sort().forEach(server => {
-            const div = document.createElement('div');
-            div.className = 'country-checkbox';
-            div.style.opacity = '0.7';
-            div.innerHTML = `
-                <span style="flex: 1; display: flex; align-items: center; gap: 10px;">
-                    <span style="color: var(--danger);">🚫</span>
-                    <span>${escapeHtml(server)}</span>
-                    <span style="color: var(--text-secondary); font-size: 0.75rem; margin-left: auto;">(Auto-disabled)</span>
-                </span>
-                <button class="btn btn-secondary" style="margin-left: 10px; padding: 6px 12px; font-size: 0.85rem;" data-server="${escapeHtml(server)}" onclick="reEnableServer(this.dataset.server)">Re-enable</button>
-            `;
-            grid.appendChild(div);
-        });
-
-        container.appendChild(grid);
-    }
-
-    async function reEnableServer(serverName) {
-        if (!confirm(`Re-enable server "${serverName}"? It will be tested again in future scans.`)) {
-            return;
-        }
-
-        try {
-            // Dedicated endpoint: only this change is saved, other unsaved edits stay
-            const response = await fetch(`/api/servers/${encodeURIComponent(serverName)}/enable`, { method: 'POST' });
-            const data = await response.json().catch(() => ({}));
-            if (!response.ok || data.error || !Array.isArray(data.disabled_servers)) {
-                showToast(`Failed to re-enable ${serverName}: ${data.error || data.detail || 'HTTP ' + response.status}`, 'error');
-                return;
-            }
-
+    // Shared list in app.js; the argument is ignored (details come from /api/servers/disabled)
+    function renderDisabledServers() {
+        loadDisabledServers('disabledServersList', (serverName, disabled) => {
             // Re-render the server grid so the server reappears, keeping current (unsaved) checks
             const selected = getSelectedServers();
             const enabled = selected.length ? [...new Set([...selected, serverName])] : [];
-            originalSettings.disabled_servers = data.disabled_servers;
-            renderDisabledServers(data.disabled_servers.slice());
-            renderServerGrid(originalSettings.all_servers, enabled, data.disabled_servers);
-            showToast(`Server "${serverName}" re-enabled`, 'success');
-        } catch (e) {
-            showToast('Failed to re-enable server: ' + e.message, 'error');
-        }
+            originalSettings.disabled_servers = disabled;
+            renderServerGrid(originalSettings.all_servers, enabled, disabled);
+        });
     }
 
     function getSelectedCountries() {
@@ -1050,8 +1028,9 @@
     }
 
     let allCountriesMap = {};
+    const REGION_ORDER = ['East', 'Central', 'Mountain', 'West'];
 
-    function renderCityGrid(citiesByCountry, enabledCities, allCountries) {
+    function renderCityGrid(citiesByCountry, enabledCities, allCountries, cityRegions = {}) {
         const grid = document.getElementById('cityGrid');
         grid.innerHTML = '';
 
@@ -1084,42 +1063,87 @@
             header.textContent = `${getFlagEmoji(countryCode)} ${countryName}`;
             countrySection.appendChild(header);
 
-            const checkboxGroup = document.createElement('div');
-            checkboxGroup.className = 'city-checkbox-group';
-
             const sortedCities = Array.from(cities).sort();
             const enabledForCountry = enabledCities?.[countryCode.toUpperCase()] || [];
 
-            sortedCities.forEach(city => {
-                const cityLower = city.toLowerCase();
-                const isEnabled = enabledForCountry.length === 0 ||
-                    enabledForCountry.some(c => c.toLowerCase() === cityLower);
+            // Group by region (East/Central/West) when the server knows it;
+            // cities without a region go last under "Other".
+            const regionOf = cityRegions[countryCode.toUpperCase()] || {};
+            const groups = Object.keys(regionOf).length ? groupCitiesByRegion(sortedCities, regionOf) : [[null, sortedCities]];
 
-                const checkboxDiv = document.createElement('div');
-                checkboxDiv.className = `city-checkbox ${isEnabled ? 'checked' : ''}`;
-
-                const checkbox = document.createElement('input');
-                checkbox.type = 'checkbox';
-                checkbox.value = city;
-                checkbox.checked = isEnabled;
-                checkbox.id = `city-${countryCode}-${city}`;
-                checkbox.addEventListener('change', () => {
-                    checkboxDiv.classList.toggle('checked', checkbox.checked);
-                    markChanged();
+            for (const [region, regionCities] of groups) {
+                const checkboxGroup = document.createElement('div');
+                checkboxGroup.className = 'city-checkbox-group';
+                if (region) countrySection.appendChild(makeRegionHeader(region, checkboxGroup));
+                regionCities.forEach(city => {
+                    const cityLower = city.toLowerCase();
+                    const isEnabled = enabledForCountry.length === 0 ||
+                        enabledForCountry.some(c => c.toLowerCase() === cityLower);
+                    checkboxGroup.appendChild(makeCityCheckbox(countryCode, city, isEnabled));
                 });
-
-                const label = document.createElement('span');
-                label.textContent = city;
-                label.setAttribute('for', checkbox.id);
-
-                checkboxDiv.appendChild(checkbox);
-                checkboxDiv.appendChild(label);
-                checkboxGroup.appendChild(checkboxDiv);
-            });
-
-            countrySection.appendChild(checkboxGroup);
+                countrySection.appendChild(checkboxGroup);
+            }
             grid.appendChild(countrySection);
         }
+    }
+
+    function groupCitiesByRegion(sortedCities, regionOf) {
+        const groups = new Map(REGION_ORDER.map(r => [r, []]));
+        sortedCities.forEach(city => {
+            const region = regionOf[city] || 'Other';
+            if (!groups.has(region)) groups.set(region, []);
+            groups.get(region).push(city);
+        });
+        const other = groups.get('Other');
+        groups.delete('Other');
+        if (other) groups.set('Other', other);
+        return [...groups.entries()].filter(([, list]) => list.length);
+    }
+
+    function makeRegionHeader(region, checkboxGroup) {
+        const header = document.createElement('div');
+        header.className = 'city-region-header';
+        const title = document.createElement('span');
+        title.textContent = region;
+        const toggle = document.createElement('button');
+        toggle.type = 'button';
+        toggle.className = 'btn btn-secondary city-region-toggle';
+        toggle.textContent = 'Toggle all';
+        toggle.addEventListener('click', () => {
+            const boxes = [...checkboxGroup.querySelectorAll('input[type="checkbox"]')];
+            const turnOn = !boxes.every(cb => cb.checked);
+            boxes.forEach(cb => {
+                cb.checked = turnOn;
+                cb.closest('.city-checkbox').classList.toggle('checked', turnOn);
+            });
+            markChanged();
+        });
+        header.appendChild(title);
+        header.appendChild(toggle);
+        return header;
+    }
+
+    function makeCityCheckbox(countryCode, city, isEnabled) {
+        const checkboxDiv = document.createElement('div');
+        checkboxDiv.className = `city-checkbox ${isEnabled ? 'checked' : ''}`;
+
+        const checkbox = document.createElement('input');
+        checkbox.type = 'checkbox';
+        checkbox.value = city;
+        checkbox.checked = isEnabled;
+        checkbox.id = `city-${countryCode}-${city}`;
+        checkbox.addEventListener('change', () => {
+            checkboxDiv.classList.toggle('checked', checkbox.checked);
+            markChanged();
+        });
+
+        const label = document.createElement('span');
+        label.textContent = city;
+        label.setAttribute('for', checkbox.id);
+
+        checkboxDiv.appendChild(checkbox);
+        checkboxDiv.appendChild(label);
+        return checkboxDiv;
     }
 
     function renderGluetunProfiles() {
@@ -1140,7 +1164,7 @@
                     <div style="display: flex; align-items: center; gap: 10px;">
                         <span class="setting-label" style="margin:0;">Enabled</span>
                         <label class="toggle" for="gp_enabled_${index}">
-                            <input type="checkbox" id="gp_enabled_${index}" ${profile.enabled ? 'checked' : ''} onchange="markChanged()">
+                            <input type="checkbox" id="gp_enabled_${index}" ${profile.enabled ? 'checked' : ''} onchange="currentGluetunProfiles[${index}].enabled = this.checked; renderGluetunControlProfileSelect(); markChanged()">
                             <span class="toggle-slider"></span>
                         </label>
                     </div>
@@ -1869,6 +1893,17 @@
         markChanged();
     }
 
+    // Adds the region's countries, or clears them if all are already checked,
+    // so regions can be combined (e.g. West + Central).
+    function toggleEuropeRegion(region) {
+        const codes = EUROPE_REGIONS[region];
+        const boxes = [...document.querySelectorAll('#countryGrid input[type="checkbox"]:not(:disabled)')]
+            .filter(cb => codes.includes(cb.value.toUpperCase()));
+        const turnOn = !boxes.every(cb => cb.checked);
+        boxes.forEach(cb => cb.checked = turnOn);
+        markChanged();
+    }
+
     function selectAllServers() {
         document.querySelectorAll('#serverGrid input[type="checkbox"]').forEach(cb => cb.checked = true);
         markChanged();
@@ -1960,6 +1995,7 @@
         document.getElementById('gluetunApiKey').placeholder = originalSettings.gluetun_api_key_set ? '•••••• (saved)' : 'Not set';
         document.getElementById('gluetunForceUpdate').checked = Boolean(originalSettings.gluetun_force_update);
         document.getElementById('gluetunForceUpdateMode').value = originalSettings.gluetun_force_update_mode || 'NOT_TOP4';
+        document.getElementById('gluetunWatchdogInterval').value = originalSettings.gluetun_watchdog_interval ?? 60;
         document.getElementById('gluetunControlHost').value = originalSettings.gluetun_control_host || '127.0.0.1';
         document.getElementById('gluetunControlPort').value = originalSettings.gluetun_control_port || 8000;
 
@@ -2038,6 +2074,7 @@
             gluetun_api_key: document.getElementById('gluetunApiKey').value,
             gluetun_api_key_clear: gluetunApiKeyClear,
             gluetun_control_profile: document.getElementById('gluetunControlProfile').value,
+            gluetun_watchdog_interval: parseInt(document.getElementById('gluetunWatchdogInterval').value),
             gluetun_profiles: getGluetunProfilesData(),
 
             // WireGuard settings

@@ -52,6 +52,7 @@ class AppState:
         self.all_servers: set[str] = set()  # All server names from API
         self.countries_with_configs: set[str] = set()
         self.servers_with_configs: set[str] = set()  # All server names with configs
+        self.region_configs = False  # Only region configs in conf/: server configs are generated from the API list
         self.servers_by_country: dict[str, str] = {}  # server_name -> country_code
         self.server_to_city_api: dict[str, str] = {}  # server_name -> city (from API)
         self.cities_by_country: dict[str, set[str]] = {}  # country_code -> set of city names (from configs)
@@ -142,6 +143,8 @@ class AppState:
             logger.info(f"Restored {len(persisted_discovery)} discovery results from config")
         
         # Scan config directory for WireGuard configs
+        configs = []
+        self.region_configs = False
         try:
             from ..wireguard import scan_config_directory
             configs = scan_config_directory(self.config_dir)
@@ -189,7 +192,28 @@ class AppState:
             
             logger.info(f"Loaded from API: {len(self.all_countries)} countries, {len(self.all_servers)} servers")
         except Exception as e:
+            status = None
             logger.warning(f"Failed to fetch API data: {e}")
+
+        if not configs:
+            from ..confgen import extract_client_identity
+            from ..wireguard import no_configs_message
+            if status and extract_client_identity(self.config_dir):
+                # Only region configs: scans build a config for every API server, so all can be selected
+                self.region_configs = True
+                for server in status.servers:
+                    code = server.country_code.upper()
+                    self.countries_with_configs.add(code)
+                    self.servers_with_configs.add(server.public_name)
+                    # Same city form as parsed config filenames ("Fremont-California" -> "Fremont California")
+                    self.cities_by_country.setdefault(code, set()).add(server.location.replace("-", " "))
+                msg = "No per-server configs: scans build one for every AirVPN server from the keys in your region config."
+                logger.info(msg)
+                print(msg, flush=True)
+            else:
+                msg = no_configs_message(self.config_dir, api_failed=status is None)
+                logger.warning(msg)
+                print(f"WARNING: {msg}", flush=True)  # docker logs; the app log is only on /debug
 
         # After a restart, rebuild the last completed scan so results, exports and manual tests work
         if self.current_scan is None and self.db:
@@ -197,6 +221,14 @@ class AppState:
                 self.current_scan = await self._restore_last_scan()
             except Exception as e:
                 logger.error(f"Failed to rebuild last scan from DB: {e}", exc_info=True)
+
+    def server_configs(self) -> list:
+        """Per-server configs: conf/, or the generated ones when conf/ only has region configs."""
+        from ..wireguard import scan_config_directory
+        configs = scan_config_directory(self.config_dir)
+        if not configs and self.region_configs:
+            configs = scan_config_directory(Path(config_manager.config.scan.confgen_dir))
+        return configs
 
     async def _restore_last_scan(self) -> Optional[ScanSummary]:
         """ScanSummary for the last completed scan, rebuilt from the DB (marked restored=True).
@@ -245,7 +277,7 @@ class AppState:
 
         configs = {}
         try:
-            for c in scan_config_directory(self.config_dir):
+            for c in self.server_configs():
                 configs.setdefault(c.server_name, c)
         except Exception as e:
             logger.debug(f"Restore: config scan failed: {e}")

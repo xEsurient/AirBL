@@ -33,6 +33,12 @@
     </div>
 </div>
 
+<!-- Auto-Disabled Servers (same list as Settings) -->
+<div class="chart-card" data-metric-category="servers" style="margin-bottom: 30px;">
+    <h3>🚫 Auto-Disabled Servers</h3>
+    <div id="metricsDisabledList"></div>
+</div>
+
 <!-- Entry Ping by Server -->
 <div class="chart-card" data-metric-category="ping" style="margin-bottom: 30px;">
     <h3>📡 Entry Ping by Server</h3>
@@ -54,17 +60,19 @@
 <!-- WireGuard Discovery Performance -->
 <div class="chart-card" data-metric-category="wireguard" style="margin-bottom: 30px;">
     <h3>🔒 WireGuard Port Performance</h3>
+    <p class="setting-description" style="margin: 0 0 10px;">Averages over all VPN speedtests (scans, manual tests and port discovery) by the port they used.</p>
     <div class="chart-container" id="wgPortChartContainer" style="min-height: 350px;">
         <canvas id="wgPortChart"></canvas>
-        <p id="wgPortPlaceholder" class="setting-description" style="text-align:center; padding: 40px 0;">No WireGuard port performance data yet. Run a scan with port discovery enabled.</p>
+        <p id="wgPortPlaceholder" class="setting-description" style="text-align:center; padding: 40px 0;">No WireGuard port data yet. It appears after the first VPN speedtest.</p>
     </div>
 </div>
 
 <div class="chart-card" data-metric-category="wireguard" style="margin-bottom: 30px;">
     <h3>🔒 WireGuard Entry IP Performance</h3>
+    <p class="setting-description" style="margin: 0 0 10px;">Averages over all VPN speedtests by the entry IP they used.</p>
     <div class="chart-container" id="wgEntryChartContainer" style="min-height: 350px;">
         <canvas id="wgEntryChart"></canvas>
-        <p id="wgEntryPlaceholder" class="setting-description" style="text-align:center; padding: 40px 0;">No WireGuard entry IP performance data yet. Run a scan with port discovery enabled.</p>
+        <p id="wgEntryPlaceholder" class="setting-description" style="text-align:center; padding: 40px 0;">No WireGuard entry IP data yet. It appears after the first VPN speedtest.</p>
     </div>
 </div>
 
@@ -106,6 +114,48 @@
                 el.style.display = 'none';
             }
         });
+    }
+
+    // Grouped bars: speeds on the left axis, ping on the right; tooltips show test counts
+    function renderWgChart(chart, canvasId, placeholderId, stats, label) {
+        const placeholder = document.getElementById(placeholderId);
+        if (chart) chart.destroy();
+        if (!stats.length) {
+            placeholder.style.display = '';
+            return null;
+        }
+        placeholder.style.display = 'none';
+        return makeChart(document.getElementById(canvasId), {
+            type: 'bar',
+            data: {
+                labels: stats.map(label),
+                datasets: [
+                    { label: 'Avg Download (Mbps)', data: stats.map(s => s.download_mbps), backgroundColor: '#10b981', yAxisID: 'y' },
+                    { label: 'Avg Upload (Mbps)', data: stats.map(s => s.upload_mbps), backgroundColor: '#38bdf8', yAxisID: 'y' },
+                    { label: 'Avg Ping (ms)', data: stats.map(s => s.ping_ms), backgroundColor: '#f59e0b', yAxisID: 'y1' }
+                ]
+            },
+            options: {
+                responsive: true,
+                maintainAspectRatio: false,
+                scales: {
+                    y: { beginAtZero: true, position: 'left', title: { display: true, text: 'Mbps' } },
+                    y1: { beginAtZero: true, position: 'right', grid: { drawOnChartArea: false }, title: { display: true, text: 'ms' } }
+                },
+                plugins: {
+                    legend: { position: 'top' },
+                    tooltip: { callbacks: { afterBody: items => {
+                        const s = stats[items[0].dataIndex];
+                        return `${s.success_tests}/${s.tests} tests succeeded (${Math.round(s.success_rate * 100)}%)`;
+                    } } }
+                }
+            }
+        });
+    }
+
+    function loadMetricsDisabled() {
+        // Re-enabling changes the per-country counts, so refresh the charts too
+        loadDisabledServers('metricsDisabledList', () => loadAdvancedMetrics());
     }
 
     async function loadAdvancedMetrics() {
@@ -220,83 +270,11 @@
                 document.getElementById('banHistoryPlaceholder').style.display = '';
             }
 
-            // --- WireGuard Discovery Charts ---
-            try {
-                const settingsRes = await fetch('/api/settings');
-                const settingsData = await settingsRes.json();
-                const discoveryResults = settingsData.port_discovery_results || {};
-                const entries = Object.entries(discoveryResults);
-
-                if (entries.length > 0) {
-                    // Group by port and by entry
-                    const byPort = {};  // port -> {download, upload, ping, count}
-                    const byEntry = {}; // "E1"/"E3" -> {download, upload, ping, count}
-
-                    entries.forEach(([key, val]) => {
-                        const parts = key.split('_'); // e.g. "47107_E3"
-                        const port = parts[0];
-                        const entry = parts[1] || key;
-
-                        if (!byPort[port]) byPort[port] = { dl: 0, ul: 0, ping: 0, n: 0 };
-                        byPort[port].dl += val.download_mbps || 0;
-                        byPort[port].ul += val.upload_mbps || 0;
-                        byPort[port].ping += val.ping_ms || 0;
-                        byPort[port].n += 1;
-
-                        if (!byEntry[entry]) byEntry[entry] = { dl: 0, ul: 0, ping: 0, n: 0 };
-                        byEntry[entry].dl += val.download_mbps || 0;
-                        byEntry[entry].ul += val.upload_mbps || 0;
-                        byEntry[entry].ping += val.ping_ms || 0;
-                        byEntry[entry].n += 1;
-                    });
-
-                    // Port chart
-                    const portLabels = Object.keys(byPort).sort();
-                    document.getElementById('wgPortPlaceholder').style.display = 'none';
-                    if (wgPortChart) wgPortChart.destroy();
-                    wgPortChart = makeChart(document.getElementById('wgPortChart'), {
-                        type: 'bar',
-                        data: {
-                            labels: portLabels.map(p => `Port ${p}`),
-                            datasets: [
-                                { label: 'Avg Download (Mbps)', data: portLabels.map(p => +(byPort[p].dl / byPort[p].n).toFixed(1)), backgroundColor: '#10b981' },
-                                { label: 'Avg Upload (Mbps)', data: portLabels.map(p => +(byPort[p].ul / byPort[p].n).toFixed(1)), backgroundColor: '#38bdf8' },
-                                { label: 'Avg Ping (ms)', data: portLabels.map(p => +(byPort[p].ping / byPort[p].n).toFixed(1)), backgroundColor: '#f59e0b' }
-                            ]
-                        },
-                        options: {
-                            responsive: true,
-                            maintainAspectRatio: false,
-                            scales: { y: { beginAtZero: true } },
-                            plugins: { legend: { position: 'top' } }
-                        }
-                    });
-
-                    // Entry chart
-                    const entryLabels = Object.keys(byEntry).sort();
-                    document.getElementById('wgEntryPlaceholder').style.display = 'none';
-                    if (wgEntryChart) wgEntryChart.destroy();
-                    wgEntryChart = makeChart(document.getElementById('wgEntryChart'), {
-                        type: 'bar',
-                        data: {
-                            labels: entryLabels.map(e => e.replace('E', 'Entry ')),
-                            datasets: [
-                                { label: 'Avg Download (Mbps)', data: entryLabels.map(e => +(byEntry[e].dl / byEntry[e].n).toFixed(1)), backgroundColor: '#10b981' },
-                                { label: 'Avg Upload (Mbps)', data: entryLabels.map(e => +(byEntry[e].ul / byEntry[e].n).toFixed(1)), backgroundColor: '#38bdf8' },
-                                { label: 'Avg Ping (ms)', data: entryLabels.map(e => +(byEntry[e].ping / byEntry[e].n).toFixed(1)), backgroundColor: '#f59e0b' }
-                            ]
-                        },
-                        options: {
-                            responsive: true,
-                            maintainAspectRatio: false,
-                            scales: { y: { beginAtZero: true } },
-                            plugins: { legend: { position: 'top' } }
-                        }
-                    });
-                }
-            } catch (wgErr) {
-                console.error('Failed to load WireGuard discovery charts:', wgErr);
-            }
+            // --- WireGuard port / entry charts (all VPN speedtests + discovery) ---
+            wgPortChart = renderWgChart(wgPortChart, 'wgPortChart', 'wgPortPlaceholder',
+                metricsData.wg_port_stats || [], s => `Port ${s.key}`);
+            wgEntryChart = renderWgChart(wgEntryChart, 'wgEntryChart', 'wgEntryPlaceholder',
+                metricsData.wg_entry_stats || [], s => s.key);
 
             // Load advanced period-based averages
             const response = await fetch('/api/metrics/advanced');
@@ -312,7 +290,7 @@
             ];
             
             periods.forEach(p => {
-                const metrics = data[p.key] || { total_scans: 0, avg_clean: 0, avg_blocked: 0 };
+                const metrics = data[p.key] || { total_scans: 0, avg_clean: 0, avg_blocked: 0, avg_disabled: 0 };
                 
                 const section = document.createElement('div');
                 section.className = 'settings-section';
@@ -334,6 +312,11 @@
                             <div class="summary-value" style="font-size: 2.5rem; text-align: center;">${escapeHtml(metrics.avg_blocked ?? '-')}</div>
                             <div class="summary-label" style="text-align: center;">Average Blocked Servers</div>
                         </div>
+
+                        <div class="summary-card warning" style="padding: 25px;">
+                            <div class="summary-value" style="font-size: 2.5rem; text-align: center;">${escapeHtml(metrics.avg_disabled ?? '-')}</div>
+                            <div class="summary-label" style="text-align: center;">Average Disabled Servers</div>
+                        </div>
                     </div>
                 `;
                 container.appendChild(section);
@@ -346,5 +329,6 @@
     }
     
     loadAdvancedMetrics();
+    loadMetricsDisabled();
 </script>
 {% endblock %}

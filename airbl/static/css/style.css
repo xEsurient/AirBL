@@ -611,6 +611,10 @@ header h1::before {
     color: var(--danger);
 }
 
+.summary-card.warning .summary-value {
+    color: var(--warning);
+}
+
 footer {
     margin-top: 40px;
     padding: 20px;
@@ -908,6 +912,24 @@ footer {
     display: grid;
     grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
     gap: 8px;
+}
+
+.city-region-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin: 12px 0 6px;
+    color: var(--text-secondary);
+    font-weight: 600;
+}
+
+.city-region-header:first-of-type {
+    margin-top: 0;
+}
+
+.city-region-toggle {
+    padding: 2px 10px;
+    font-size: 0.8em;
 }
 
 .city-checkbox {
@@ -1266,5 +1288,64 @@ footer {
 
     .info-grid {
         grid-template-columns: 1fr;
+    }
+}
+/* Auto-disabled servers list (settings + metrics) */
+.disabled-list {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+}
+
+.disabled-row {
+    display: grid;
+    grid-template-columns: minmax(160px, 1.2fr) minmax(200px, 2fr) auto;
+    align-items: center;
+    gap: 16px;
+    padding: 10px 14px;
+    background: var(--bg-secondary);
+    border: 1px solid var(--border);
+    border-left: 3px solid var(--danger);
+    border-radius: 6px;
+}
+
+.disabled-name {
+    font-weight: 600;
+}
+
+.disabled-meta {
+    color: var(--text-secondary);
+    font-size: 0.8rem;
+    margin-top: 2px;
+}
+
+.disabled-results {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    font-size: 0.8rem;
+}
+
+.disabled-result {
+    padding: 3px 8px;
+    border-radius: 4px;
+    background: var(--bg-tertiary, rgba(255, 255, 255, 0.04));
+    white-space: nowrap;
+}
+
+.disabled-result .low {
+    color: var(--danger);
+}
+
+.disabled-row .btn {
+    padding: 6px 12px;
+    font-size: 0.85rem;
+    white-space: nowrap;
+}
+
+@media (max-width: 700px) {
+    .disabled-row {
+        grid-template-columns: 1fr;
+        gap: 8px;
     }
 }

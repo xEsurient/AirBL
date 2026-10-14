@@ -29,6 +29,7 @@ from .dns_lookup import lookup_exit_ips
 from .wireguard import (
     WireGuardConfig,
     scan_config_directory,
+    no_configs_message,
     get_unique_countries,
     get_scannable_configs,
 )
@@ -860,20 +861,23 @@ class EnhancedScanner:
         # Load configs
         self.load_configs()
         
-        if not self._configs:
-            yield ScanUpdate(
-                summary=ScanSummary(countries_scanned=[]),
-                server=None,
-                total_expected=0
-            )
-            return
-        
         # Fetch API data
         try:
             self._api_status = await get_airvpn_status()
         except Exception as e:
             logger.warning(f"Failed to fetch API: {e}")
             self._api_status = None
+        
+        if not self._configs and self._api_status:
+            # Only region configs (e.g. AirVPN_Europe_...): build per-server configs from their keys
+            from .confgen import configs_from_api
+            self._configs = configs_from_api(self._api_status.servers, self.config_dir)
+            if self._configs:
+                logger.info(f"No per-server configs: generated {len(self._configs)} from the AirVPN server list")
+        
+        if not self._configs:
+            # An empty "complete" scan looked like success (Idle 0/0, no error)
+            raise ValueError(no_configs_message(self.config_dir, api_failed=self._api_status is None))
         
         # Get countries to scan
         countries = self.get_countries_to_scan()

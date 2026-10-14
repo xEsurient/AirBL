@@ -257,6 +257,17 @@ def _control_profile(cfg):
     return enabled[0] if enabled else None
 
 
+def _control_candidates(cfg, servers) -> list:
+    """[(server, ips)] Gluetun may be moved to: the control profile's servers, or with no
+    enabled profile every scanned server that isn't disabled (only clean ones are used)."""
+    profile = _control_profile(cfg)
+    if profile is not None:
+        return _filter_profile_servers(profile, servers)
+    disabled = {n.lower() for n in config_manager.config.performance.disabled_servers}
+    return [(s, []) for s in servers
+            if s.server_name.lower() not in disabled and _gluetun_name(s).lower() not in disabled]
+
+
 async def generate_gluetun_servers_json():
     """
     Generate a custom servers.json per enabled profile, then (optionally) point a
@@ -264,8 +275,9 @@ async def generate_gluetun_servers_json():
     """
     cfg = config_manager.config.gluetun
     active_profiles = [p for p in cfg.profiles if p.enabled]
-    if not active_profiles:
-        logger.debug("No active Gluetun profiles. Generation disabled.")
+    control_on = cfg.force_update_enabled and cfg.force_update_mode != "DISABLED"
+    if not active_profiles and not control_on:
+        logger.debug("No active Gluetun profiles and control is off. Generation disabled.")
         return
 
     servers = await _get_servers_for_gluetun_generation()
@@ -273,35 +285,77 @@ async def generate_gluetun_servers_json():
         logger.warning("Cannot generate Gluetun servers.json: No scan results available yet.")
         return
 
-    filtered_by_profile = {}
     for profile in active_profiles:
-        filtered = _filter_profile_servers(profile, servers)
-        filtered_by_profile[profile.name] = filtered
-        _write_servers_json(profile, filtered)
+        _write_servers_json(profile, _filter_profile_servers(profile, servers))
 
-    if not cfg.force_update_enabled or cfg.force_update_mode == "DISABLED":
-        return
-
-    profile = _control_profile(cfg)
-    if profile is None:
-        return
-    await update_gluetun_server_selection(filtered_by_profile.get(profile.name, []))
+    if control_on:
+        await update_gluetun_server_selection(_control_candidates(cfg, servers))
 
 
-async def update_gluetun_server_selection(filtered) -> dict:
+# Watchdog state: Gluetun needs time to reconnect after a push, and errors are logged once per outage
+WATCHDOG_COOLDOWN_SECONDS = 180
+_last_push_at = 0.0
+_watchdog_error = None
+
+
+async def gluetun_watchdog_check(force: bool = False) -> dict:
+    """
+    Make sure Gluetun is on a server the switch mode allows, between scans.
+
+    Gluetun may reconnect on its own (restart, network drop) and pick any server from
+    its list, so this re-applies the mode's targets when it drifted. It never pushes
+    while a scan runs, while Gluetun is still connecting, or within the cooldown after a push.
+
+    force (the Check Now button): ignore the cooldown and the automatic-control switch.
+    """
+    global _watchdog_error
+    cfg = config_manager.config.gluetun
+    if cfg.force_update_mode == "DISABLED" or not (cfg.force_update_enabled or force):
+        return {"applied": False, "reason": "control disabled"}
+    if state.is_scanning:
+        return {"applied": False, "reason": "scan running"}  # the scan pushes when it finishes
+    if not force and time.monotonic() - _last_push_at < WATCHDOG_COOLDOWN_SECONDS:
+        return {"applied": False, "reason": "cooldown after a switch"}
+    servers = await _get_servers_for_gluetun_generation()
+    if not servers:
+        return {"applied": False, "reason": "no scan results"}
+
+    status = await get_gluetun_status(cfg)
+    if status.get("error"):
+        if status["error"] != _watchdog_error:
+            logger.warning(f"Gluetun watchdog: {status['error']}")
+        _watchdog_error = status["error"]
+        return {"applied": False, "reason": status["error"]}
+    if _watchdog_error:
+        logger.info("Gluetun watchdog: control server reachable again.")
+        _watchdog_error = None
+    current = status.get("server_name") or status.get("ip")
+    if status.get("vpn_status") != "running" or not status.get("ip"):
+        return {"applied": False, "reason": "Gluetun not connected yet", "current": current}
+
+    result = await update_gluetun_server_selection(_control_candidates(cfg, servers), status=status, quiet=True)
+    return {**result, "current": current, "mode": cfg.force_update_mode}
+
+
+async def update_gluetun_server_selection(filtered, status: dict = None, quiet: bool = False) -> dict:
     """
     Decide (per force_update_mode) whether Gluetun should move, and if so push the
     target server names via PUT /v1/vpn/settings. Gluetun only reads servers.json at
     startup, so the API is the only way to change servers on a running instance.
+
+    status: an already fetched Gluetun status (watchdog). quiet: log "staying" at debug
+    level, and treat ALWAYS as "reset if outside the target set" so it doesn't push every minute.
     """
     cfg = config_manager.config.gluetun
     mode = cfg.force_update_mode
+    stay_log = logger.debug if quiet else logger.info
 
     # Never steer Gluetun onto a blocklisted server, whatever the profile allows.
     ranked = sorted((s for s, _ in filtered if s.is_clean), key=lambda s: s.score or 0, reverse=True)
     if not ranked:
-        logger.warning("Gluetun control: control profile has no clean servers, not changing selection.")
-        return {"applied": False, "reason": "no clean servers in control profile"}
+        (logger.debug if quiet else logger.warning)(
+            "Gluetun control: no clean servers to choose from, not changing selection.")
+        return {"applied": False, "reason": "no clean servers to choose from"}
 
     if mode == "NOT_BEST":
         targets = ranked[:1]
@@ -310,25 +364,44 @@ async def update_gluetun_server_selection(filtered) -> dict:
     else:  # ALWAYS, CLEAN_ONLY
         targets = ranked
 
-    if mode != "ALWAYS":
-        status = await get_gluetun_status(cfg)
+    if mode != "ALWAYS" or quiet:
+        if status is None:
+            status = await get_gluetun_status(cfg)
         if status.get("error"):
             logger.warning(f"Gluetun control: {status['error']}; not changing selection.")
             return {"applied": False, "reason": status["error"]}
         current_ip = status.get("ip")
+        # The status resolves the name via the scan or scan history; match on it too, since a
+        # rebuilt scan keeps only one exit IP per server
+        current_name = (status.get("server_name") or "").lower()
         if current_ip:
+            in_targets = (any(current_ip in _server_ips(s) for s in targets)
+                          or (current_name and current_name in {_gluetun_name(s).lower() for s in targets}))
             if mode == "CLEAN_ONLY":
-                current = _find_server_by_ip(current_ip)
+                current = _find_server_by_ip(current_ip) or _find_server_by_name(current_name)
                 # Stay unless there is evidence of a listing; a failed lookup is not a ban
-                if current is not None and not current.is_blocked:
-                    logger.info(f"Gluetun control: {current.server_name} is not listed, staying connected.")
+                if in_targets or (current is not None and not current.is_blocked):
+                    name = current.server_name if current is not None else status.get("server_name") or current_ip
+                    stay_log(f"Gluetun control: {name} is not listed, staying connected.")
                     return {"applied": False, "reason": "current server still clean"}
-            elif any(current_ip in _server_ips(s) for s in targets):
-                logger.info(f"Gluetun control: current server is within target set ({mode}), staying connected.")
+            elif in_targets:
+                stay_log(f"Gluetun control: current server is within target set ({mode}), staying connected.")
                 return {"applied": False, "reason": "current server within target set"}
 
     names = sorted({_gluetun_name(s) for s in targets})
+    if quiet:
+        where = status.get("server_name") or status.get("ip")
+        logger.info(f"Gluetun watchdog: {where} doesn't fit {mode}; switching.")
     return await set_gluetun_server_names(cfg, names)
+
+
+def _find_server_by_name(name: str):
+    if not name or not state.current_scan or not state.current_scan.servers:
+        return None
+    for server in state.current_scan.servers:
+        if _gluetun_name(server).lower() == name.lower():
+            return server
+    return None
 
 
 def _find_server_by_ip(ip: str):
@@ -358,7 +431,18 @@ def _http_error(resp) -> str:
         return "Gluetun rejected the API key (401). Check the key and the role routes in Gluetun's auth config.toml."
     if resp.status_code == 403:
         return "Gluetun API key lacks access to this route (403). Add it to the role's routes."
-    return f"Gluetun returned HTTP {resp.status_code}: {resp.text.strip()[:200]}"
+    msg = f"Gluetun returned HTTP {resp.status_code}: {resp.text.strip()[:200]}"
+    if resp.status_code == 400 and "server name" in resp.text and "no possible value" in resp.text:
+        # Gluetun's stored list has servers without "server_name" (e.g. migrated from an old
+        # AirBL servers.json), so it can't select by name. It never re-reads servers.json.
+        msg += (" (Gluetun's AirVPN server list has no server names. Recreate the Gluetun container"
+                " so it re-reads servers.json; if /gluetun is a persistent folder, delete"
+                " servers/airvpn.json there first.)")
+    elif resp.status_code == 400 and "server name" in resp.text and "is one of the choices" in resp.text:
+        # Gluetun only knows the servers it loaded at startup; newly clean servers aren't among them.
+        msg += (" (None of these servers were in Gluetun's list when it last started. Restart Gluetun so it"
+                " loads AirBL's current servers.json, or let Gluetun use its full built-in AirVPN list.)")
+    return msg
 
 
 async def get_gluetun_status(cfg) -> dict:
@@ -401,12 +485,25 @@ async def get_gluetun_status(cfg) -> dict:
         result["server_name"] = _gluetun_name(server)
         result["country"] = server.country_code
         result["city"] = server.location
+    elif state.db:
+        # Not in the current scan (e.g. a disabled server): fall back to scan history
+        try:
+            name = await state.db.find_server_by_exit_ip(public_ip)
+        except Exception as e:
+            logger.debug(f"Gluetun status: exit IP history lookup failed: {e}")
+            name = None
+        if name:
+            result["server_name"] = name.replace("AirVPN ", "").strip()
+            result["country"] = state.servers_by_country.get(name) or state.servers_by_country.get(result["server_name"])
+            result["city"] = state.server_to_city_api.get(name) or state.server_to_city_api.get(result["server_name"])
     return result
 
 
 async def set_gluetun_server_names(cfg, names: list) -> dict:
     """Restrict Gluetun to the given server names; Gluetun reconnects on change."""
     import httpx
+    global _last_push_at
+    _last_push_at = time.monotonic()  # watchdog waits after any attempt, failed ones included
 
     url = f"{_base_url(cfg)}/v1/vpn/settings"
     # Gluetun ANDs all filters, so names alone would still be limited by its own

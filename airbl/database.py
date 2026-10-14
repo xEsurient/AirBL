@@ -361,6 +361,21 @@ class DatabaseManager:
             """, (limit,)) as cursor:
                 return [dict(row) for row in await cursor.fetchall()]
     
+    async def get_speedtest_group_stats(self) -> List[Dict[str, Any]]:
+        """Test counts and successful-result sums per (vpn_port, vpn_entry)."""
+        async with self._conn.execute("""
+            SELECT vpn_port, vpn_entry, COUNT(*) AS tests, SUM(is_success) AS ok,
+                   SUM(CASE WHEN is_success THEN download_mbps END) AS dl_sum,
+                   SUM(CASE WHEN is_success THEN upload_mbps END) AS ul_sum,
+                   -- Old rows carry a 1,800,000 ms placeholder ping; leave implausible pings out
+                   SUM(CASE WHEN is_success AND ping_ms < 10000 THEN ping_ms END) AS ping_sum,
+                   SUM(CASE WHEN is_success AND ping_ms < 10000 THEN 1 ELSE 0 END) AS ping_n
+            FROM speedtest_history
+            WHERE vpn_port IS NOT NULL OR vpn_entry IS NOT NULL
+            GROUP BY vpn_port, vpn_entry
+        """) as cursor:
+            return [dict(row) for row in await cursor.fetchall()]
+
     async def get_stats(self) -> Dict[str, Any]:
         async with self._conn.execute("SELECT COUNT(*) FROM scan_history WHERE status = 'complete'") as cursor:
             total_scans = (await cursor.fetchone())[0]
@@ -385,7 +400,8 @@ class DatabaseManager:
             async with self._conn.execute(f"""
                 SELECT COUNT(*) as total_scans, 
                        AVG(clean_servers) as avg_clean, 
-                       AVG(blocked_servers) as avg_blocked
+                       AVG(blocked_servers) as avg_blocked,
+                       AVG(disabled_servers) as avg_disabled
                 FROM scan_history 
                 WHERE status = 'complete' AND timestamp >= datetime('now', '-{days} days')
             """) as cursor:
@@ -393,7 +409,8 @@ class DatabaseManager:
             return {
                 "total_scans": row["total_scans"] or 0,
                 "avg_clean": round(row["avg_clean"] or 0, 1),
-                "avg_blocked": round(row["avg_blocked"] or 0, 1)
+                "avg_blocked": round(row["avg_blocked"] or 0, 1),
+                "avg_disabled": round(row["avg_disabled"] or 0, 1)
             }
         
         return {
@@ -424,6 +441,14 @@ class DatabaseManager:
             ORDER BY s.server_name
         """, (scan_id,)) as cursor:
             return [dict(row) for row in await cursor.fetchall()]
+
+    async def find_server_by_exit_ip(self, ip: str) -> Optional[str]:
+        """Name of the server most recently scanned with this exit IP (covers servers no longer scanned)."""
+        async with self._conn.execute(
+            "SELECT server_name FROM server_scan_history WHERE exit_ip = ? ORDER BY id DESC LIMIT 1", (ip,)
+        ) as cursor:
+            row = await cursor.fetchone()
+        return row["server_name"] if row else None
 
     async def get_last_scan_entry_pings(self) -> List[Dict[str, Any]]:
         last_scan = await self.get_last_complete_scan()

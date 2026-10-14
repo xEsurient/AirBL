@@ -476,7 +476,7 @@ async def _run_batch_speedtests():
         # Let's copy the logic fully to be safe.
          
         original_count = len(clean_servers)
-        configs = scan_config_directory(state.config_dir)
+        configs = state.server_configs()
         scannable_configs = get_scannable_configs(configs)
         config_to_city = {}
         for config in scannable_configs:
