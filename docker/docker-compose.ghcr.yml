@@ -1,0 +1,18 @@
+# Use the prebuilt image from GitHub Container Registry instead of building
+# from source. Layer it on top of the main compose file:
+#
+#   docker compose -f docker-compose.yml -f docker-compose.ghcr.yml pull
+#   docker compose -f docker-compose.yml -f docker-compose.ghcr.yml up -d
+#
+# Or add COMPOSE_FILE=docker-compose.yml:docker-compose.ghcr.yml to docker/.env
+# so plain `docker compose pull && docker compose up -d` works.
+# Pin a release by replacing :latest with a version tag, e.g. :1.2.3.
+
+services:
+  airbl:
+    build: !reset null
+    image: ghcr.io/xesurient/airbl:latest
+
+  airbl-vpn-tester:
+    build: !reset null
+    image: ghcr.io/xesurient/airbl:latest

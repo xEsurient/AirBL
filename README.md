@@ -28,6 +28,24 @@ AirBL keeps your AirVPN connection on servers that aren't on the [DroneBL](https
    ```bash
    cd docker && docker compose up -d --build
    ```
+   Or skip the build and run the prebuilt image `ghcr.io/xesurient/airbl` (amd64 and arm64, e.g. a 64-bit Raspberry Pi). Run it from the folder that holds your `conf/` (`docker/` if you cloned the repo):
+   ```bash
+   docker run --detach \
+       --name airbl \
+       --cap-add NET_ADMIN \
+       --sysctl net.ipv4.conf.all.src_valid_mark=1 \
+       --sysctl net.ipv4.ip_forward=1 \
+       --sysctl net.ipv6.conf.all.disable_ipv6=1 \
+       --publish 5665:5665 \
+       --env TZ=Europe/London \
+       --volume "$PWD/conf:/app/conf:ro" \
+       --volume "$PWD/data:/app/data" \
+       --volume "$PWD/gluetun:/app/gluetun" \
+       --volume "$PWD/wireguard:/app/wireguard" \
+       --restart unless-stopped \
+       ghcr.io/xesurient/airbl:latest
+   ```
+   See [Installation](docs/Installation.md#prebuilt-image) for the compose version, tags and updates.
 4. Open `http://<host>:5665` and choose countries, servers and a schedule under **Settings**.
 
 ## Using it with Gluetun
