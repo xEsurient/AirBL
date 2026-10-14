@@ -294,7 +294,7 @@ async def generate_gluetun_servers_json():
 
 # Watchdog state: Gluetun needs time to reconnect after a push, and errors are logged once per outage
 WATCHDOG_COOLDOWN_SECONDS = 180
-_last_push_at = 0.0
+_last_push_at = None  # monotonic() counts from boot, so 0.0 would mean "just pushed" on a fresh machine
 _watchdog_error = None
 
 
@@ -314,7 +314,7 @@ async def gluetun_watchdog_check(force: bool = False) -> dict:
         return {"applied": False, "reason": "control disabled"}
     if state.is_scanning:
         return {"applied": False, "reason": "scan running"}  # the scan pushes when it finishes
-    if not force and time.monotonic() - _last_push_at < WATCHDOG_COOLDOWN_SECONDS:
+    if not force and _last_push_at is not None and time.monotonic() - _last_push_at < WATCHDOG_COOLDOWN_SECONDS:
         return {"applied": False, "reason": "cooldown after a switch"}
     servers = await _get_servers_for_gluetun_generation()
     if not servers:
