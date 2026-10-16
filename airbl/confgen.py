@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Optional
 
 from .config import config_manager
-from .wireguard import parse_config_content, COUNTRY_CODE_MAP
+from .wireguard import parse_config_content
 
 logger = logging.getLogger("airbl.confgen")
 
@@ -195,6 +195,7 @@ def generate_config(
         lines.append(f"PresharedKey = {identity.preshared_key}")
     
     conf_path.write_text("\n".join(lines) + "\n")
+    conf_path.chmod(0o600)  # contains the private key
     logger.debug(f"Generated config: {filename}")
     return conf_path
 
@@ -244,87 +245,6 @@ def get_or_generate_config(
         entry_number=entry_number,
         identity=identity,
     )
-
-
-def generate_all_combos(
-    server_name: str,
-    country_code: str,
-    city: str,
-    entry1_ip: Optional[str],
-    entry3_ip: Optional[str],
-    server_pubkey: str,
-    ports: Optional[list[int]] = None,
-    entry_filter: str = "ALL",
-    identity: Optional[ClientIdentity] = None,
-) -> list[tuple[Path, int, int]]:
-    """
-    Generate configs for all port×entry combos for a server.
-    
-    Args:
-        entry_filter: "ALL", "ENTRY1", or "ENTRY3"
-        ports: List of ports to test (defaults to available_ports from config)
-    
-    Returns:
-        List of (config_path, port, entry_number) tuples
-    """
-    if ports is None:
-        ports = config_manager.config.scan.available_ports
-    
-    if identity is None:
-        identity = get_client_identity()
-    
-    # Determine which entries to include
-    entries = []
-    if entry_filter in ("ALL", "ENTRY1") and entry1_ip:
-        entries.append((1, entry1_ip))
-    if entry_filter in ("ALL", "ENTRY3") and entry3_ip:
-        entries.append((3, entry3_ip))
-    
-    results = []
-    for port in ports:
-        for entry_number, entry_ip in entries:
-            config_path = get_or_generate_config(
-                server_name=server_name,
-                country_code=country_code,
-                city=city,
-                endpoint_ip=entry_ip,
-                server_pubkey=server_pubkey,
-                port=port,
-                entry_number=entry_number,
-                identity=identity,
-            )
-            results.append((config_path, port, entry_number))
-    
-    logger.info(f"Generated {len(results)} combo configs for {server_name}")
-    return results
-
-
-def list_generated_configs() -> list[dict]:
-    """List all generated configs in confgen_dir with parsed metadata."""
-    confgen_dir = Path(config_manager.config.scan.confgen_dir)
-    if not confgen_dir.exists():
-        return []
-    
-    configs = []
-    for conf_file in sorted(confgen_dir.glob("*.conf")):
-        try:
-            content = conf_file.read_text()
-            parsed = parse_config_content(content)
-            configs.append({
-                "filename": conf_file.name,
-                "path": str(conf_file),
-                "endpoint_ip": parsed.get("endpoint_ip"),
-                "endpoint_port": parsed.get("endpoint_port"),
-                "address": parsed.get("address"),
-            })
-        except Exception as e:
-            configs.append({
-                "filename": conf_file.name,
-                "path": str(conf_file),
-                "error": str(e),
-            })
-    
-    return configs
 
 
 def configs_from_api(servers, conf_dir: Path) -> list:

@@ -3,7 +3,8 @@
 {% block body_class %}dashboard{% endblock %}
 
 {% block head %}
-<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+<!-- Pinned with SRI: an unpinned URL would pull a future major version with breaking changes -->
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.5.1/dist/chart.umd.min.js" integrity="sha384-jb8JQMbMoBUzgWatfe6COACi2ljcDdZQ2OxczGA3bGNeWe+6DChMTBJemed7ZnvJ" crossorigin="anonymous"></script>
 {% endblock %}
 
 {% block header_extra %}
@@ -14,12 +15,17 @@
 
 {% block content %}
 <!-- Dashboard Controls -->
-<div class="settings-section" style="padding: 15px 25px; display: flex; align-items: center; gap: 15px; margin-bottom: 25px;">
+<div class="settings-section" style="padding: 15px 25px; display: flex; flex-wrap: wrap; align-items: center; gap: 15px; margin-bottom: 25px;">
     <span style="font-weight: 500; color: var(--text-secondary);">Scanner Controls:</span>
     <button id="scanBtn" class="btn" onclick="startScan()" style="background: var(--text-primary); color: var(--bg-primary); border-color: var(--text-primary);">Start Scan</button>
     <button id="restartBtn" class="btn" onclick="restartScan()" style="display: none; background: transparent; border-color: var(--border);">Restart</button>
     <button id="pauseBtn" class="btn" onclick="pauseScan()" style="display: none; background: #f59e0b; color: #fff; border-color: #f59e0b;">Pause</button>
     <button id="stopBtn" class="btn" onclick="stopScan()" style="display: none; background: #ef4444; color: #fff; border-color: #ef4444;">Stop</button>
+</div>
+
+<div id="restoredNote" class="restored-note" role="status" hidden>
+    <span>Showing the last scan, restored from the database after a restart. Some details (all exit IPs, live pings) refresh with the next scan.</span>
+    <button type="button" class="note-dismiss" aria-label="Dismiss" onclick="this.parentElement.hidden = true; sessionStorage.setItem('airbl.restoredNoteDismissed', '1')">×</button>
 </div>
 
 <div class="status-bar">
@@ -68,7 +74,7 @@
 <!-- Imported Metrics (Charts) -->
 <div style="display: flex; justify-content: space-between; align-items: center; margin-top: 25px;">
     <h2 style="font-size: 1.25rem; font-family: 'Outfit', sans-serif; color: var(--text-primary); margin: 0;">Performance History</h2>
-    <select id="timeframeSelect" style="width: 150px; background: rgba(255,255,255,0.05); color: var(--text-primary); border: 1px solid var(--border); border-radius: 6px; padding: 6px 12px; cursor: pointer; outline: none;" onchange="renderCharts()">
+    <select id="timeframeSelect" style="width: 150px; background: rgba(255,255,255,0.05); color: var(--text-primary); border: 1px solid var(--border); border-radius: 6px; padding: 6px 12px; cursor: pointer; outline: none;" onchange="loadMetrics()" aria-label="Time range">
         <option value="latest">Latest Scan</option>
         <option value="72">Last 3 Days</option>
         <option value="168">Last 7 Days</option>
@@ -76,6 +82,8 @@
         <option value="all">All Time</option>
     </select>
 </div>
+
+<p id="chartsEmptyRange" class="chart-empty" hidden>No speedtests in this time range.</p>
 
 <div class="charts-grid" style="margin-top: 15px;">
     <div class="chart-card">
@@ -114,16 +122,16 @@
         Chart.defaults.borderColor = '#1f1f1f';
     }
 
-    function getFlagEmoji(cc) {
-        if (!cc) return '';
-        return String.fromCodePoint(...[...cc.toUpperCase()].map(c => 0x1F1E6 - 65 + c.charCodeAt(0)));
-    }
+    // getFlagEmoji comes from app.js
 
     let rawSpeedtestHistory = [];
 
     async function loadMetrics() {
         try {
-            const response = await fetch('/api/metrics');
+            // Longer ranges need more than the newest 100 speedtests the default returns
+            const tf = document.getElementById('timeframeSelect').value;
+            const query = tf === 'latest' ? '' : '?hours=' + (tf === 'all' ? 0 : encodeURIComponent(tf));
+            const response = await fetch('/api/metrics' + query);
             const data = await response.json();
 
             if (data.scan_history.length === 0 && data.speedtest_history.length === 0) {
@@ -134,8 +142,9 @@
             }
 
             // API returns newest first; charts read oldest -> newest
-            rawSpeedtestHistory = (data.speedtest_history || []).slice()
-                .sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp));
+            // Failed runs are stored too (for success rates); the speed charts show successful ones
+            rawSpeedtestHistory = (data.speedtest_history || []).filter(d => d.is_success !== 0)
+                .sort((a, b) => parseServerTime(a.timestamp) - parseServerTime(b.timestamp));
             renderCharts();
 
         } catch (e) {
@@ -157,12 +166,12 @@
             } else {
                 // Fallback dynamically mapped to the last 24 block structure if IDs decay
                 const cutoff = new Date(Date.now() - 24 * 60 * 60 * 1000);
-                recent = rawSpeedtestHistory.filter(d => new Date(d.timestamp) >= cutoff);
+                recent = rawSpeedtestHistory.filter(d => parseServerTime(d.timestamp) >= cutoff);
             }
         } else if (tfVal !== 'all') {
             const hours = parseInt(tfVal);
             const cutoff = new Date(Date.now() - hours * 60 * 60 * 1000);
-            recent = rawSpeedtestHistory.filter(d => new Date(d.timestamp) >= cutoff);
+            recent = rawSpeedtestHistory.filter(d => parseServerTime(d.timestamp) >= cutoff);
         }
 
         if (recent.length > 0) {
@@ -204,18 +213,21 @@
             });
 
             if (pingChart) pingChart.destroy();
+            // Bars, not a line: each point is a different server, so a line would join unrelated values
             pingChart = new Chart(document.getElementById('pingChart'), {
-                type: 'line',
+                type: 'bar',
                 data: {
                     labels: sLabels,
-                    datasets: [{ label: 'Ping (ms)', data: recent.map(d => d.ping_ms), borderColor: '#f59e0b', backgroundColor: 'rgba(245, 158, 11, 0.1)', fill: true, tension: 0.3 }]
+                    datasets: [{ label: 'Ping (ms)', data: recent.map(d => d.ping_ms), backgroundColor: '#f59e0b' }]
                 },
                 options: { responsive: true, maintainAspectRatio: false, plugins: tooltipPlugin }
             });
         } else {
             if (speedtestChart) speedtestChart.destroy();
             if (pingChart) pingChart.destroy();
+            speedtestChart = pingChart = null;
         }
+        document.getElementById('chartsEmptyRange').hidden = recent.length > 0;
     }
 
     let _topServerData = [];
@@ -258,7 +270,7 @@
                 const dl = s.speedtest && s.speedtest.download_mbps ? s.speedtest.download_mbps.toFixed(1) + ' Mbps' : '--';
                 const score = s.score != null ? s.score.toFixed(1) : '--';
                 return `
-                    <div class="summary-card success" style="padding: 18px; text-align: left; cursor: pointer;" onclick="showServerDetail(${i})">
+                    <div class="summary-card success" style="padding: 18px; text-align: left; cursor: pointer;" role="button" tabindex="0" onclick="showServerDetail(${i})" onkeydown="if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); showServerDetail(${i}); }">
                         <div style="font-size: 1.3rem; font-weight: bold; margin-bottom: 8px;">${flag} ${name}</div>
                         <div style="display: flex; flex-direction: column; gap: 4px; font-size: 0.85rem; color: var(--text-secondary);">
                             <span>⏱️ Ping: <strong style="color:var(--text-primary)">${bestPing}</strong></span>
@@ -298,9 +310,9 @@
             <div class="settings-section" style="padding: 20px;">
                 <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:15px;">
                     <h3 style="margin:0;color:var(--accent);">${flag} ${name}</h3>
-                    <button class="btn btn-secondary" style="padding:4px 12px;" onclick="document.getElementById('serverDetailPanel').style.display='none'">✕</button>
+                    <button class="btn btn-secondary" style="padding:4px 12px;" aria-label="Close details" onclick="document.getElementById('serverDetailPanel').style.display='none'">✕</button>
                 </div>
-                <div style="display:grid;grid-template-columns:repeat(5,1fr);gap:10px;">
+                <div class="detail-metrics-grid">
                     <div class="summary-card" style="padding:10px;"><div class="summary-label">Entry 1 Ping</div><div class="summary-value" style="font-size:1.1rem;">${e1}</div></div>
                     <div class="summary-card" style="padding:10px;"><div class="summary-label">Exit Ping</div><div class="summary-value" style="font-size:1.1rem;">${exit}</div></div>
                     <div class="summary-card" style="padding:10px;"><div class="summary-label">Upload</div><div class="summary-value" style="font-size:1.1rem;">${ul}</div></div>

@@ -33,7 +33,47 @@ document.getElementById = function(id) {
     return null;
 };
 let ws = null;
+// Timestamps from the server: most are local server time without an offset, which
+// new Date() would read as the browser's local time. Add the server's offset first.
+function parseServerTime(s) {
+    if (!s) return null;
+    s = String(s).trim().replace(' ', 'T').replace(/(\.\d{3})\d+/, '$1');
+    if (/(Z|[+-]\d\d:?\d\d)$/i.test(s)) return new Date(s);
+    const off = window.AIRBL_SERVER_UTC_OFFSET_MIN || 0;
+    const a = Math.abs(off);
+    const tz = (off < 0 ? '-' : '+') + String(Math.floor(a / 60)).padStart(2, '0') + ':' + String(a % 60).padStart(2, '0');
+    return new Date(s + tz);
+}
+
 let nextScanTime = null;
+let autoScanEnabled = null;  // null = unknown yet
+let scanPaused = false;
+let manualBaselinePending = false;  // toast only for a baseline started from this tab, not each scan's
+
+// Settings > Speedtest: measure the line without the VPN now (the API queues it behind any VPN job)
+async function runBaselineNow(btn) {
+    btn.disabled = true;
+    try {
+        const res = await fetch('/api/baseline-speedtest', { method: 'POST' });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok || data.error) throw new Error(data.error || 'HTTP ' + res.status);
+        manualBaselinePending = true;
+        showToast('Baseline speedtest started (about a minute).', 'info');
+    } catch (e) {
+        showToast('Could not start the baseline: ' + e.message, 'error');
+    } finally {
+        btn.disabled = false;
+    }
+}  // speedtest events must not overwrite a "Paused" status
+
+// Every payload with next_scan_at goes through here: null clears the countdown
+// (auto-scan off), so it can't keep counting down to a stale time and stick at "Now"
+function setNextScan(data) {
+    if (!data || !('next_scan_at' in data)) return;
+    nextScanTime = data.next_scan_at ? new Date(data.next_scan_at) : null;
+    if ('auto_scan_enabled' in data) autoScanEnabled = data.auto_scan_enabled;
+    if (hasEl('nextScan')) updateCountdown();
+}
 let allResults = null;
 let scoringThresholds = { signal_good_threshold: 80, signal_medium_threshold: 50 };  // Defaults, updated from API
 
@@ -44,7 +84,10 @@ function hasEl(id) { return !!originalGetElementById(id); }
 let _statusPromise = null;
 function getStatusOnce() {
     if (!_statusPromise) {
-        _statusPromise = fetch('/api/status').then(r => r.json());
+        _statusPromise = fetch('/api/status').then(r => {
+            if (!r.ok) throw new Error('HTTP ' + r.status);
+            return r.json();
+        });
         _statusPromise.catch(() => { _statusPromise = null; });
     }
     return _statusPromise;
@@ -77,14 +120,16 @@ function handleMessage(msg) {
     switch (msg.type) {
         case 'status':
             updateStatus(msg.data);
+            setNextScan(msg.data);
             // Restore progress if available
             if (msg.data.progress) {
                 updateProgress(msg.data.progress);
             }
-            // Restore summary stats if available
+            // Restore summary stats if available. Sent on every (re)connect: outside a scan
+            // it is the latest result, which a page that was disconnected may have missed.
             if (msg.data.summary) {
                 updateSummary(msg.data.summary);
-                if (!allResults) {
+                if (!allResults || !msg.data.is_scanning) {
                     allResults = msg.data.summary;
                     populateCountryFilter(msg.data.summary);
                     // Apply filters (defaults to clean only)
@@ -94,9 +139,7 @@ function handleMessage(msg) {
             break;
         case 'scan_started':
             updateStatus({ is_scanning: true, is_paused: false });
-            if (msg.data && msg.data.next_scan_at) {
-                nextScanTime = new Date(msg.data.next_scan_at);
-            }
+            setNextScan(msg.data);
             document.getElementById('progressContainer').style.display = 'block';
             document.getElementById('nextStep').textContent = '-';
             // Initialize empty results for incremental updates
@@ -145,6 +188,7 @@ function handleMessage(msg) {
                     allResults.total_servers = msg.data.summary.total_servers;
                     allResults.clean_servers_count = msg.data.summary.clean_servers_count;
                     allResults.blocked_servers_count = msg.data.summary.blocked_servers_count;
+                    allResults.unknown_servers_count = msg.data.summary.unknown_servers_count;
                     allResults.total_ips_scanned = msg.data.summary.total_ips_scanned;
                     allResults.total_responsive = msg.data.summary.total_responsive;
                     allResults.total_blocked = msg.data.summary.total_blocked;
@@ -164,10 +208,17 @@ function handleMessage(msg) {
         case 'baseline_speedtest_complete':
             if (msg.data.baseline) {
                 updateBaselineDisplay(msg.data.baseline);
+                if (manualBaselinePending) {
+                    const b = msg.data.baseline;
+                    showToast(`Baseline: ↓ ${Number(b.download_mbps).toFixed(0)} / ↑ ${Number(b.upload_mbps).toFixed(0)} Mbps, ${Number(b.ping_ms).toFixed(0)} ms`, 'success');
+                }
             }
+            manualBaselinePending = false;
             break;
         case 'baseline_speedtest_error':
             console.error('Baseline speedtest error:', msg.data.error);
+            if (manualBaselinePending) showToast('Baseline failed: ' + (msg.data.error || 'unknown error'), 'error');
+            manualBaselinePending = false;
             break;
         case 'scan_complete':
             document.getElementById('scanStatus').textContent = 'Scan Complete';
@@ -181,9 +232,7 @@ function handleMessage(msg) {
                     // Apply filters to respect current filter settings
                     applyFilters();
                 }
-                if (msg.data && msg.data.next_scan_at) {
-                    nextScanTime = new Date(msg.data.next_scan_at);
-                }
+                setNextScan(msg.data);
             }
             // Fire page-level callback for reactive refresh
             firePageRefresh('onScanComplete', msg.data);
@@ -197,9 +246,9 @@ function handleMessage(msg) {
         case 'speedtest_queue':
             // Show speedtest queue notification
             console.log('Speedtest queue:', msg.data.message);
-            // Ensure is_scanning is true when speedtests start
-            updateStatus({ is_scanning: true, is_paused: false });
-            if (msg.data.count) {
+            // Ensure is_scanning is true when speedtests start (keep a pause)
+            updateStatus({ is_scanning: true, is_paused: scanPaused });
+            if (msg.data.count && !scanPaused) {
                 document.getElementById('scanStatus').textContent = 'Speedtesting...';
                 document.getElementById('scanStatus').classList.add('scanning');
                 document.getElementById('progressContainer').style.display = 'block';
@@ -231,6 +280,7 @@ function handleMessage(msg) {
                 allResults.total_servers = msg.data.summary.total_servers;
                 allResults.clean_servers_count = msg.data.summary.clean_servers_count;
                 allResults.blocked_servers_count = msg.data.summary.blocked_servers_count;
+                    allResults.unknown_servers_count = msg.data.summary.unknown_servers_count;
                 allResults.total_ips_scanned = msg.data.summary.total_ips_scanned;
                 updateSummary(allResults);
             }
@@ -251,7 +301,7 @@ function handleMessage(msg) {
                     next: msg.data.next || ''
                 });
                 // Update status to show which server is being tested
-                document.getElementById('scanStatus').textContent = `Speedtesting ${server}...`;
+                if (!scanPaused) document.getElementById('scanStatus').textContent = `Speedtesting ${server}...`;
             }
             break;
         case 'speedtest_complete':
@@ -292,6 +342,7 @@ function handleMessage(msg) {
                         allResults.total_servers = msg.data.summary.total_servers;
                         allResults.clean_servers_count = msg.data.summary.clean_servers_count;
                         allResults.blocked_servers_count = msg.data.summary.blocked_servers_count;
+                    allResults.unknown_servers_count = msg.data.summary.unknown_servers_count;
                         allResults.total_ips_scanned = msg.data.summary.total_ips_scanned;
                     }
                 }
@@ -374,7 +425,7 @@ function handleMessage(msg) {
             // Refresh thresholds/next scan time; pages with forms handle their own reloads
             fetch('/api/status').then(r => r.json()).then(st => {
                 if (st.scoring) scoringThresholds = st.scoring;
-                if (st.next_scan_at) nextScanTime = new Date(st.next_scan_at);
+                setNextScan(st);
             }).catch(() => {});
             break;
         case 'speedtest_error':
@@ -431,6 +482,7 @@ function updateStatus(data) {
     const pauseBtn = document.getElementById('pauseBtn');
     const restartBtn = document.getElementById('restartBtn');
     const statusEl = document.getElementById('scanStatus');
+    scanPaused = !!(data.is_scanning && data.is_paused);
 
     if (data.is_scanning) {
         if (data.is_paused) {
@@ -448,13 +500,18 @@ function updateStatus(data) {
         pauseBtn.style.display = 'inline-block';
         restartBtn.style.display = 'inline-block';
     } else {
-        statusEl.textContent = 'Idle';
+        // A manual speedtest or baseline holds the VPN outside a scan
+        statusEl.textContent = data.network_owner ? 'VPN busy: ' + data.network_owner : 'Idle';
         statusEl.classList.remove('scanning');
         scanBtn.disabled = false;
         scanBtn.style.display = 'inline-block';
         stopBtn.style.display = 'none';
         pauseBtn.style.display = 'none';
         restartBtn.style.display = 'none';
+    }
+    if ('results_restored' in data && hasEl('restoredNote')) {
+        const dismissed = sessionStorage.getItem('airbl.restoredNoteDismissed') === '1';
+        document.getElementById('restoredNote').hidden = !data.results_restored || dismissed;
     }
 }
 
@@ -464,7 +521,9 @@ function updateProgress(data) {
 
     // Format: "Country - Server - phase (current/total)"
     let progressText = '';
-    if (data.phase === 'speedtesting') {
+    if (data.phase === 'idle') {
+        progressText = 'Idle';  // not "Idle (0/0)"
+    } else if (data.phase === 'speedtesting') {
         // Special format for speedtesting
         if (data.country && data.server) {
             progressText = `Speedtesting ${data.country} - ${data.server} (${data.current}/${data.total})`;
@@ -587,12 +646,20 @@ function _applyFiltersNow() {
 
     const seq = ++applyFiltersSeq;
     fetch('/api/servers?' + params.toString())
-        .then(r => r.json())
+        .then(r => {
+            if (!r.ok) throw new Error('HTTP ' + r.status);
+            return r.json();
+        })
         .then(data => {
             if (seq !== applyFiltersSeq) return;  // a newer request is in flight
             renderFilteredResults(data.countries || []);
         })
-        .catch(e => console.error('Failed to load servers:', e));
+        .catch(e => {
+            if (seq !== applyFiltersSeq) return;
+            console.error('Failed to load servers:', e);
+            // Keep the current list instead of a misleading "No Matching Servers"
+            showToast('Could not apply the filters (' + e.message + '). Check the values.', 'error');
+        });
 }
 
 function resetFilters() {
@@ -713,7 +780,7 @@ function renderCountryCard(countryCode, servers) {
         const serverScore = server.score || 0;
 
         html += `
-            <div class="server-item ${statusClass}" data-server-name="${escapeHtml(server.server_name)}" onclick="showServerDetails(this.dataset.serverName)">
+            <div class="server-item ${statusClass}" data-server-name="${escapeHtml(server.server_name)}" role="button" tabindex="0" onclick="showServerDetails(this.dataset.serverName)" onkeydown="if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); showServerDetails(this.dataset.serverName); }">
                 <div class="server-info">
                     <div class="server-name">
                         ${getSignalBarsHtml(server)}
@@ -741,7 +808,7 @@ function renderCountryCard(countryCode, servers) {
                             <span class="metric-label">Dev</span>
                         </div>
                         <div class="metric">
-                            <span class="metric-value ${loadClass}">${escapeHtml(server.load_percent ?? '-')}%</span>
+                            <span class="metric-value ${loadClass}">${server.load_percent == null ? '–' : escapeHtml(String(server.load_percent)) + '%'}</span>
                             <span class="metric-label">Load</span>
                         </div>
                     </div>
@@ -827,7 +894,7 @@ function showServerDetails(serverName) {
         </div>
         <div class="info-item">
             <span class="info-label">Score</span>
-            <span class="info-value accent">${(server.score || 0).toFixed(1)}</span>
+            <span class="info-value accent">${escapeHtml((Number(server.score) || 0).toFixed(1))}</span>
         </div>
     `;
 
@@ -852,7 +919,7 @@ function showServerDetails(serverName) {
         </div>
         <div class="info-item">
             <span class="info-label">Server Load</span>
-            <span class="info-value ${getLoadClass(load)}">${load}%</span>
+            <span class="info-value ${getLoadClass(load)}">${load == null ? '–' : escapeHtml(String(load)) + '%'}</span>
         </div>
         <div class="info-item">
             <span class="info-label">IPs Scanned</span>
@@ -917,7 +984,7 @@ function showServerDetails(serverName) {
     const blockedIps = (server.exit_ips || []).filter(ip => ip.is_blocked);
     document.getElementById('modalBlockNotesSection').style.display = blockedIps.length ? '' : 'none';
     document.getElementById('modalBlockNotes').innerHTML = blockedIps.map(ip => {
-        const checked = ip.dronebl_checked_at ? new Date(ip.dronebl_checked_at).toLocaleString() : 'unknown';
+        const checked = ip.dronebl_checked_at ? parseServerTime(ip.dronebl_checked_at).toLocaleString() : 'unknown';
         const code = ip.dronebl_code != null ? ` (code ${ip.dronebl_code})` : '';
         return `
             <div class="ip-item blocked" style="flex-direction: column; align-items: flex-start; gap: 4px;">
@@ -1018,6 +1085,7 @@ document.addEventListener('keydown', (e) => {
 });
 
 function getFlagEmoji(countryCode) {
+    if (!countryCode) return '';
     const codePoints = countryCode.toUpperCase().split('').map(char => 127397 + char.charCodeAt(0));
     return String.fromCodePoint(...codePoints);
 }
@@ -1070,7 +1138,7 @@ function renderDisabledServerList(el, data, onEnabled) {
     const rows = servers.map(s => {
         const where = [s.city, s.country_name].filter(Boolean).join(', ');
         const results = (s.recent || []).map(r => {
-            const day = r.timestamp ? new Date(r.timestamp).toLocaleDateString(undefined, { day: 'numeric', month: 'short' }) : '';
+            const day = r.timestamp ? parseServerTime(r.timestamp).toLocaleDateString(undefined, { day: 'numeric', month: 'short' }) : '';
             return `<span class="disabled-result" title="${escapeHtml(r.timestamp || '')}">${escapeHtml(day)} ↓${val(r.download, thDl)} ↑${val(r.upload, thUl)}</span>`;
         }).join('') || '<span class="disabled-meta">No recent results kept</span>';
         return `<div class="disabled-row">
@@ -1122,6 +1190,7 @@ function getPingClass(ping) {
 }
 
 function getLoadClass(load) {
+    if (load == null) return '';  // unknown load: no colour, not a green 0%
     if (load < 50) return 'good';
     if (load < 80) return 'medium';
     return 'bad';
@@ -1175,7 +1244,7 @@ async function restartScan() {
 
 function updateCountdown() {
     const el = document.getElementById('nextScan');
-    if (!nextScanTime) { el.textContent = '--:--'; return; }
+    if (!nextScanTime) { el.textContent = autoScanEnabled === false ? 'Auto-scan off' : '--:--'; return; }
 
     const now = new Date();
     const diff = nextScanTime - now;
@@ -1206,7 +1275,7 @@ document.addEventListener('DOMContentLoaded', () => {
         fetch('/api/results').then(r => r.json())
     ]).then(([status, results]) => {
         updateStatus(status);
-        if (status.progress) updateProgress(status.progress);
+        if (status.progress && status.progress.phase !== 'idle') updateProgress(status.progress);
 
         // Restore progress bar visibility on refresh if a scan/speedtest is active
         if (status.is_scanning && status.progress && status.progress.phase !== 'idle') {
@@ -1217,10 +1286,8 @@ document.addEventListener('DOMContentLoaded', () => {
         if (status.scoring) {
             scoringThresholds = status.scoring;
         }
-        // Load next scan time
-        if (status.next_scan_at) {
-            nextScanTime = new Date(status.next_scan_at);
-        }
+        // Load next scan time (null: auto-scan off)
+        setNextScan(status);
 
         // /api/results returns the summary itself ({error} when no scan yet)
         const loaded = results && results.servers_by_country ? results : status.summary;

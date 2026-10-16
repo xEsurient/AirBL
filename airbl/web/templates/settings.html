@@ -96,6 +96,17 @@
 
         <div class="setting-row">
             <div class="setting-info">
+                <div class="setting-label">Baseline Speedtest</div>
+                <div class="setting-description">Measure your line without the VPN now. Speedtest results are
+                    compared with it (deviation score). Every scan also measures one first.</div>
+            </div>
+            <div class="setting-control">
+                <button type="button" class="btn btn-secondary" onclick="runBaselineNow(this)">Run baseline now</button>
+            </div>
+        </div>
+
+        <div class="setting-row">
+            <div class="setting-info">
                 <div class="setting-label">VPN Cooldown</div>
                 <div class="setting-description">Wait time between server speedtests to avoid rate limiting and ensure
                     clean disconnects</div>
@@ -368,8 +379,9 @@
         <div class="setting-row">
             <div class="setting-info">
                 <div class="setting-label">Blacklist Duration (days)</div>
-                <div class="setting-description">How many days a server stays blacklisted after failing speed
-                    thresholds.</div>
+                <div class="setting-description">How many days a speedtest.net server stays blacklisted after it
+                    reported itself unavailable too often (see the failure count below). Slow results don't
+                    blacklist; the list is cleared when AirBL restarts.</div>
             </div>
             <div class="setting-control">
                 <input type="number" id="speedtestBlacklistDuration" min="1" max="365" value="2"
@@ -677,10 +689,13 @@
     // AirBL's /app/gluetun is expected to be the same folder as Gluetun's /gluetun.
     function gluetunPathHint(path) {
         path = (path || '').trim();
-        if (path.endsWith('/servers/airvpn.json')) {
+        if (!path.startsWith('/app/gluetun/') || path.split('/').includes('..')) {
+            return '❌ Must be inside /app/gluetun/ (the folder mounted for Gluetun); saving will be refused.';
+        }
+        if (path === '/app/gluetun/servers/airvpn.json') {
             return '✅ Current Gluetun reads this at startup (as /gluetun/servers/airvpn.json).';
         }
-        if (path.endsWith('/servers.json')) {
+        if (path === '/app/gluetun/servers.json') {
             return '⚠️ Only older Gluetun reads this. Current Gluetun imports it once, then ignores it.';
         }
         return 'ℹ️ Gluetun does not read this file. Local copy only; API control still works.';
@@ -741,7 +756,11 @@
         out.textContent = 'Checking (uses saved settings)...';
         try {
             const res = await fetch('/api/gluetun/check', { method: 'POST' });
-            const d = await res.json();
+            const d = await res.json().catch(() => ({}));
+            if (!res.ok) {
+                out.textContent = '❌ Check failed: ' + (d.error || d.detail || 'HTTP ' + res.status);
+                return;
+            }
             const on = d.current ? ` (on ${d.current})` : '';
             const mode = GLUETUN_MODE_LABELS[d.mode] || d.mode || '';
             if (d.applied) {
@@ -931,6 +950,7 @@
         grid.innerHTML = '';
 
         const countries = Object.entries(allCountries).sort((a, b) => a[1].localeCompare(b[1]));
+        const withConfigs = new Set((countriesWithConfigs || []).map(c => String(c).toUpperCase()));
 
         for (const [code, name] of countries) {
             const codeUpper = code.toUpperCase();
@@ -940,8 +960,9 @@
 
             const div = document.createElement('div');
             div.className = 'country-checkbox';
+            // data-has-config: used by "Config Files Only"
             div.innerHTML = `
-                <input type="checkbox" id="country_${escapeHtml(code)}" value="${escapeHtml(code)}" ${isEnabled ? 'checked' : ''} onchange="markChanged()">
+                <input type="checkbox" id="country_${escapeHtml(code)}" value="${escapeHtml(code)}" data-has-config="${withConfigs.has(codeUpper)}" ${isEnabled ? 'checked' : ''} onchange="markChanged()">
                 <label for="country_${escapeHtml(code)}">
                     ${getFlagEmoji(code)} ${escapeHtml(name)}
                 </label>
@@ -1137,9 +1158,9 @@
             markChanged();
         });
 
-        const label = document.createElement('span');
+        const label = document.createElement('label');  // a <span for> isn't clickable
         label.textContent = city;
-        label.setAttribute('for', checkbox.id);
+        label.htmlFor = checkbox.id;
 
         checkboxDiv.appendChild(checkbox);
         checkboxDiv.appendChild(label);
@@ -1551,7 +1572,7 @@
                     <input type="text" value="${escapeHtml(p.name ?? '')}" onchange="currentWgProfiles[${i}].name=this.value; markChanged();" style="font-weight: 600; font-size: 1rem; background: transparent; border: none; color: var(--text-primary); width: 200px;">
                     <div style="display: flex; gap: 10px; align-items: center;">
                         <label class="toggle"><input type="checkbox" ${p.enabled ? 'checked' : ''} onchange="currentWgProfiles[${i}].enabled=this.checked; markChanged();"><span class="toggle-slider"></span></label>
-                        <button class="btn btn-danger" onclick="window.removeWgProfile(${i})" style="padding: 4px 10px; font-size: 0.8rem;">✕</button>
+                        <button class="btn btn-danger" aria-label="Remove profile" onclick="window.removeWgProfile(${i})" style="padding: 4px 10px; font-size: 0.8rem;">✕</button>
                     </div>
                 </div>
                 <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 10px;">
@@ -1565,13 +1586,6 @@
                             <option value="ENTRY1" ${p.entry_ip === 'ENTRY1' ? 'selected' : ''}>Entry 1</option>
                             <option value="ENTRY3" ${p.entry_ip === 'ENTRY3' ? 'selected' : ''}>Entry 3</option>
                             <option value="AUTO" ${p.entry_ip === 'AUTO' ? 'selected' : ''}>Auto (Lowest Latency)</option>
-                        </select>
-                    </div>
-                    <div class="setting-row" style="margin:0; padding: 8px 0;">
-                        <span class="setting-label" style="font-size: 0.85rem;">IP Protocol</span>
-                        <select onchange="currentWgProfiles[${i}].ip_protocol=this.value; markChanged();" style="padding: 4px 8px;">
-                            <option value="IPv4" ${p.ip_protocol === 'IPv4' ? 'selected' : ''}>IPv4</option>
-                            <option value="IPv6" ${p.ip_protocol === 'IPv6' ? 'selected' : ''}>IPv6</option>
                         </select>
                     </div>
                     <div class="setting-row" style="margin:0; padding: 8px 0;">
@@ -1728,7 +1742,7 @@
         let historyHtml = '';
         if (result.history && result.history.length > 0) {
             historyHtml += `<div style="font-size: 0.8rem; color: var(--text-secondary);">Last ${result.history.length} test(s); failed or leaked tests are shown but not averaged.</div>`;
-            historyHtml = `<table style="width: 100%; border-collapse: collapse; margin-top: 15px; text-align: left; font-size: 0.9rem;">
+            historyHtml += `<table style="width: 100%; border-collapse: collapse; margin-top: 15px; text-align: left; font-size: 0.9rem;">
                 <thead>
                     <tr style="border-bottom: 1px solid var(--border); color: var(--text-secondary);">
                         <th style="padding: 8px;">Run</th>
@@ -1740,7 +1754,7 @@
                 </thead>
                 <tbody>`;
             result.history.forEach((test, index) => {
-                const dt = new Date(test.tested_at || test.timestamp);
+                const dt = parseServerTime(test.tested_at || test.timestamp);
                 const timeStr = isNaN(dt) ? '—' : dt.toLocaleString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
                 const where = test.server ? ` title="${escapeHtml(test.server)}"` : '';
                 historyHtml += test.error ? `
@@ -1771,7 +1785,7 @@
         modal.innerHTML = `
             <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:15px">
                 <h3 style="margin:0;color:var(--accent);">Discovery: ${escapeHtml(combo_key.replace('_', ' : '))}</h3>
-                <button onclick="this.closest('div').parentElement.parentElement.remove()" style="background:none;border:none;color:var(--text-secondary);font-size:1.5rem;cursor:pointer;">&times;</button>
+                <button aria-label="Close" onclick="this.closest('div').parentElement.parentElement.remove()" style="background:none;border:none;color:var(--text-secondary);font-size:1.5rem;cursor:pointer;">&times;</button>
             </div>
             
             <div style="display: flex; justify-content: space-between; background: var(--bg-secondary); padding: 10px 15px; border-radius: 8px; margin-bottom: 15px;">
@@ -2010,7 +2024,7 @@
 
         renderCountryGrid(originalSettings.all_countries, originalSettings.countries_with_configs, originalSettings.enabled_countries);
         if (originalSettings.cities_by_country) {
-            renderCityGrid(originalSettings.cities_by_country, originalSettings.enabled_cities || {}, originalSettings.all_countries || {});
+            renderCityGrid(originalSettings.cities_by_country, originalSettings.enabled_cities || {}, originalSettings.all_countries || {}, originalSettings.city_regions || {});
         }
         renderServerGrid(originalSettings.all_servers, originalSettings.enabled_servers, originalSettings.disabled_servers || []);
 
@@ -2124,6 +2138,10 @@
                 const toast = document.getElementById('toast');
                 toast.classList.add('visible');
                 setTimeout(() => toast.classList.remove('visible'), 3000);
+
+                // The server kept its previous profiles for anything it rejected: show what is
+                // really saved instead of the submitted values
+                if ((data.warnings || []).length) loadSettings();
             }
         } catch (e) {
             showToast('Failed to save settings: ' + e.message, 'error');

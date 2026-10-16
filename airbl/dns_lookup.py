@@ -70,8 +70,9 @@ async def lookup_exit_ips(server_name: str) -> Tuple[Set[str], Optional[str]]:
     SERVERNAME_exit.airservers.org at dns1/dns2.airvpn.org.
 
     Returns:
-        (ips, error): error is None when at least one query got an answer
-        (possibly empty = no records); otherwise a reason why every query failed.
+        (ips, error): error is None when at least one A query got an answer
+        (possibly empty = no records); otherwise a reason. AAAA answers alone don't
+        count: the IPv4 exits would then go unchecked while the server looks clean.
     """
     query_name = f"{server_name.lower()}_exit.airservers.org"
     jobs = [(srv, rd) for srv in DNS_SERVERS for rd in ("A", "AAAA")]
@@ -82,7 +83,7 @@ async def lookup_exit_ips(server_name: str) -> Tuple[Set[str], Optional[str]]:
 
     all_ips: Set[str] = set()
     errors = []
-    answered = False
+    answered_a = False
     for (srv, rd), res in zip(jobs, results):
         if isinstance(res, BaseException):
             if isinstance(res, asyncio.CancelledError):
@@ -90,21 +91,11 @@ async def lookup_exit_ips(server_name: str) -> Tuple[Set[str], Optional[str]]:
             errors.append(str(res))
             logger.warning(f"DNS query failed for {query_name} {rd} @{srv}: {res}")
         else:
-            answered = True
+            answered_a = answered_a or rd == "A"
             all_ips.update(res)
 
-    if not answered:
+    if not answered_a:
         return set(), "; ".join(sorted(set(errors)))  # usually one shared reason
     return all_ips, None
 
 
-async def lookup_server_exit_ips(server_name: str) -> Set[str]:
-    """
-    Lookup exit IPs for a server.
-
-    Returns the set of IPs; raises DNSLookupError if every query failed.
-    """
-    ips, error = await lookup_exit_ips(server_name)
-    if error:
-        raise DNSLookupError(error)
-    return ips

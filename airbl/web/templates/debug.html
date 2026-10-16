@@ -33,6 +33,12 @@
         background: rgba(255,255,255,0.04);
     }
 
+    @media (max-width: 640px) {
+        /* Phones: time, level and module on one line, the message full width below */
+        .log-entry { grid-template-columns: auto auto 1fr; }
+        .log-entry .log-msg { grid-column: 1 / -1; }
+    }
+
     .log-entry:nth-child(even) {
         background: rgba(255,255,255,0.015);
     }
@@ -260,7 +266,7 @@
             <span class="log-count" id="logCount">0 / 0</span>
         </div>
         <button id="pauseDebugBtn" class="btn btn-sm btn-secondary" onclick="togglePause()">Pause</button>
-        <button class="btn btn-sm btn-secondary" onclick="fetchLogs()">↻</button>
+        <button class="btn btn-sm btn-secondary" aria-label="Refresh now" title="Refresh now" onclick="fetchLogs()">↻</button>
         <button class="btn btn-sm btn-danger" onclick="clearLogs()">Clear</button>
     </div>
 </div>
@@ -280,6 +286,16 @@
     let isPaused = false;
     let allLogs = [];
     let enabledLevels = new Set(['DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL']);
+    let lastSignature = '';
+    const expandedKeys = new Set();  // long messages the user opened, kept across redraws
+
+    function logKey(entry) { return (entry.timestamp || '') + '|' + (entry.message || '').slice(0, 80); }
+
+    // Selecting text to copy must survive the 1 s refresh
+    function selectingInLog() {
+        const sel = window.getSelection();
+        return sel && !sel.isCollapsed && document.getElementById('logContainer').contains(sel.anchorNode);
+    }
 
     async function fetchLogs() {
         if (isPaused) return;
@@ -288,6 +304,10 @@
             const response = await fetch('/api/debug/logs');
             const data = await response.json();
             if (isPaused) return;  // paused while the request was in flight
+            const last = data[data.length - 1];
+            const signature = data.length + '|' + (last ? logKey(last) : '');
+            if (signature === lastSignature || selectingInLog()) return;  // nothing new, or user is selecting
+            lastSignature = signature;
             allLogs = data;
             renderLogs();
         } catch (e) {
@@ -340,7 +360,7 @@
     function formatLog(entry) {
         let time = '';
         if (entry.timestamp) {
-            const date = new Date(entry.timestamp);
+            const date = parseServerTime(entry.timestamp);
             time = date.toLocaleTimeString('en-GB', { hour12: false }) +
                    '.' + String(date.getMilliseconds()).padStart(3, '0');
         }
@@ -356,8 +376,10 @@
         else if (level === 'ERROR') cls = 'log-error';
         else if (level === 'CRITICAL') cls = 'log-critical';
 
-        const msgClass = isLong ? 'log-msg truncated' : 'log-msg';
-        const clickHandler = isLong ? ' onclick="this.classList.toggle(\'truncated\');this.classList.toggle(\'expanded\')"' : '';
+        const key = logKey(entry);
+        const open = expandedKeys.has(key);
+        const msgClass = isLong ? (open ? 'log-msg expanded' : 'log-msg truncated') : 'log-msg';
+        const clickHandler = isLong ? ` data-key="${escapeHtml(key)}" onclick="toggleExpand(this)"` : '';
 
         return `<div class="log-entry ${cls}">
             <span class="log-time" title="${escapeHtml(entry.timestamp || '')}">${escapeHtml(time)}</span>
@@ -365,6 +387,12 @@
             <span class="log-module" title="${escapeHtml(module)}${entry.funcName ? '.' + escapeHtml(entry.funcName) : ''}:${escapeHtml(entry.lineno || '')}">${escapeHtml(module)}</span>
             <span class="${msgClass}"${clickHandler}>${highlightMsg(escapeHtml(rawMsg))}</span>
         </div>`;
+    }
+
+    function toggleExpand(el) {
+        const open = el.classList.toggle('expanded');
+        el.classList.toggle('truncated', !open);
+        if (open) expandedKeys.add(el.dataset.key); else expandedKeys.delete(el.dataset.key);
     }
 
     function highlightMsg(text) {
@@ -420,10 +448,15 @@
 
     async function clearLogs() {
         try {
-            await fetch('/api/debug/clear', { method: 'POST' });
+            const res = await fetch('/api/debug/clear', { method: 'POST' });
+            if (!res.ok) throw new Error('HTTP ' + res.status);
             allLogs = [];
+            lastSignature = '';
             renderLogs();
-        } catch (e) { console.error('Failed to clear logs:', e); }
+        } catch (e) {
+            console.error('Failed to clear logs:', e);
+            showToast('Could not clear the log (' + e.message + ')', 'error');
+        }
     }
 
     // Keyboard shortcut: / to focus search

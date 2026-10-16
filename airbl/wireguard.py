@@ -7,7 +7,7 @@ File naming convention: AirVPN_AT-Vienna_Alderamin_UDP-1637-Entry3.conf
 
 import logging
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 import ipaddress
@@ -469,11 +469,6 @@ def get_unique_countries(configs: list[WireGuardConfig]) -> dict[str, list[WireG
     return by_country
 
 
-def get_unique_subnets(configs: list[WireGuardConfig]) -> set[str]:
-    """Get all unique /24 subnets from configs."""
-    return {c.subnet for c in configs if c.subnet}
-
-
 def get_scannable_configs(
     configs: list[WireGuardConfig],
     us_near_europe_only: Optional[bool] = None,
@@ -488,8 +483,4 @@ def get_scannable_configs(
         us_near_europe_only = _us_filter_enabled()
     return [c for c in configs if c.passes_us_filter(us_near_europe_only)]
 
-
-def get_all_endpoint_ips(configs: list[WireGuardConfig]) -> list[str]:
-    """Get all unique endpoint IPs from configs."""
-    return list(set(c.endpoint_ip for c in configs if c.endpoint_ip))
 

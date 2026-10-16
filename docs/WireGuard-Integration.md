@@ -2,7 +2,7 @@
 
 AirBL can write ready-to-use WireGuard `.conf` files from the latest scan, for routers, other machines or containers.
 
-Set this up in **Settings → WireGuard Profile Generation**. Each profile writes to its own output directory (default `/app/wireguard`, mounted as `docker/wireguard`).
+Set this up in **Settings → WireGuard Profile Generation**. Each profile writes to its own output directory (default `/app/wireguard`, mounted as `docker/wireguard`). The directory must be `/app/wireguard` or a folder inside it; other paths are refused.
 
 ## Modes
 
@@ -28,7 +28,7 @@ Files a profile generated earlier but no longer produces are removed on the next
 - **IP layer exit:** `Both`, `IPv4` or `IPv6`.
   - IPv6 routes (`::/0`) are only added when your address includes IPv6.
   - AirVPN's DNS (10.128.0.1) is always routed through the tunnel.
-  - IPv6 *endpoints* aren't supported; the IPv4 entry is used.
+  - Endpoints are always IPv4: scans only collect IPv4 entry addresses. (An older "IP Protocol" option that offered IPv6 endpoints was removed; it always used IPv4.)
 - **MTU / Keepalive.**
 - **Keys:** the private key comes from the profile (or is pre-filled from your configs).
   - The address and preshared key come from your AirVPN configs, so use a private key from the same AirVPN device.

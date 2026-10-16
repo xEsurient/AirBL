@@ -3,12 +3,11 @@ Configuration management for AirBL.
 """
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
-from pydantic import Field, model_validator, BaseModel, AliasChoices
-from typing import Optional, List, Dict, Any, Set
+from pydantic import Field, field_validator, model_validator, BaseModel, AliasChoices
+from typing import Annotated, Literal, Optional, List, Dict, Any
 from pathlib import Path
 import json
 import logging
-import os
 import shutil
 from datetime import datetime
 
@@ -80,62 +79,68 @@ class Settings(BaseSettings):
 # --- Configuration File Models ---
 
 class RegionConfig(BaseModel):
-    mode: str = "all"  # "all", "none", "manual", "config_only"
+    # (An older "mode" key was never used; files that still have it load fine, extra keys are ignored)
     countries: List[str] = Field(default_factory=list)
     excluded_countries: List[str] = Field(default_factory=list)
     us_near_europe_only: bool = False  # Opt-in: scan only US cities close to Europe
 
+# Bounds below match the settings API, so a bad value in a settings file is dropped
+# (logged, default used) instead of e.g. a 0-minute interval starting a scan every minute
+DayName = Literal["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+
+
 class ScanConfig(BaseModel):
     auto_scan_enabled: bool = True
-    scan_mode: str = "interval"  # "interval" or "schedule"
-    scan_interval_minutes: int = 120
-    scan_schedule_time: str = "20:00"
-    scan_schedule_days: List[str] = Field(default_factory=lambda: ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"])
+    scan_mode: Literal["interval", "schedule"] = "interval"
+    scan_interval_minutes: int = Field(default=120, ge=5, le=1440)
+    scan_schedule_time: str = Field(default="20:00", pattern=r"^([01]\d|2[0-3]):[0-5]\d$")
+    scan_schedule_days: List[DayName] = Field(default_factory=lambda: ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"])
     speedtest_enabled: bool = True
     # Port/Entry discovery: test all combos each scan for N days to find optimal
     port_discovery_enabled: bool = False
-    preferred_port: int = 1637           # Discovered or manually set best port
-    preferred_entry_ip: str = "ENTRY3"    # ENTRY1 | ENTRY3 | AUTO
-    discovery_test_count: int = 3         # Number of tests per combo during discovery
-    speedtest_test_count: Optional[int] = None  # Tests per server for normal speedtests (None = use discovery_test_count, legacy)
-    discovery_duration_days: int = 3      # How many days to run discovery (3, 5, or 7)
-    discovery_entry_filter: str = "ALL"   # ALL | ENTRY1 | ENTRY3
+    preferred_port: int = Field(default=1637, ge=1, le=65535)  # Discovered or manually set best port
+    preferred_entry_ip: Literal["ENTRY1", "ENTRY3", "AUTO"] = "ENTRY3"
+    discovery_test_count: int = Field(default=3, ge=1, le=10)  # Number of tests per combo during discovery
+    speedtest_test_count: Optional[int] = Field(default=None, ge=1, le=10)  # Tests per server for normal speedtests (None = use discovery_test_count, legacy)
+    discovery_duration_days: int = Field(default=3, ge=1, le=30)  # How many days to run discovery (UI: 3, 5 or 7)
+    discovery_entry_filter: Literal["ALL", "ENTRY1", "ENTRY3"] = "ALL"
     discovery_started_at: Optional[str] = None   # ISO timestamp (UTC) when the current discovery period started
     discovery_finished_at: Optional[str] = None  # ISO timestamp (UTC) of the last finalize
     discovery_outcome: Optional[str] = None      # Last finalize result, e.g. "47107/ENTRY3" or "inconclusive: ..."
     discovery_scan_count: int = 0                # Discovery runs so far in this period (server rotation)
     discovery_auto_port: Optional[int] = None    # Best port found by discovery (informational)
     discovery_auto_entry: Optional[str] = None   # Best entry found by discovery (informational)
-    post_server_wait: int = 120           # Seconds to wait after testing a server
+    post_server_wait: int = Field(default=120, ge=0, le=3600)  # Seconds to wait after testing a server
     # Available AirVPN ports (hardcoded, overridable via config)
-    available_ports: List[int] = Field(default_factory=lambda: [1637, 47107, 51820])
+    available_ports: List[Annotated[int, Field(ge=1, le=65535)]] = Field(
+        default_factory=lambda: [1637, 47107, 51820], min_length=1)
     # Generated config directory (internal)
     confgen_dir: str = "/app/confgen"
-    preferred_mtu: int = 1320             # MTU for generated test configs (discovery / non-default port or entry), 1280-1500
+    preferred_mtu: int = Field(default=1320, ge=1280, le=1500)  # MTU for generated test configs (discovery / non-default port or entry), 1280-1500
     # Persisted discovery results: {"PORT_ENTRY": {download_mbps, upload_mbps, ping_ms, tests}}
     discovery_results: Dict[str, Dict] = Field(default_factory=dict)
 
 class SpeedtestBlacklistConfig(BaseModel):
-    duration_days: int = 2
-    max_failures: int = 3
+    duration_days: int = Field(default=2, ge=1, le=365)
+    max_failures: int = Field(default=3, ge=1, le=10)
 
 class PerformanceConfig(BaseModel):
     disabled_servers: List[str] = Field(default_factory=list)
-    threshold_download: float = 50.0
-    threshold_upload: float = 10.0
-    check_count: int = 3
+    threshold_download: float = Field(default=50.0, ge=0)
+    threshold_upload: float = Field(default=10.0, ge=0)
+    check_count: int = Field(default=3, ge=1, le=10)
     # History is now better stored in SQLite, but keeping for backward compatibility in config until migration
     history: Dict[str, List[Dict]] = Field(default_factory=dict)
 
 class ScoringConfig(BaseModel):
     """Scoring and signal bar settings."""
     # Deviation score weights (must sum to 1.0)
-    deviation_download_weight: float = 0.4  # 40% weight for download
-    deviation_upload_weight: float = 0.6    # 60% weight for upload
+    deviation_download_weight: float = Field(default=0.4, ge=0, le=1)  # 40% weight for download
+    deviation_upload_weight: float = Field(default=0.6, ge=0, le=1)    # 60% weight for upload
     
     # Signal bar thresholds (based on score 0-100)
-    signal_good_threshold: int = 80   # Score >= 80 = good (3 bars)
-    signal_medium_threshold: int = 50  # Score >= 50 = medium (2 bars), < 50 = bad (1 bar)
+    signal_good_threshold: int = Field(default=80, ge=1, le=100)   # Score >= 80 = good (3 bars)
+    signal_medium_threshold: int = Field(default=50, ge=1, le=100)  # Score >= 50 = medium (2 bars), < 50 = bad (1 bar)
 
 class GluetunProfileConfig(BaseModel):
     """A distinct output profile for Gluetun custom servers.json generation."""
@@ -188,7 +193,16 @@ class WireGuardProfileConfig(BaseModel):
     enabled: bool = False
     output_dir: str = "/app/wireguard"
     entry_ip: str = "ENTRY3"          # ENTRY1 | ENTRY3
-    ip_protocol: str = "IPv4"         # IPv4 | IPv6
+    # Endpoints are always IPv4: scans only collect IPv4 entry addresses. Older settings
+    # may say "IPv6" (the option silently fell back to IPv4); they load as IPv4.
+    ip_protocol: str = "IPv4"
+
+    @field_validator("ip_protocol", mode="before")
+    @classmethod
+    def _ipv4_only(cls, v):
+        if v != "IPv4":
+            logger.info(f"WireGuard profile ip_protocol {v!r} is not supported; using IPv4")
+        return "IPv4"
     port: int = 1637                  # 1637 | 47107 | 51820
     ip_layer_exit: str = "Both"       # Both | IPv4 | IPv6
     mtu: int = 1320
@@ -235,7 +249,25 @@ class SettingsManager:
         self.base_config_path = settings.config_file or (settings.config_dir / "airbl-config.json")
         self.user_settings_path = settings.cache_dir / "airbl-settings.json"
         self.config = AirBLConfig()
-        
+        # (section, key) -> (override value, saved value): env/CLI values for this run only
+        self._runtime_overrides: Dict = {}
+
+    def set_runtime_override(self, section: str, key: str, value) -> None:
+        """Apply a value for this run only (SCAN_INTERVAL, AUTO_SCAN): save() keeps writing
+        the saved value, unless the user changes the setting in the UI meanwhile."""
+        sec = getattr(self.config, section)
+        saved = self._runtime_overrides.get((section, key), (None, getattr(sec, key)))[1]
+        setattr(sec, key, value)
+        self._runtime_overrides[(section, key)] = (getattr(sec, key), saved)
+
+    def _without_runtime_overrides(self, data: Dict) -> Dict:
+        for (section, key), (value, saved) in list(self._runtime_overrides.items()):
+            if data[section][key] == value:
+                data[section][key] = saved
+            else:
+                del self._runtime_overrides[(section, key)]  # changed in the UI: that value is saved
+        return data
+
     def _load_base(self, quiet: bool = False) -> Dict:
         """Raw base config file contents ({} if missing or unreadable)."""
         if not self.base_config_path.exists():
@@ -264,9 +296,12 @@ class SettingsManager:
             try:
                 with open(self.user_settings_path, 'r') as f:
                     user_data = json.load(f)
+                if not isinstance(user_data, dict):
+                    raise ValueError("top level is not a JSON object")
                 logger.info(f"Loaded user settings from {self.user_settings_path}")
             except Exception as e:
                 logger.error(f"Failed to load user settings: {e}")
+                user_data = {}
                 # Keep the unreadable file: the next save would otherwise replace it
                 self._preserve_copy("unreadable")
         
@@ -374,7 +409,8 @@ class SettingsManager:
         try:
             # Only the diff vs base (file + defaults): a value set back to the base
             # value simply drops out and the base value applies again.
-            config_data = self._diff_model(AirBLConfig, self.config.model_dump(mode='json'), self._base_dump())
+            current = self._without_runtime_overrides(self.config.model_dump(mode='json'))
+            config_data = self._diff_model(AirBLConfig, current, self._base_dump())
             
             # Keep the previous version, then write atomically
             if self.user_settings_path.exists():

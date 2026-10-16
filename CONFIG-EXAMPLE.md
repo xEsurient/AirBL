@@ -15,7 +15,7 @@ This document provides examples of how to configure AirBL using a JSON configura
 - **`countries`**: ISO 2-letter codes to scan. Empty or omitted means all countries that have config files.
 - **`excluded_countries`**: codes never scanned.
 - **`us_near_europe_only`** (default `false`): when `true`, only US cities close to Europe are scanned.
-- `mode`: accepted for compatibility but **not used**. Only the lists above decide. Older examples showed modes like `us_only`/`europe_only`; use `countries` instead.
+- Older files may contain `mode` (e.g. `us_only`/`europe_only`); it is ignored. Use `countries` instead.
 
 ### Servers
 

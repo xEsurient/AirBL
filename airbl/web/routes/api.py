@@ -2,11 +2,16 @@
 API Routes for AirBL Web UI.
 """
 
-from fastapi import APIRouter, BackgroundTasks, Request, WebSocket, HTTPException, Response
+from fastapi import APIRouter, BackgroundTasks, Request, Response
 from fastapi.responses import JSONResponse
-from datetime import datetime
+from datetime import datetime, timedelta
+from typing import Optional
+from pathlib import Path
+from urllib.parse import urlsplit
+import ipaddress
 import logging
 import math
+import os
 import re
 import asyncio
 
@@ -14,7 +19,7 @@ from ..state import state, debug_log_buffer
 from ...config import config_manager
 from ...database import row_is_clean
 from ..tasks import run_scan_task, run_speedtest_task, network_owner
-from ..websockets import websocket_handler, broadcast_update
+from ..websockets import broadcast_update
 from ...airvpn import get_airvpn_status
 from ...wireguard import city_regions_for
 
@@ -42,15 +47,20 @@ async def get_baseline_speedtest():
     return {"baseline": None, "message": "No baseline speedtest available. Run one first."}
 
 @router.get("/metrics")
-async def get_metrics():
-    """Get metrics data for charts."""
+async def get_metrics(hours: Optional[float] = None):
+    """Get metrics data for charts. hours: speedtests of the last N hours (0 = all,
+    capped at 5000) instead of the newest 100, for the Overview's time ranges."""
     scan_hist = state.scan_history[-50:]
     speed_hist = []
     
     if state.db:
         try:
             scan_hist = await state.db.get_scan_history(limit=50)
-            speed_hist = await state.db.get_speedtest_history(limit=100)
+            if hours is None:
+                speed_hist = await state.db.get_speedtest_history(limit=100)
+            else:
+                since = (datetime.now() - timedelta(hours=hours)).isoformat() if hours > 0 else None
+                speed_hist = await state.db.get_speedtest_history_since(since)
         except Exception:
             pass
 
@@ -329,10 +339,10 @@ async def get_status():
         "network_owner": network_owner(),
         "is_paused": state.is_paused,
         "progress": state.scan_progress,
-        "next_scan_at": state.next_scan_at.astimezone().isoformat() if state.next_scan_at else None,
+        "next_scan_at": state.next_scan_iso(),
         "next_scan_in_seconds": (
             (state.next_scan_at - datetime.now()).total_seconds()
-            if state.next_scan_at and state.next_scan_at > datetime.now()
+            if state.next_scan_iso() and state.next_scan_at > datetime.now()
             else None
         ),
         "scan_interval_minutes": state.scan_interval_minutes,
@@ -368,7 +378,7 @@ async def get_servers(
     country: str = None,
     status: str = None,  # "clean", "blocked", "all"
     min_score: float = None,
-    max_load: int = None,
+    max_load: float = None,  # the filter field allows decimals; int made "50.5" a 422
     max_ping: float = None,
     min_dev: float = None,
     min_download: float = None,
@@ -407,7 +417,7 @@ async def get_servers(
                 continue
             
             # Load filter
-            if max_load is not None and s.load_percent > max_load:
+            if max_load is not None and (not s.load_known or s.load_percent > max_load):
                 continue
             
             # Ping filter
@@ -507,23 +517,32 @@ async def test_gluetun_connection(request: Request):
         data = None
     if not isinstance(data, dict):
         return JSONResponse({"ok": False, "error": "Expected a JSON object"}, status_code=400)
-    cfg = config_manager.config.gluetun.model_copy()
-    if data.get("host"):
-        cfg.control_server_host = str(data["host"]).strip()
-    if data.get("port") not in (None, ""):
-        try:
+    saved = config_manager.config.gluetun
+    cfg = saved.model_copy()
+    try:
+        if data.get("host"):
+            cfg.control_server_host = _control_host(data["host"])
+        if data.get("port") not in (None, ""):
             port = _as_int(data, "port", -1, 65536)
-        except _BadSetting as e:
-            return JSONResponse({"ok": False, "error": str(e)}, status_code=400)
-        if not 1 <= port <= 65535:
-            return JSONResponse({"ok": False, "error": "port: must be 1-65535"}, status_code=400)
-        cfg.control_server_port = port
+            if not 1 <= port <= 65535:
+                raise _BadSetting("port: must be 1-65535")
+            cfg.control_server_port = port
+    except _BadSetting as e:
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=400)
     if data.get("api_key"):
         cfg.api_key = str(data["api_key"]).strip()
+    elif (cfg.control_server_host, cfg.control_server_port) != (saved.control_server_host, saved.control_server_port):
+        # Never send the saved key to an address it wasn't saved for
+        cfg.api_key = ""
+        key_withheld = bool(saved.api_key)
+    else:
+        key_withheld = False
 
     from ...gluetun import get_gluetun_status
     status = await get_gluetun_status(cfg)
     status["ok"] = status["error"] is None
+    if status["error"] and key_withheld:
+        status["error"] += " (The saved API key is only sent to the saved address: enter it to test a new one.)"
     return status
 
 
@@ -563,7 +582,7 @@ async def get_settings():
            for server in status.servers:
                 code = server.country_code.upper()
                 state.all_countries[code] = server.country_name
-        except:
+        except Exception:
              pass
 
     cfg = config_manager.config
@@ -711,6 +730,70 @@ def _as_str_list(data: dict, key: str, allow_none: bool = False) -> list[str]:
     return [str(x).strip() for x in v if str(x).strip()]
 
 
+# Profile outputs may only go to the folders compose mounts for them. The UI has no login,
+# so an unchecked path would let any LAN client overwrite files in the container.
+GLUETUN_OUTPUT_ROOT = Path("/app/gluetun")
+WG_OUTPUT_ROOT = Path("/app/wireguard")
+_HOSTNAME_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9.-]{0,251}[A-Za-z0-9])?$")
+
+
+class _BadPath(_BadSetting):
+    """An output path outside its mount: always a 400, never "invalid profile, previous kept"."""
+
+
+def _profile_path(value, root: Path, key: str, owner: str, allow_root: bool = False) -> str:
+    """Absolute path inside root (".." resolved without touching the filesystem)."""
+    raw = str(value or "").strip()
+    p = Path(os.path.normpath(raw)) if raw else None
+    if not p or not p.is_absolute() or not (root in p.parents or (allow_root and p == root)):
+        raise _BadPath(f"{owner}: {key} must be inside {root}/ (the folder mounted for it)")
+    return str(p)
+
+
+def _control_host(value) -> str:
+    """Gluetun control host: hostname, IP, or an http(s):// base URL without path or credentials."""
+    s = str(value or "").strip() or "127.0.0.1"
+    if "://" in s:
+        u = urlsplit(s)
+        if (u.scheme not in ("http", "https") or not u.hostname or u.username or u.password
+                or u.path not in ("", "/") or u.query or u.fragment):
+            raise _BadSetting("gluetun_control_host: use a host name, an IP, or http(s)://host[:port]")
+        return s.rstrip("/")
+    try:
+        ipaddress.ip_address(s.strip("[]"))
+        return s
+    except ValueError:
+        pass
+    if not _HOSTNAME_RE.match(s):
+        raise _BadSetting("gluetun_control_host: use a host name, an IP, or http(s)://host[:port]")
+    return s
+
+
+def _wg_profile(wp: dict) -> dict:
+    """Validate the fields of one submitted WireGuard profile (others pass to the model)."""
+    out = dict(wp)
+    name = str(wp.get("name", "")) or "profile"
+    if "output_dir" in wp:
+        out["output_dir"] = _profile_path(wp["output_dir"], WG_OUTPUT_ROOT, "output_dir",
+                                          f"WireGuard profile '{name}'", allow_root=True)
+    try:
+        for key, choices in (("entry_ip", ("ENTRY1", "ENTRY3", "AUTO")), ("ip_protocol", ("IPv4", "IPv6")),
+                             ("ip_layer_exit", ("Both", "IPv4", "IPv6")),
+                             ("mode", ("clean", "custom", "fastest", "fastest_clean", "countries",
+                                       "cities", "use_speedtest"))):
+            if key in wp:
+                out[key] = _as_choice(wp, key, choices)
+        for key, lo, hi in (("port", 1, 65535), ("mtu", 1280, 1500), ("keepalive", 0, 3600)):
+            if key in wp:
+                out[key] = _as_int(wp, key, lo, hi)
+        for key in ("enabled", "auto_update_wg0"):
+            if key in wp:
+                out[key] = _as_bool(wp, key)
+    except _BadSetting as e:
+        raise _BadSetting(f"WireGuard profile '{name}': {e}")
+    return out
+
+
 def _parse_settings(data: dict, cfg) -> tuple[dict, list[str]]:
     """Validate and convert every submitted setting without touching cfg.
 
@@ -739,6 +822,10 @@ def _parse_settings(data: dict, cfg) -> tuple[dict, list[str]]:
             raise _BadSetting(f"scan_schedule_days: unknown day(s) {', '.join(bad)}")
         wanted = {by_lower[d.lower()] for d in days}
         p["scan_schedule_days"] = [d for d in _DAY_NAMES if d in wanted]
+    # The scheduler treats "no days" as every day, which is not what an empty choice means
+    if (p.get("scan_mode", cfg.scan.scan_mode) == "schedule"
+            and not p.get("scan_schedule_days", cfg.scan.scan_schedule_days)):
+        raise _BadSetting("scan_schedule_days: pick at least one day for scheduled scans")
     for key in ("auto_scan_enabled", "speedtest_enabled", "port_discovery_enabled", "gluetun_force_update"):
         if key in data:
             p[key] = _as_bool(data, key)
@@ -807,7 +894,7 @@ def _parse_settings(data: dict, cfg) -> tuple[dict, list[str]]:
         p["gluetun_force_update_mode"] = _as_choice(data, "gluetun_force_update_mode",
                                                     ("CLEAN_ONLY", "NOT_TOP4", "NOT_BEST", "ALWAYS", "DISABLED"))
     if "gluetun_control_host" in data:
-        p["gluetun_control_host"] = str(data["gluetun_control_host"] or "").strip() or "127.0.0.1"
+        p["gluetun_control_host"] = _control_host(data["gluetun_control_host"])
     if "gluetun_control_port" in data:
         p["gluetun_control_port"] = _as_int(data, "gluetun_control_port", 1, 65535)
     if data.get("gluetun_api_key_clear"):
@@ -830,17 +917,25 @@ def _parse_settings(data: dict, cfg) -> tuple[dict, list[str]]:
                 try:
                     if not isinstance(p_data, dict):
                         raise ValueError("profile is not an object")
+                    name = str(p_data.get("name", "Custom Profile"))
+                    output_path = _profile_path(p_data.get("output_path", "/app/gluetun/servers.json"),
+                                                GLUETUN_OUTPUT_ROOT, "output_path", f"Gluetun profile '{name}'")
+                    vals = {"enabled": False, "require_clean": True, "min_download_mbps": 0,
+                            "min_upload_mbps": 0, "endpoint_strategy": "ALL", **p_data}
                     profiles.append(GluetunProfileConfig(
-                        name=str(p_data.get("name", "Custom Profile")),
-                        enabled=bool(p_data.get("enabled", False)),
-                        output_path=str(p_data.get("output_path", "/app/gluetun/servers.json")),
-                        endpoint_strategy=str(p_data.get("endpoint_strategy", "ALL")),
-                        min_download_mbps=float(p_data.get("min_download_mbps", 0)),
-                        min_upload_mbps=float(p_data.get("min_upload_mbps", 0)),
-                        require_clean=bool(p_data.get("require_clean", True)),
+                        name=name,
+                        enabled=_as_bool(vals, "enabled"),
+                        output_path=output_path,
+                        endpoint_strategy=_as_choice(vals, "endpoint_strategy",
+                                                     ("ALL", "ENTRY1", "ENTRY3", "PING_PRIORITY")),
+                        min_download_mbps=_as_float(vals, "min_download_mbps", 0, 100000),
+                        min_upload_mbps=_as_float(vals, "min_upload_mbps", 0, 100000),
+                        require_clean=_as_bool(vals, "require_clean"),
                         allowed_countries=p_data.get("allowed_countries", []),
                         allowed_cities=p_data.get("allowed_cities", [])
                     ))
+                except _BadPath:
+                    raise  # where files get written: a clear 400, not "previous kept"
                 except Exception as e:
                     invalid += 1
                     logger.warning(f"Invalid Gluetun profile in save: {e}")
@@ -860,7 +955,9 @@ def _parse_settings(data: dict, cfg) -> tuple[dict, list[str]]:
                 try:
                     if not isinstance(wp, dict):
                         raise ValueError("profile is not an object")
-                    profiles.append(WireGuardProfileConfig(**wp))
+                    profiles.append(WireGuardProfileConfig(**_wg_profile(wp)))
+                except _BadPath:
+                    raise
                 except Exception as e:
                     invalid += 1
                     logger.warning(f"Invalid WG profile in save: {e}")
@@ -871,6 +968,36 @@ def _parse_settings(data: dict, cfg) -> tuple[dict, list[str]]:
             p["wg_profiles"] = profiles
 
     return p, warnings
+
+
+def _schedule_fields(scan) -> tuple:
+    return (scan.scan_mode, scan.scan_interval_minutes, scan.scan_schedule_time,
+            tuple(scan.scan_schedule_days or ()), scan.auto_scan_enabled)
+
+
+def _drop_performance_history(names_lower: set) -> None:
+    """Forget the speed-check history of these servers (case-insensitive), in memory and config."""
+    if not names_lower:
+        return
+    for history in (state.server_performance_history, config_manager.config.performance.history):
+        for name in [n for n in history if n.lower() in names_lower]:
+            del history[name]
+
+
+_background_tasks: set = set()
+
+
+def _run_in_background(coro, what: str) -> None:
+    """create_task with a kept reference (else it can be garbage-collected) and logged errors."""
+    task = asyncio.create_task(coro)
+    _background_tasks.add(task)
+
+    def _done(t):
+        _background_tasks.discard(t)
+        if not t.cancelled() and t.exception():
+            logger.error(f"{what} failed: {t.exception()}")
+
+    task.add_done_callback(_done)
 
 
 @router.post("/settings")
@@ -888,8 +1015,14 @@ async def update_settings(request: Request):
         p, warnings = _parse_settings(data, cfg)
     except _BadSetting as e:
         return JSONResponse({"error": str(e)}, status_code=400)
+    if p.get("port_discovery_enabled") and not cfg.scan.port_discovery_enabled and state.is_scanning:
+        # A reset would swap the results dict under the running discovery phase
+        return JSONResponse({"error": "Can't start port discovery while a scan is running. "
+                                      "Try again when it finishes."}, status_code=409)
 
     # --- Apply (no failures past this point) ---
+    schedule_before = _schedule_fields(cfg.scan)
+    disabled_before = {s.lower() for s in cfg.performance.disabled_servers}
     if "scan_interval_minutes" in p:
         cfg.scan.scan_interval_minutes = p["scan_interval_minutes"]
     if "scan_mode" in p:
@@ -967,6 +1100,9 @@ async def update_settings(request: Request):
     # Manual replacement of the disabled list (prefer POST /servers/{name}/enable to unblock one)
     if "disabled_servers" in p:
         cfg.performance.disabled_servers = p["disabled_servers"]
+    # Servers taken off the list start over: their old below-threshold history would
+    # otherwise make every speedtest skip them, so they could never recover
+    _drop_performance_history(disabled_before - {s.lower() for s in cfg.performance.disabled_servers})
 
     # Scoring Settings (the two weights always sum to 1.0)
     if "deviation_download_weight" in p:
@@ -1010,17 +1146,18 @@ async def update_settings(request: Request):
     if config_manager.save():
         logger.info("Settings updated and saved successfully.")
         
-        # Signal the auto-scan loop to recalculate its sleep timer
-        if state.settings_updated_event:
+        # Recalculate the next scan only when the schedule changed; otherwise every save
+        # (a Gluetun profile edit, say) would push an interval scan back a full interval
+        if state.settings_updated_event and _schedule_fields(cfg.scan) != schedule_before:
             state.settings_updated_event.set()
-        
+
         # Trigger generation asynchronously if Gluetun config changed
         if gluetun_changed:
             has_enabled = any(prof.enabled for prof in cfg.gluetun.profiles)
             control_on = cfg.gluetun.force_update_enabled and cfg.gluetun.force_update_mode != "DISABLED"
             if has_enabled or control_on:
                 from ...gluetun import generate_gluetun_servers_json
-                asyncio.create_task(generate_gluetun_servers_json())
+                _run_in_background(generate_gluetun_servers_json(), "Gluetun output generation")
     else:
         logger.error("Failed to save settings.")
         return JSONResponse({"error": "Failed to persist settings"}, status_code=500)
@@ -1042,9 +1179,7 @@ async def enable_server(server_name: str):
     target = server_name.strip().lower()
     perf.disabled_servers = [s for s in perf.disabled_servers if s.lower() != target]
     # Drop its performance history too, or the next speedtest re-disables it on the old numbers
-    for history in (state.server_performance_history, perf.history):
-        for name in [n for n in history if n.lower() == target]:
-            del history[name]
+    _drop_performance_history({target})
     if not config_manager.save():
         return JSONResponse({"error": "Failed to persist settings"}, status_code=500)
     logger.info(f"Server re-enabled: {server_name}")
@@ -1173,20 +1308,8 @@ async def get_debug_logs():
     return list(debug_log_buffer)
 
 
-@router.post("/debug/pause")
-async def pause_debug_logs():
-    """Kept for old pages: pausing is per tab, so the debug page does it client-side."""
-    return {"paused": False, "note": "pause is client-side"}
-
-
 @router.post("/debug/clear")
 async def clear_debug_logs():
     """Clear debug logs."""
     debug_log_buffer.clear()
     return {"status": "Logs cleared"}
-
-# --- WebSocket ---
-
-@router.websocket("/ws")
-async def ws_endpoint(websocket: WebSocket):
-    await websocket_handler(websocket)

@@ -7,7 +7,7 @@ name = "airbl"
 version = "1.0.0"
 description = "AirVPN DroneBL Checker - Scan VPN servers against DroneBL blocklist"
 readme = "README.md"
-# LICENSE is the GPLv3 text and the README says GPL v3.0 with no "or later" grant
+# Decided 2026-10-16: GPL-3.0-only (LICENSE is the plain GPLv3 text, no "or later" grant)
 license = {text = "GPL-3.0-only"}
 requires-python = ">=3.10"
 authors = [
@@ -61,8 +61,10 @@ dev = [
 airbl = "airbl.cli:main"
 
 [project.urls]
-Homepage = "https://github.com/airbl/airbl"
-Repository = "https://github.com/airbl/airbl"
+Homepage = "https://github.com/xesurient/AirBL"
+Repository = "https://github.com/xesurient/AirBL"
+Documentation = "https://github.com/xesurient/AirBL/tree/main/docs"
+Issues = "https://github.com/xesurient/AirBL/issues"
 
 [tool.setuptools.packages.find]
 where = ["."]

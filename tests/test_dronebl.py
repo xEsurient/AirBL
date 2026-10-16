@@ -146,3 +146,39 @@ async def test_batch_no_retry_on_success(resolver):
                                     progress_callback=lambda a, b: progress.append((a, b)))
     assert [r.listing_code for r in res] == [3, 3] and len(calls) == 2
     assert progress[-1] == (2, 2)
+
+
+async def test_resolver_that_blocks_dronebl_makes_results_unverified(resolver, monkeypatch):
+    # A Pi-hole/NextDNS-style resolver answers NXDOMAIN for every dronebl.org name, including the
+    # test entry 127.0.0.2: "not listed" can't be trusted then
+    monkeypatch.setattr(dronebl, "_canary_checked_at", None)
+    resolver.behaviour = dns.resolver.NXDOMAIN()
+    results = await dronebl.check_dronebl_batch(["1.2.3.4", "5.6.7.8"])
+    assert all(not r.is_verified and "127.0.0.2" in r.error for r in results)
+    queried = [q for inst in resolver.instances for q, _ in inst.queries]
+    assert "2.0.0.127.dnsbl.dronebl.org" in queried
+
+
+async def test_working_resolver_keeps_clean_results(resolver, monkeypatch):
+    monkeypatch.setattr(dronebl, "_canary_checked_at", None)
+
+    def answer():
+        q = resolver.instances[-1].queries[-1][0]
+        return ["127.0.0.2"] if q.startswith("2.0.0.127.") else dns.resolver.NXDOMAIN()
+
+    resolver.behaviour = answer
+    results = await dronebl.check_dronebl_batch(["1.2.3.4"])
+    assert results[0].is_verified and not results[0].is_listed
+    assert await dronebl.dnsbl_resolver_error() is None  # cached, no second lookup needed
+
+
+async def test_listing_stays_listed_even_if_resolver_check_fails(resolver, monkeypatch):
+    monkeypatch.setattr(dronebl, "_canary_checked_at", None)
+
+    def answer():
+        q = resolver.instances[-1].queries[-1][0]
+        return dns.exception.Timeout() if q.startswith("2.0.0.127.") else ["127.0.0.19"]
+
+    resolver.behaviour = answer
+    (r,) = await dronebl.check_dronebl_batch(["1.2.3.4"])
+    assert r.is_listed and r.is_verified  # a positive answer is still trustworthy

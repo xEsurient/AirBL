@@ -40,7 +40,8 @@ gp[0].update(name="G" + P, output_path="/app/gluetun/" + P + ".json", allowed_ci
 wg = cur.get("wg_profiles") or [{}]
 wg[0].update(name="W" + P, output_dir="/app/wireguard/" + P, enabled=False)
 saved = api("/api/settings", {"gluetun_profiles": gp, "wg_profiles": wg})
-check("hostile profiles accepted by the API", saved.get("status"), str(saved)[:120])
+# Warnings mean "invalid, previous profiles kept": then nothing hostile was stored to test
+check("hostile profiles accepted by the API", saved.get("status") and not saved.get("warnings"), str(saved)[:120])
 
 HOSTILE_SERVER = {
     "server_name": "S" + P, "country_code": "CH", "country_name": "C" + P, "location": "L" + P,

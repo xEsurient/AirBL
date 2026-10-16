@@ -267,3 +267,25 @@ def test_ookla_error_falls_back_to_raw_stdout():
     from airbl.speedtest import _ookla_error
     msg = _ookla_error(b'{"type":"result","error":"Cannot open socket"}\n', b"")
     assert "Cannot open socket" in msg
+
+
+async def test_run_speedtest_with_extra_log_lines(fake_exec):
+    # A successful run can print {"type":"log"} lines too; json.loads(all) threw them away
+    queue, _ = fake_exec
+    log = {"type": "log", "level": "warning", "message": "Server selection took long"}
+    data = {"type": "result", "ping": {"latency": 12.5}, "download": {"bandwidth": 12_500_000},
+            "upload": {"bandwidth": 2_500_000}, "server": {"id": 1, "name": "X", "location": "Y", "country": "Estonia"}}
+    queue.append(FakeProc(out=(json.dumps(log) + "\n" + json.dumps(data) + "\n").encode()))
+    r = await run_speedtest(server_id=1)
+    assert r.is_success and r.download_mbps == pytest.approx(100.0)
+
+
+async def test_zero_upload_is_a_partial_failure(fake_exec):
+    # Averaged in, a 0 upload could auto-disable a working server
+    queue, _ = fake_exec
+    data = {"type": "result", "ping": {"latency": 12.5}, "download": {"bandwidth": 12_500_000},
+            "upload": {"bandwidth": 0}, "server": {"id": 1, "name": "X", "location": "Y", "country": "Estonia"}}
+    queue.append(FakeProc(out=json.dumps(data).encode()))
+    r = await run_speedtest(server_id=1)
+    assert not r.is_success and "Upload test failed" in r.error
+    assert not SpeedTestResult(100, 0, 5).is_success

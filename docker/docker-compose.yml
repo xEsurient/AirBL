@@ -21,23 +21,12 @@ services:
     # network_mode: host
     
     # Expose web server port
+    # Set PORT in docker/.env to move the dashboard (default 5665)
     ports:
-      - "5665:5665"
-    
-    # Optional: Mount custom config file for pre-container configuration
-    # This allows you to configure scan regions, servers, and cities before starting the container
-    # Example config file format (airbl-config.json):
-    # {
-    #   "regions": {
-    #     "mode": "manual",  # Options: "all", "none", "config_only", "us_only", "asia_only", "europe_only", "manual"
-    #     "countries": ["DE", "GB", "US"]  # Required if mode is "manual"
-    #   },
-    #   "servers": ["Norma", "Segin"],  # Optional: specific server names
-    #   "cities": {  # Optional: filter by cities within countries
-    #     "GB": ["London"],
-    #     "DE": ["Frankfurt"]
-    #   }
-    # }
+      - "${PORT:-5665}:${PORT:-5665}"
+
+    # Optional: put airbl-config.json in conf/ to preset scan regions, servers and
+    # cities before the first start. Format and options: CONFIG-EXAMPLE.md
     volumes:
       # Mount your WireGuard configs and airbl-config.json
       # Place airbl-config.json in the conf/ directory alongside your .conf files
@@ -58,7 +47,7 @@ services:
       # - SCAN_INTERVAL=120
       
       # Web server port
-      - PORT=5665
+      - PORT=${PORT:-5665}
       
       # Time zone for scan schedules (e.g. "05:00") and log/history timestamps.
       # Set your zone in docker/.env (TZ=Europe/London) or here; default UTC.
@@ -118,16 +107,19 @@ services:
       - ./wireguard:/app/wireguard
     
     environment:
-      - SCAN_INTERVAL=0
       - TZ=${TZ:-UTC}
       # Cache directory (where database and cache files are stored)
       - AIRBL_CACHE_DIR=/app/data
-    
+
     # This container only runs speedtests on demand
     command: ["shell"]
     stdin_open: true
     tty: true
-    
+
+    # No web server runs here, so the image's dashboard healthcheck would always fail
+    healthcheck:
+      disable: true
+
     profiles:
       - vpn-testing
 

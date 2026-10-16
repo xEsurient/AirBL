@@ -319,11 +319,118 @@ def test_gluetun_test_uses_form_values(client, monkeypatch, fresh_config):
         return {"connected": True, "error": None}
 
     monkeypatch.setattr(gl, "get_gluetun_status", fake_status)
-    r = client.post("/api/gluetun/test", json={"host": "gluetun", "port": "8001", "api_key": ""})
+    r = client.post("/api/gluetun/test", json={"host": "gluetun", "port": "8001", "api_key": "typed"})
     assert r.status_code == 200 and r.json()["ok"] is True
-    assert seen == {"host": "gluetun", "port": 8001, "key": "saved"}
+    assert seen == {"host": "gluetun", "port": 8001, "key": "typed"}
     assert config_manager.config.gluetun.control_server_port == 8000  # not saved
+    # Empty key: the saved one is used for the saved address only
+    client.post("/api/gluetun/test", json={"api_key": ""})
+    assert seen["key"] == "saved"
     assert client.post("/api/gluetun/test", json=[1]).status_code == 400
+
+
+def test_gluetun_test_never_sends_saved_key_elsewhere(client, monkeypatch, fresh_config):
+    import airbl.gluetun as gl
+    fresh_config.gluetun.api_key = "saved"
+    seen = []
+
+    async def fake_status(cfg):
+        seen.append(cfg.api_key)
+        return {"connected": False, "error": "Gluetun rejected the API key (401)."}
+
+    monkeypatch.setattr(gl, "get_gluetun_status", fake_status)
+    for body in ({"host": "attacker.example"}, {"port": 9999}, {"host": "http://10.0.0.9:8000"}):
+        r = client.post("/api/gluetun/test", json=body)
+        assert "only sent to the saved address" in r.json()["error"]
+    assert seen == ["", "", ""]
+
+
+@pytest.mark.parametrize("host", ["http://user:pw@evil", "ftp://gluetun", "http://gluetun/v1/x",
+                                  "gluetun/../x", "a b", "evil@host"])
+def test_gluetun_control_host_rejected(client, monkeypatch, host):
+    import airbl.gluetun as gl
+
+    async def boom(cfg):
+        raise AssertionError("must not contact Gluetun")
+
+    monkeypatch.setattr(gl, "get_gluetun_status", boom)
+    assert client.post("/api/gluetun/test", json={"host": host}).status_code == 400
+    assert post_settings(client, {"gluetun_control_host": host}).status_code == 400
+
+
+@pytest.mark.parametrize("host", ["192.168.1.20", "gluetun", "fd00::5", "[fd00::5]", "http://gluetun:8000/"])
+def test_gluetun_control_host_accepted(client, host):
+    assert post_settings(client, {"gluetun_control_host": host}).status_code == 200
+
+
+@pytest.mark.parametrize("path", ["/app/data/airbl-settings.json", "/app/gluetun/../data/x.json",
+                                  "servers.json", "/app/gluetun", "/etc/passwd"])
+def test_gluetun_profile_path_outside_mount_rejected(client, fresh_config, path):
+    before = [p.model_dump() for p in fresh_config.gluetun.profiles]
+    r = post_settings(client, {"gluetun_profiles": [{"name": "X", "output_path": path}]})
+    assert r.status_code == 400 and "/app/gluetun" in r.json()["error"] and "'X'" in r.json()["error"]
+    assert [p.model_dump() for p in config_manager.config.gluetun.profiles] == before
+
+
+def test_gluetun_profile_bools_parsed(client):
+    r = post_settings(client, {"gluetun_profiles": [
+        {"name": "A", "enabled": "false", "require_clean": "false", "output_path": "/app/gluetun/servers/airvpn.json"}]})
+    assert r.status_code == 200
+    (p,) = config_manager.config.gluetun.profiles
+    assert p.enabled is False and p.require_clean is False  # bool("false") was True
+    r = post_settings(client, {"gluetun_profiles": [{"name": "B", "min_download_mbps": "nan"}]})
+    assert r.status_code == 200 and len(r.json()["warnings"]) == 1  # NaN: invalid, previous kept
+    assert [p.name for p in config_manager.config.gluetun.profiles] == ["A"]
+
+
+@pytest.mark.parametrize("field", [{"output_dir": "/app/data"}, {"output_dir": "/app/wireguard/../conf"},
+                                   {"output_dir": "wireguard"}])
+def test_wg_profile_dir_outside_mount_rejected(client, fresh_config, field):
+    before = [p.model_dump() for p in fresh_config.wireguard.profiles]
+    r = post_settings(client, {"wg_profiles": [{"name": "W", **field}]})
+    assert r.status_code == 400 and "'W'" in r.json()["error"] and "/app/wireguard" in r.json()["error"]
+    assert [p.model_dump() for p in config_manager.config.wireguard.profiles] == before
+
+
+@pytest.mark.parametrize("field", [{"mode": "everything"}, {"entry_ip": "ENTRY2"}, {"ip_protocol": "IPX"},
+                                   {"ip_layer_exit": "v5"}, {"enabled": "maybe"}])
+def test_wg_profile_bad_values_warn_and_keep_previous(client, fresh_config, field):
+    before = [p.model_dump() for p in fresh_config.wireguard.profiles]
+    r = post_settings(client, {"wg_profiles": [{"name": "W", **field}]})
+    assert r.status_code == 200 and len(r.json()["warnings"]) == 1
+    assert [p.model_dump() for p in config_manager.config.wireguard.profiles] == before
+
+
+def test_wg_profile_numbers_clamped_and_subdir_ok(client):
+    r = post_settings(client, {"wg_profiles": [{"name": "W", "output_dir": "/app/wireguard/home",
+                                                "mtu": 9000, "keepalive": -1, "port": 70000}]})
+    assert r.status_code == 200
+    (p,) = config_manager.config.wireguard.profiles
+    assert (p.output_dir, p.mtu, p.keepalive, p.port) == ("/app/wireguard/home", 1500, 0, 65535)
+
+
+# --- Cross-site writes ---------------------------------------------------------------
+
+def test_cross_site_post_blocked(client, fresh_config):
+    r = client.post("/api/settings", json={"scan_interval_minutes": 30},
+                    headers={"Origin": "http://evil.example"})
+    assert r.status_code == 403
+    assert config_manager.config.scan.scan_interval_minutes == 120
+    # Form-style request without a JSON body, opaque origin
+    assert client.post("/api/scan/stop", headers={"Origin": "null"}).status_code == 403
+
+
+def test_same_origin_and_scripted_posts_allowed(client, monkeypatch):
+    ok = {"scan_interval_minutes": 30}
+    assert client.post("/api/settings", json=ok, headers={"Origin": "http://testserver"}).status_code == 200
+    assert client.post("/api/settings", json=ok).status_code == 200  # curl/scripts: no Origin
+    # Behind a reverse proxy that rewrites Host
+    r = client.post("/api/settings", json=ok, headers={"Origin": "https://airbl.home", "X-Forwarded-Host": "airbl.home"})
+    assert r.status_code == 200
+    monkeypatch.setenv("AIRBL_ALLOWED_ORIGINS", "https://dash.example")
+    assert client.post("/api/settings", json=ok, headers={"Origin": "https://dash.example"}).status_code == 200
+    # Reads are never blocked
+    assert client.get("/api/status", headers={"Origin": "http://evil.example"}).status_code == 200
 
 
 def test_gluetun_check_endpoint(client, monkeypatch):
@@ -338,13 +445,6 @@ def test_gluetun_check_endpoint(client, monkeypatch):
     for path in ("/api/gluetun/check", "/api/gluetun/apply"):
         assert client.post(path).json()["current"] == "Fuyue"
     assert seen == [True, True]
-
-
-def test_debug_pause_is_noop(client):
-    for _ in range(2):
-        r = client.post("/api/debug/pause")
-        assert r.status_code == 200
-        assert r.json()["paused"] is False
 
 
 def test_status_network_owner(client, monkeypatch):
@@ -571,3 +671,69 @@ def test_baseline_survives_restart(fresh_config):
     state._load_baseline()
     assert state.baseline_speedtest == baseline
     (settings.cache_dir / "baseline.json").unlink()
+
+
+# --- Settings side effects ---------------------------------------------------------
+
+def test_unblocking_in_settings_drops_history(client, fresh_config):
+    # Old below-threshold history made _should_skip_server skip the server forever
+    fresh_config.performance.disabled_servers = ["Hamal", "Cujam", "Achernar"]
+    bad = [{"download": 5, "upload": 5}] * 3
+    state.server_performance_history = {"Hamal": list(bad), "Cujam": list(bad), "Achernar": list(bad)}
+    fresh_config.performance.history = {"Hamal": list(bad)}
+    assert post_settings(client, {"disabled_servers": ["Cujam", "Achernar"]}).status_code == 200
+    assert "Hamal" not in state.server_performance_history and "Hamal" not in fresh_config.performance.history
+    assert tasks._should_skip_server("Hamal") is False
+    # Enabling via enabled_servers takes it off the list too
+    assert post_settings(client, {"enabled_servers": ["cujam"]}).status_code == 200
+    assert "Cujam" not in state.server_performance_history
+    assert "Achernar" in state.server_performance_history  # still disabled: kept
+
+
+def test_only_schedule_changes_reschedule(client, monkeypatch):
+    import asyncio
+    event = asyncio.Event()
+    monkeypatch.setattr(state, "settings_updated_event", event)
+    assert post_settings(client, {"performance_threshold_download": 99}).status_code == 200
+    assert not event.is_set()  # a Gluetun/threshold edit no longer pushes the next scan back
+    assert post_settings(client, {"scan_interval_minutes": 60}).status_code == 200
+    assert event.is_set()
+
+
+def test_discovery_cannot_restart_during_scan(client, fresh_config):
+    fresh_config.scan.port_discovery_enabled = False
+    state.is_scanning = True
+    try:
+        r = post_settings(client, {"port_discovery_enabled": True})
+        assert r.status_code == 409 and fresh_config.scan.port_discovery_enabled is False
+        # Turning it off, or other settings, still work during a scan
+        assert post_settings(client, {"port_discovery_enabled": False}).status_code == 200
+    finally:
+        state.is_scanning = False
+
+
+def test_schedule_mode_needs_a_day(client, fresh_config):
+    # The scheduler treats an empty list as "every day"
+    r = post_settings(client, {"scan_mode": "schedule", "scan_schedule_days": []})
+    assert r.status_code == 400 and "at least one day" in r.json()["error"]
+    assert fresh_config.scan.scan_mode == "interval"
+    # In interval mode the day list doesn't matter
+    assert post_settings(client, {"scan_mode": "interval", "scan_schedule_days": []}).status_code == 200
+
+
+def test_servers_max_load_accepts_decimals(client):
+    assert client.get("/api/servers?max_load=50.5").status_code == 200
+
+
+def test_default_profiles_round_trip_unchanged(client, fresh_config):
+    # What the settings page loads must save back as-is (a missing choice such as
+    # PING_PRIORITY made every save drop back to "previous profiles kept")
+    from airbl.config import AirBLConfig
+    defaults = AirBLConfig()
+    fresh_config.gluetun.profiles = defaults.gluetun.profiles
+    fresh_config.wireguard.profiles = defaults.wireguard.profiles
+    cur = client.get("/api/settings").json()
+    r = post_settings(client, {"gluetun_profiles": cur["gluetun_profiles"], "wg_profiles": cur["wg_profiles"]})
+    assert r.status_code == 200 and r.json()["warnings"] == []
+    assert client.get("/api/settings").json()["gluetun_profiles"] == cur["gluetun_profiles"]
+    assert client.get("/api/settings").json()["wg_profiles"] == cur["wg_profiles"]

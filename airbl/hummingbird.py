@@ -13,6 +13,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 import re
+import tempfile
 
 
 @dataclass
@@ -196,9 +197,12 @@ class WireGuardController:
                 logger.info(f"{config_file.name} has split AllowedIPs ({wg_conf.allowed_ips}); "
                             "testing uses a full IPv4 tunnel instead")
             
-            # Write stripped config to temp file
-            temp_conf_path = Path(f"/tmp/{interface_name}_stripped.conf")
-            temp_conf_path.write_text("\n".join(stripped_conf))
+            # Write stripped config to a private temp file (it holds the private key):
+            # mkstemp creates it 0600 with an unpredictable name
+            fd, temp_name = tempfile.mkstemp(prefix=f"{interface_name}_", suffix=".conf")
+            with os.fdopen(fd, "w") as f:
+                f.write("\n".join(stripped_conf))
+            temp_conf_path = Path(temp_name)
             self._temp_config_path = temp_conf_path
             
             try:
@@ -444,8 +448,15 @@ class WireGuardController:
             async with httpx.AsyncClient(timeout=10) as client:
                 resp = await client.get("https://airvpn.org/api/whatismyip/")
                 data = resp.json()
-            if data.get("airvpn") is True:
+            if data.get("airvpn") is True and data.get("ip"):
                 return data.get("ip")
+            if data.get("airvpn") is True:
+                # Confirmed AirVPN but no IP in the reply: get it elsewhere (the speedtest's
+                # leak check compares against it, and None would skip that check)
+                ip = await get_public_ip(timeout=10)
+                if ip:
+                    return ip
+                raise RuntimeError("Tunnel is up but no internet access through it")
             if data.get("airvpn") is False:
                 raise RuntimeError(f"Traffic is not leaving via AirVPN (egress {data.get('ip')}); refusing to measure")
         except RuntimeError:
@@ -552,7 +563,13 @@ class WireGuardController:
                 
                 if interface_to_disconnect not in interfaces:
                     logger.debug(f"Interface {interface_to_disconnect} does not exist, cleaning up routes only")
-                    # Still clean up any stale routing rules, DNS and the kill switch
+                    # Still clean up any stale routing rules, DNS and the kill switch. The
+                    # resolvconf entry outlives the interface ("-x" made it exclusive), so
+                    # without this the tunnel DNS stays in resolv.conf and lookups fail.
+                    try:
+                        await self._run_sudo(["resolvconf", "-d", interface_to_disconnect, "-f"])
+                    except Exception:
+                        pass  # resolvconf may not be available
                     if self._resolv_backup is not None:
                         try:
                             Path("/etc/resolv.conf").write_text(self._resolv_backup)

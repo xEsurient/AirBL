@@ -1,8 +1,11 @@
 import asyncio
 import logging
+import os
 from contextlib import asynccontextmanager
 from pathlib import Path
+from urllib.parse import urlsplit
 from fastapi import FastAPI
+from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 import uvicorn
 
@@ -17,7 +20,31 @@ from fastapi import WebSocket
 setup_debug_logging()
 logger = logging.getLogger("airbl.web")
 
+def _origin_allowed(origin: str, headers) -> bool:
+    """Same-origin check for write requests: the Origin's host:port must be the Host the
+    browser used (or X-Forwarded-Host behind a proxy), or listed in AIRBL_ALLOWED_ORIGINS."""
+    extra = {o.strip().rstrip("/").lower() for o in os.getenv("AIRBL_ALLOWED_ORIGINS", "").split(",") if o.strip()}
+    if origin.rstrip("/").lower() in extra:
+        return True
+    netloc = urlsplit(origin).netloc.lower()
+    if not netloc:  # "null" (sandboxed frames, file://)
+        return False
+    hosts = {headers.get("host", "").lower()}
+    hosts |= {h.strip().lower() for h in headers.get("x-forwarded-host", "").split(",") if h.strip()}
+    return netloc in hosts
+
+
 async def _shutdown():
+    # Stop the loops first, so none of them starts a scan or a Gluetun check while the
+    # tunnel is torn down and the DB is closed
+    loops = [getattr(state, "auto_scan_loop_task", None), getattr(state, "gluetun_watchdog_task", None),
+             *api._background_tasks]
+    loops = [t for t in loops if t and not t.done()]
+    for t in loops:
+        t.cancel()
+    if loops:
+        await asyncio.wait(loops, timeout=10)
+
     # Don't leave a tunnel, kill switch or routes behind on stop/restart
     task = getattr(state, "scan_task", None)
     if task and not task.done():
@@ -61,6 +88,18 @@ def create_app(config_dir: Path = None) -> FastAPI:
         if not path.startswith(("/api", "/ws")):
             response.headers.setdefault("Cache-Control", "no-cache")
         return response
+
+    @app.middleware("http")
+    async def _same_origin_writes(request, call_next):
+        # No login, so a web page open in a LAN browser could otherwise POST here
+        # (form or text/plain requests need no CORS preflight). Browsers always send
+        # Origin on POSTs; scripts and curl send none and are allowed.
+        if request.method not in ("GET", "HEAD", "OPTIONS") and request.url.path.startswith("/api"):
+            origin = request.headers.get("origin")
+            if origin is not None and not _origin_allowed(origin, request.headers):
+                logger.warning(f"Blocked cross-site {request.method} {request.url.path} from {origin}")
+                return JSONResponse({"error": "Cross-site request blocked"}, status_code=403)
+        return await call_next(request)
 
     # Mount static files
     static_dir = Path(__file__).parent.parent / "static"
@@ -117,8 +156,8 @@ async def run_server(
     # Always start the scan timer loop so it respects dynamic settings changes.
     async def auto_scan_loop():
         from datetime import datetime
-        from .tasks import calculate_next_scan_time
-        
+        from .tasks import next_scan_from_last
+
         # Wait for startup to initialize the event
         while state.settings_updated_event is None:
             await asyncio.sleep(1)
@@ -139,10 +178,9 @@ async def run_server(
 
                 from ..config import config_manager
                 scan_cfg = config_manager.config.scan
-                
-                now = datetime.now()
+
                 if state.next_scan_at is None:
-                    state.next_scan_at = calculate_next_scan_time(scan_cfg, now)
+                    state.next_scan_at = next_scan_from_last(scan_cfg)
                     
                 # How long until next scan?
                 sleep_duration = (state.next_scan_at - datetime.now()).total_seconds()
@@ -175,9 +213,7 @@ async def run_server(
                     )
                     # Event fired (settings changed). Recalculate.
                     logger.info("Settings changed, recalculating next scan time")
-                    state.next_scan_at = calculate_next_scan_time(
-                        config_manager.config.scan, datetime.now()
-                    )
+                    state.next_scan_at = next_scan_from_last(config_manager.config.scan)
                 except asyncio.TimeoutError:
                     pass  # Timer expired naturally, loop will fire the scan
 

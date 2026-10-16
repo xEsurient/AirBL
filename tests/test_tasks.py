@@ -185,6 +185,24 @@ async def test_check_underperforming_ignores_failures_and_good_runs(fresh_config
     assert len(state.server_performance_history["Ran"]) == 4
 
 
+async def test_performance_history_saved_once_per_batch(fresh_config, monkeypatch):
+    # Checks that don't disable a server used to stay in memory only, so a restart lost them
+    fresh_config.performance.check_count = 3
+    state.server_performance_history = {}
+    saves = []
+    monkeypatch.setattr(config_manager, "save", lambda: saves.append(
+        {k: len(v) for k, v in config_manager.config.performance.history.items()}) or True)
+    monkeypatch.setattr(tasks, "_perf_history_unsaved", False)
+    bad = SpeedTestResult(download_mbps=5, upload_mbps=5, ping_ms=10).to_dict()
+    await tasks._check_and_disable_underperforming_server("Copernicus", bad)
+    await tasks._check_and_disable_underperforming_server("Felis", bad)
+    assert saves == []  # nothing written per test
+    tasks._save_performance_history()
+    assert saves == [{"Copernicus": 1, "Felis": 1}]
+    tasks._save_performance_history()  # nothing new: no extra write (keeps the .bak useful)
+    assert len(saves) == 1
+
+
 # --- calculate_next_scan_time ----------------------------------------------------------
 
 def test_next_scan_interval(fresh_config):
@@ -485,3 +503,105 @@ async def test_scan_with_only_region_config_reports_error(monkeypatch, fresh_con
     assert gen_calls == []
     async with temp_db._conn.execute("SELECT status FROM scan_history") as cur:
         assert [r["status"] for r in await cur.fetchall()] == ["failed"]
+
+
+# --- next_scan_from_last ----------------------------------------------------------------
+
+def test_next_scan_counts_from_last_scan_end(fresh_config, monkeypatch):
+    # A restart (or settings save) used to restart the countdown from "now", so a daily
+    # interval never fired on a host that restarts every night
+    fresh_config.scan.scan_mode = "interval"
+    fresh_config.scan.scan_interval_minutes = 120
+    now = datetime.now()
+    monkeypatch.setattr(state, "is_scanning", False)
+    monkeypatch.setattr(state, "current_scan", NS(completed_at=now - timedelta(minutes=30)))
+    nxt = tasks.next_scan_from_last(fresh_config.scan)
+    assert abs((nxt - (now + timedelta(minutes=90))).total_seconds()) < 5
+    # Overdue: due in about a minute, not a full interval later
+    monkeypatch.setattr(state, "current_scan", NS(completed_at=now - timedelta(hours=5)))
+    nxt = tasks.next_scan_from_last(fresh_config.scan)
+    assert timedelta(seconds=50) < nxt - now < timedelta(seconds=70)
+    # No scan yet: full interval from now (old behaviour)
+    monkeypatch.setattr(state, "current_scan", None)
+    nxt = tasks.next_scan_from_last(fresh_config.scan)
+    assert abs((nxt - (now + timedelta(minutes=120))).total_seconds()) < 5
+
+
+def test_next_scan_schedule_mode_ignores_last_scan(fresh_config, monkeypatch):
+    fresh_config.scan.scan_mode = "schedule"
+    fresh_config.scan.scan_schedule_time = "05:00"
+    monkeypatch.setattr(state, "current_scan", NS(completed_at=datetime.now() - timedelta(days=3)))
+    nxt = tasks.next_scan_from_last(fresh_config.scan)
+    assert (nxt.hour, nxt.minute) == (5, 0) and nxt > datetime.now()
+
+
+async def test_manual_speedtest_never_disconnects_outside_the_lock(monkeypatch, fake_server, broadcasts, fresh_config):
+    # The old outer disconnect ran after the lock was released and tore down the next job's tunnel
+    server = fake_server("Toliman")
+    seen = []
+
+    class Ctrl(_Ctrl):
+        async def disconnect(self, *a):
+            seen.append(tasks.network_owner())  # who holds the lock right now
+
+    async def fake_single(srv, total_, cur, ctrl, **k):
+        await ctrl.disconnect()  # the real one disconnects in its finally, inside the lock
+        return None
+
+    async def no_override(srv):
+        return None
+
+    monkeypatch.setattr(tasks, "_run_single_server_speedtest", fake_single)
+    monkeypatch.setattr(tasks, "_resolve_server_config", no_override)
+    monkeypatch.setattr(tasks, "WireGuardController", lambda **k: Ctrl())
+    await tasks.run_speedtest_task(server, controller=Ctrl())
+    await tasks.run_speedtest_task(server)  # own controller: same rule
+    assert len(seen) == 2 and all(seen)  # one disconnect per run, both while the lock was held
+
+
+async def test_finish_teardown_survives_repeated_cancels():
+    finished = []
+
+    async def slow_teardown():
+        await asyncio.sleep(0.05)
+        finished.append(True)
+
+    async def job():
+        await tasks._finish_teardown(slow_teardown())
+
+    t = asyncio.create_task(job())
+    await asyncio.sleep(0.01)
+    t.cancel()
+    await asyncio.sleep(0.01)
+    t.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await t
+    assert finished == [True]  # teardown ran to the end; the cancel was still delivered
+
+
+async def test_failed_speedtests_are_stored(monkeypatch, fake_server, fresh_config, tmp_path):
+    # Only successful runs were saved, so success rates were always 100%
+    server = fake_server("Toliman")
+    saved = []
+
+    class DB:
+        async def add_speedtest_result(self, result, scan_id=None):
+            saved.append((result, scan_id))
+
+    async def failing(*a, **k):
+        return SpeedTestResult(download_mbps=0, upload_mbps=0, ping_ms=0, error="Server 1 not available")
+
+    async def no_wait(*a, **k):
+        return None
+
+    monkeypatch.setattr(state, "db", DB())
+    monkeypatch.setattr(tasks, "run_speedtest_for_country", failing)
+    monkeypatch.setattr(tasks.asyncio, "sleep", no_wait)
+    conf = tmp_path / "AirVPN_CH-Zurich_Toliman_UDP-47107-Entry3.conf"
+    conf.write_text("[Interface]\n")
+    err = await tasks._run_single_server_speedtest(server, 1, 1, _Ctrl(), tests_per_server=2,
+                                                   inter_test_delay=0, vpn_wait=0, config_override=conf, scan_id=7)
+    assert err and "failed" in err
+    ((row, scan_id),) = saved
+    assert scan_id == 7 and row["is_success"] is False and "not available" in row["error"]
+    assert row["vpn_server_name"] == "Toliman" and row["vpn_port"] == 47107 and row["vpn_entry"] == "Entry 3"

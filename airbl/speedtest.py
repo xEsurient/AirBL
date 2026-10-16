@@ -54,12 +54,11 @@ class SpeedTestResult:
         
         Success requires:
         - No error set
-        - Download speed > 0 (upload can be 0 for download-only tests)
+        - Download and upload > 0 (either at 0 is a partial failure)
         """
         if self.error is not None:
             return False
-        # Require download > 0 for success (upload-only results are considered partial failures)
-        return self.download_mbps > 0
+        return self.download_mbps > 0 and self.upload_mbps > 0
     
     @property
     def score(self) -> float:
@@ -393,8 +392,8 @@ async def run_speedtest(
                 error=error_msg or "Speedtest failed",
             )
         
-        data = json.loads(stdout.decode())
-        
+        data = _ookla_result_json(stdout.decode())
+
         # Bandwidth is returned in bytes/s. Convert to Mbps.
         download_mbps = (data.get("download", {}).get("bandwidth", 0) * 8) / 1_000_000
         upload_mbps = (data.get("upload", {}).get("bandwidth", 0) * 8) / 1_000_000
@@ -437,6 +436,11 @@ async def run_speedtest(
         elif download_mbps == 0 and upload_mbps == 0:
             result.error = "Speedtest completed with 0.00 Mbps for both download and upload"
             logger.warning(f"Speedtest complete failure: {result.error}")
+        elif upload_mbps <= 0:
+            # A failed upload phase: averaged in, the 0 would push the server under the
+            # upload threshold and could auto-disable a working server
+            result.error = f"Upload test failed (0.00 Mbps), download succeeded ({download_mbps:.2f} Mbps)"
+            logger.warning(f"Speedtest partial failure: {result.error}")
         elif download_mbps > 0:
             # Success - no error
             logger.info(f"Speedtest completed: {result.download_mbps:.2f} Mbps down, {result.upload_mbps:.2f} Mbps up, {result.ping_ms:.1f}ms ping (server: {result.server_name}, {result.server_location})")
@@ -485,6 +489,34 @@ async def run_speedtest(
             ping_ms=0,
             error=str(e),
         )
+
+
+def _ookla_result_json(text: str) -> dict:
+    """The result object from Ookla's -f json output. A successful run can also print
+    {"type": "log"} lines, one JSON object per line, which json.loads(all) rejects."""
+    try:
+        data = json.loads(text)
+        if isinstance(data, dict):
+            return data
+    except ValueError:
+        pass
+    objects = []
+    for line in text.splitlines():
+        line = line.strip()
+        if line.startswith("{"):
+            try:
+                obj = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(obj, dict):
+                objects.append(obj)
+    for obj in objects:
+        if obj.get("type") == "result":
+            return obj
+    for obj in reversed(objects):  # older CLIs: no "type", the result is the last object
+        if "download" in obj:
+            return obj
+    raise ValueError(f"No speedtest result in the Ookla output: {text.strip()[:200]!r}")
 
 
 def _ookla_error(stdout: bytes, stderr: bytes) -> str:
@@ -626,9 +658,3 @@ def clear_server_blacklist():
     """Clear the server blacklist (useful for testing or manual reset)."""
     _server_blacklist.clear()
     logger.info("Server blacklist cleared")
-
-
-# Synchronous wrapper
-def run_speedtest_sync(server_id: Optional[int] = None, secure: bool = True) -> SpeedTestResult:
-    """Synchronous wrapper for run_speedtest."""
-    return asyncio.run(run_speedtest(server_id=server_id, secure=secure))

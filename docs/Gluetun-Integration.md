@@ -12,7 +12,7 @@ Gluetun only reads its server list when the container starts. Cycling the VPN do
 
 Inside the Settings UI > **Gluetun Integration**:
 1. Click **Add Profile**.
-2. **Output Path**: where to write the file. It must be the file Gluetun actually reads (see below).
+2. **Output Path**: where to write the file. It must be the file Gluetun actually reads (see below), and it must be inside `/app/gluetun/` (the mounted folder); other paths are refused.
 3. **Endpoint Route Strategy**:
    - `ALL`: Exports both Entry 1 and Entry 3.
    - `ENTRY1`/`ENTRY3`: Forces strict routes.
@@ -47,17 +47,18 @@ Settings > Gluetun Integration:
   HTTP_CONTROL_SERVER_AUTH_DEFAULT_ROLE={"auth":"apikey","apikey":"<your key>"}
   ```
   Or use a role in Gluetun's auth `config.toml` that includes `GET /v1/vpn/status`, `GET /v1/publicip/ip` and `PUT /v1/vpn/settings`.
-- **Control Profile**: the profile whose clean servers are offered to Gluetun. Leave it empty to use the first enabled profile.
+- **Control Profile**: the profile whose clean servers are offered to Gluetun. Leave it empty to use the first enabled profile. Profiles are optional: with none enabled, AirBL offers every clean scanned server that isn't disabled.
 - **Test**: checks reachability and the key, and shows the current public IP and the matching server.
-- **Apply Now**: runs the switch logic immediately.
+- **Apply Now**: runs the switch logic immediately (skips the cooldown below).
+- **Watchdog interval**: how often AirBL checks between scans that Gluetun is still on a server the switch mode allows (default 60 s; 0 = only after scans). Gluetun can reconnect by itself (restart, network drop) and pick any server; the watchdog moves it back. It skips while a scan runs, while Gluetun isn't connected yet, and for 3 minutes after any switch so Gluetun can reconnect.
 
-When enabled, after every scan AirBL sends `PUT /v1/vpn/settings` with `{"provider":{"server_selection":{"names":[...], "countries":[], "regions":[], "cities":[], "hostnames":[]}}}`. The empty lists clear any `SERVER_COUNTRIES`/`SERVER_CITIES` set on Gluetun, so only the pushed names decide. Gluetun validates the names, then reconnects to one of them. Blocklisted servers are never sent, even if the profile allows them.
+When enabled, after every scan (and whenever the watchdog finds Gluetun outside the allowed servers) AirBL sends `PUT /v1/vpn/settings` with `{"provider":{"server_selection":{"names":[...], "countries":[], "regions":[], "cities":[], "hostnames":[]}}}`. The empty lists clear any `SERVER_COUNTRIES`/`SERVER_CITIES` set on Gluetun, so only the pushed names decide. Gluetun validates the names, then reconnects to one of them. Blocklisted servers are never sent, even if the profile allows them.
 
 **Switch Mode** (the current server is found by Gluetun's public/exit IP):
 - **Clean Only:** stay while the current server is clean. Otherwise limit Gluetun to all clean servers in the profile.
 - **Reset if not Top 4:** stay if the current server is in the profile's top 4 by score. Otherwise limit Gluetun to those 4.
 - **Reset if not Best:** same, with only the top server.
-- **Always:** push the full clean list after every scan, which causes a reconnect.
+- **Always:** push the full clean list after every scan, which causes a reconnect. Between scans the watchdog only switches if Gluetun is outside that list.
 - **Disabled:** never touch Gluetun.
 
 If Gluetun can't be reached or rejects the key, AirBL logs the reason and leaves the selection unchanged.

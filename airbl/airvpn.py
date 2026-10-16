@@ -4,14 +4,13 @@ AirVPN API Client Module.
 Fetches server information from the AirVPN status API.
 """
 
-import asyncio
 from dataclasses import dataclass, field
 from typing import Optional
 from datetime import datetime
 import ipaddress
 
 import httpx
-from tenacity import retry, stop_after_attempt, wait_exponential
+from tenacity import retry, retry_if_exception, stop_after_attempt, wait_exponential
 
 from .config import settings
 
@@ -119,6 +118,12 @@ class AirVPNStatus:
         return [s for s in self.servers if s.continent.lower() == continent.lower()]
 
 
+def _is_transient(exc: BaseException) -> bool:
+    if isinstance(exc, httpx.HTTPStatusError):
+        return exc.response.status_code >= 500
+    return isinstance(exc, httpx.TransportError)
+
+
 class AirVPNClient:
     """Async client for AirVPN API."""
     
@@ -137,6 +142,9 @@ class AirVPNClient:
     @retry(
         stop=stop_after_attempt(3),
         wait=wait_exponential(multiplier=1, min=1, max=10),
+        # Only what a retry can fix (network, 5xx); a 4xx or bad JSON fails at once
+        retry=retry_if_exception(_is_transient),
+        reraise=True,  # callers see the real error, not tenacity's RetryError
     )
     async def fetch_status(self) -> AirVPNStatus:
         """
@@ -200,10 +208,3 @@ async def get_airvpn_status() -> AirVPNStatus:
     """Convenience function to fetch AirVPN status."""
     async with AirVPNClient() as client:
         return await client.fetch_status()
-
-
-# Synchronous wrapper
-def get_airvpn_status_sync() -> AirVPNStatus:
-    """Synchronous wrapper for get_airvpn_status."""
-    return asyncio.run(get_airvpn_status())
-

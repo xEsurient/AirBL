@@ -3,12 +3,21 @@ import logging
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import List, Dict, Optional, Any
-import asyncio
 
 logger = logging.getLogger("airbl.database")
 
 # History older than this is pruned at startup
 RETENTION_DAYS = 180
+
+async def _add_column(conn, table: str, column_def: str) -> None:
+    """ALTER TABLE ADD COLUMN unless it exists. A real failure (locked or read-only DB)
+    raises instead of being swallowed like "column already exists" used to be."""
+    name = column_def.split()[0]
+    async with conn.execute(f"PRAGMA table_info({table})") as cur:
+        existing = {row[1] for row in await cur.fetchall()}
+    if name not in existing:
+        await conn.execute(f"ALTER TABLE {table} ADD COLUMN {column_def}")
+
 
 class DatabaseManager:
     def __init__(self, db_path: Path):
@@ -50,10 +59,7 @@ class DatabaseManager:
             # Migration: scan status (running / complete / cancelled / failed). Only a
             # completed scan's summary was ever written, so 0-count legacy rows are the
             # cancelled or crashed ones.
-            try:
-                await conn.execute("ALTER TABLE scan_history ADD COLUMN status TEXT")
-            except Exception:
-                pass
+            await _add_column(conn, "scan_history", "status TEXT")
             await conn.execute("""
                 UPDATE scan_history SET status = CASE WHEN total_servers > 0 THEN 'complete' ELSE 'cancelled' END
                 WHERE status IS NULL
@@ -82,10 +88,7 @@ class DatabaseManager:
             
             # Migration: add vpn columns to existing DBs
             for col in ["vpn_server_name TEXT", "vpn_country_code TEXT", "vpn_port INTEGER", "vpn_entry TEXT"]:
-                try:
-                    await conn.execute(f"ALTER TABLE speedtest_history ADD COLUMN {col}")
-                except Exception:
-                    pass
+                await _add_column(conn, "speedtest_history", col)
             
             # Server Scan History Table
             await conn.execute("""
@@ -106,10 +109,7 @@ class DatabaseManager:
                 )
             """)
             # Migration: reputation state (clean / blocked / unknown); older rows have NULL
-            try:
-                await conn.execute("ALTER TABLE server_scan_history ADD COLUMN reputation TEXT")
-            except Exception:
-                pass
+            await _add_column(conn, "server_scan_history", "reputation TEXT")
 
             # Entry Ping History Table
             await conn.execute("""
@@ -132,6 +132,8 @@ class DatabaseManager:
             await conn.execute("CREATE INDEX IF NOT EXISTS idx_speedtest_server ON speedtest_history(server_name)")
             await conn.execute("CREATE INDEX IF NOT EXISTS idx_server_scan_id ON server_scan_history(scan_id)")
             await conn.execute("CREATE INDEX IF NOT EXISTS idx_server_scan_name ON server_scan_history(server_name)")
+            # Gluetun status falls back to "which server had this exit IP" on every poll
+            await conn.execute("CREATE INDEX IF NOT EXISTS idx_server_scan_exit_ip ON server_scan_history(exit_ip)")
             await conn.execute("CREATE INDEX IF NOT EXISTS idx_entry_ping_server ON entry_ping_history(server_name)")
             await conn.execute("CREATE INDEX IF NOT EXISTS idx_entry_ping_scan ON entry_ping_history(scan_id)")
             
@@ -202,46 +204,6 @@ class DatabaseManager:
         elif e1_avg is not None:
             return "ENTRY1"
         return "ENTRY3"
-
-    async def get_best_entries_bulk(self, server_names: list[str], lookback: int = 10) -> dict[str, str]:
-        results = {}
-        if not server_names:
-            return results
-        
-        placeholders = ",".join("?" for _ in server_names)
-        async with self._conn.execute(f"""
-            SELECT server_name, entry_type, AVG(latency_ms) as avg_latency
-            FROM entry_ping_history
-            WHERE server_name IN ({placeholders})
-              AND is_alive = 1 AND latency_ms IS NOT NULL
-              AND scan_id IN (
-                  SELECT DISTINCT scan_id FROM entry_ping_history
-                  WHERE scan_id IS NOT NULL
-                  ORDER BY scan_id DESC LIMIT ?
-              )
-            GROUP BY server_name, entry_type
-        """, server_names + [lookback]) as cursor:
-            rows = await cursor.fetchall()
-        
-        server_entries = {}
-        for row in rows:
-            name = row["server_name"]
-            if name not in server_entries:
-                server_entries[name] = {}
-            server_entries[name][row["entry_type"]] = row["avg_latency"]
-        
-        for name in server_names:
-            entries = server_entries.get(name, {})
-            e1 = entries.get("ENTRY1")
-            e3 = entries.get("ENTRY3")
-            if e1 is not None and e3 is not None:
-                results[name] = "ENTRY1" if e1 < e3 else "ENTRY3"
-            elif e1 is not None:
-                results[name] = "ENTRY1"
-            else:
-                results[name] = "ENTRY3"
-        
-        return results
 
     async def add_scan_result(self, summary: Dict[str, Any]) -> int:
         cursor = await self._conn.execute("""
@@ -361,6 +323,16 @@ class DatabaseManager:
             """, (limit,)) as cursor:
                 return [dict(row) for row in await cursor.fetchall()]
     
+    async def get_speedtest_history_since(self, since_iso: Optional[str], limit: int = 5000) -> List[Dict[str, Any]]:
+        """Newest-first speedtests at or after since_iso (None = all), capped at limit.
+        Timestamps are ISO strings, so they compare as text."""
+        if since_iso:
+            sql, args = "SELECT * FROM speedtest_history WHERE timestamp >= ? ORDER BY id DESC LIMIT ?", (since_iso, limit)
+        else:
+            sql, args = "SELECT * FROM speedtest_history ORDER BY id DESC LIMIT ?", (limit,)
+        async with self._conn.execute(sql, args) as cursor:
+            return [dict(row) for row in await cursor.fetchall()]
+
     async def get_speedtest_group_stats(self) -> List[Dict[str, Any]]:
         """Test counts and successful-result sums per (vpn_port, vpn_entry)."""
         async with self._conn.execute("""
@@ -375,25 +347,6 @@ class DatabaseManager:
             GROUP BY vpn_port, vpn_entry
         """) as cursor:
             return [dict(row) for row in await cursor.fetchall()]
-
-    async def get_stats(self) -> Dict[str, Any]:
-        async with self._conn.execute("SELECT COUNT(*) FROM scan_history WHERE status = 'complete'") as cursor:
-            total_scans = (await cursor.fetchone())[0]
-        async with self._conn.execute("SELECT COUNT(*) FROM speedtest_history") as cursor:
-            total_speedtests = (await cursor.fetchone())[0]
-        
-        async with self._conn.execute("""
-            SELECT AVG(clean_servers) as avg_clean, AVG(blocked_servers) as avg_blocked 
-            FROM (SELECT clean_servers, blocked_servers FROM scan_history WHERE status = 'complete' ORDER BY id DESC LIMIT 10)
-        """) as cursor:
-            avg_row = await cursor.fetchone()
-        
-        return {
-            "total_scans": total_scans,
-            "total_speedtests": total_speedtests,
-            "recent_avg_clean": avg_row["avg_clean"] or 0,
-            "recent_avg_blocked": avg_row["avg_blocked"] or 0
-        }
 
     async def get_historical_averages(self) -> Dict[str, Any]:
         async def fetch_period(days: int):

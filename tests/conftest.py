@@ -213,3 +213,13 @@ def broadcasts():
     ws = _FakeWS()
     _state_mod.state.websocket_clients.append(ws)
     return ws
+
+
+@pytest.fixture(autouse=True)
+def dnsbl_resolver_ok(monkeypatch):
+    """Tests assume a resolver that really answers for DroneBL (its test entry is listed);
+    tests of that check reset _canary_checked_at themselves."""
+    import time as _time
+    import airbl.dronebl as _dronebl
+    monkeypatch.setattr(_dronebl, "_canary_checked_at", _time.monotonic())
+    monkeypatch.setattr(_dronebl, "_canary_error", None)

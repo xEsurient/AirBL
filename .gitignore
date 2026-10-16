@@ -44,10 +44,23 @@ env/
 .ruff_cache/
 .pytest_cache/
 
-# AirNL specific
+# AirBL runtime data
 *.db
 .airnl/
 
+# Docker runtime folders: WireGuard configs (private keys), settings (Gluetun API key),
+# database and generated outputs. Keep only the empty conf/ placeholder.
+docker/conf/*
+!docker/conf/.gitkeep
+docker/data/
+docker/wireguard/
+docker/gluetun/
+docker/servers.json
+/airbl-config.json
 
-# Local project docs & dev tooling (not committed by default)
+
+# Local project docs, Claude memory & dev tooling (not committed by default)
+_claude/
+CLAUDE.local.md
+.claude/
 .DS_Store

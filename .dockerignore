@@ -1,3 +1,14 @@
+# Allowlist: the build context is the repo root, which also holds docker/conf (WireGuard
+# private keys), docker/data (settings incl. the Gluetun API key) and other local files.
+# Send only what the Dockerfile COPYs.
+*
+!airbl/
+!main.py
+!requirements.txt
+!docker/entrypoint.sh
+**/__pycache__
+**/*.pyc
+
 # Local project docs, Claude memory & dev tooling (not committed by default)
 _claude/
 CLAUDE.local.md

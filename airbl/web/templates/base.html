@@ -34,6 +34,7 @@
                     <a href="/servers" class="{% if request.url.path == '/servers' %}active{% endif %}">Servers</a>
                     <a href="/metrics" class="{% if request.url.path == '/metrics' %}active{% endif %}">Metrics</a>
                     <a href="/settings" class="{% if request.url.path == '/settings' %}active{% endif %}">Settings</a>
+                    <a href="/debug" class="{% if request.url.path == '/debug' %}active{% endif %}">Debug</a>
                 </div>
                 {% endblock %}
                 {% block nav_buttons %}{% endblock %}
@@ -53,12 +54,14 @@
     </footer>
 
     <!-- Loaded once, before page scripts, so pages can use its helpers -->
+    <script>window.AIRBL_SERVER_UTC_OFFSET_MIN = {{ server_utc_offset_min() }};</script>
     <script src="/static/js/app.js?v={{ asset_version }}"></script>
     {% block scripts %}{% endblock %}
     <script>
         async function pollGluetunStatus() {
             try {
                 const res = await fetch('/api/gluetun/status');
+                if (!res.ok) return;  // keep the last shown state
                 const data = await res.json();
                 const el = document.getElementById('gluetunConnected');
                 const nameEl = document.getElementById('gluetunServerName');

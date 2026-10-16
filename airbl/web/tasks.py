@@ -9,17 +9,17 @@ import copy
 import random
 from typing import Optional
 import logging
-from collections import defaultdict, deque
+from collections import defaultdict
 import statistics
 
 from .state import state
 from .websockets import broadcast_update
 from ..config import config_manager, settings
-from ..scanner import EnhancedScanner, ScanSummary
+from ..scanner import EnhancedScanner
 from ..speedtest import run_speedtest_for_country, SpeedTestResult
 from ..hummingbird import WireGuardController
-from ..wireguard import scan_config_directory, get_scannable_configs
-from ..airvpn import get_airvpn_status
+from ..wireguard import get_scannable_configs
+from ..database import RETENTION_DAYS
 from ..gluetun import generate_gluetun_servers_json
 
 logger = logging.getLogger("airbl.web.tasks")
@@ -65,6 +65,21 @@ def _reject_if_not_via_vpn(res, egress_ip: Optional[str]):
     return res
 
 
+def next_scan_from_last(scan_cfg) -> datetime:
+    """Next scan time for the scheduler loop. Interval mode counts from the end of the last
+    scan (restored from the DB at startup), so restarts and settings saves don't push the
+    scan back; if that time has passed, the scan is due in a minute."""
+    now = datetime.now()
+    if getattr(scan_cfg, "scan_mode", "interval") == "interval":
+        scan = state.current_scan
+        last = scan.completed_at if scan and not state.is_scanning else None
+        if last and last.tzinfo:
+            last = last.astimezone().replace(tzinfo=None)
+        if last and last <= now:
+            return max(calculate_next_scan_time(scan_cfg, last), now + timedelta(minutes=1))
+    return calculate_next_scan_time(scan_cfg, now)
+
+
 def calculate_next_scan_time(scan_cfg, last_scan_time=None) -> datetime:
     """Calculate the next scheduled scan time based on configuration."""
     now = datetime.now()
@@ -103,10 +118,25 @@ def calculate_next_scan_time(scan_cfg, last_scan_time=None) -> datetime:
         return now + timedelta(days=1)
 
 
+_perf_history_unsaved = False  # speed checks recorded since the last settings save
+
+
+def _save_performance_history():
+    """Persist the speed-check history, once per batch so the settings .bak stays a useful
+    previous version. Without this, a restart drops every check since the last auto-disable."""
+    global _perf_history_unsaved
+    if not _perf_history_unsaved:
+        return
+    config_manager.config.performance.history = state.server_performance_history
+    if config_manager.save():
+        _perf_history_unsaved = False
+
+
 async def _check_and_disable_underperforming_server(server_name: str, speedtest_result: dict):
     """
     Check if server consistently underperforms and auto-disable if needed.
     """
+    global _perf_history_unsaved
     # Skip if speedtest failed
     # to_dict() always has an "error" key (None on success), so test its value
     if not speedtest_result or speedtest_result.get("error"):
@@ -134,7 +164,8 @@ async def _check_and_disable_underperforming_server(server_name: str, speedtest_
     max_history = config_manager.config.performance.check_count * 2
     if len(state.server_performance_history[server_name]) > max_history:
         state.server_performance_history[server_name] = state.server_performance_history[server_name][-max_history:]
-    
+    _perf_history_unsaved = True
+
     # Check if underperforming for N consecutive times
     check_count = config_manager.config.performance.check_count
     history = state.server_performance_history[server_name]
@@ -159,8 +190,9 @@ async def _check_and_disable_underperforming_server(server_name: str, speedtest_
             
             config_manager.config.performance.disabled_servers = sorted(list(current_disabled))
             config_manager.config.performance.history = state.server_performance_history
-            config_manager.save()
-            
+            if config_manager.save():
+                _perf_history_unsaved = False
+
             await broadcast_update("server_disabled", {
                 "server": server_name,
                 "reason": "underperformance"
@@ -282,7 +314,7 @@ async def run_scan_task():
             state.next_scan_at = calculate_next_scan_time(scan_cfg, datetime.now())
         
             await broadcast_update("scan_started", {
-                "next_scan_at": state.next_scan_at.astimezone().isoformat()
+                "next_scan_at": state.next_scan_iso()
             })
         
             logger.info("Starting scheduled scan task")
@@ -305,6 +337,7 @@ async def run_scan_task():
                 city_filter=city_filter,
                 # Settings > Server Selection; empty means all servers
                 server_filter=state.enabled_servers or None,
+                scan_concurrency=settings.scan_concurrency,  # AIRBL_SCAN_CONCURRENCY
             )
         
             # Create scan entry in DB at start to get ID (status 'running' until it completes)
@@ -390,7 +423,7 @@ async def run_scan_task():
         
             await broadcast_update("scan_complete", {
                 "summary": summary.to_dict(),
-                "next_scan_at": state.next_scan_at.astimezone().isoformat() if state.next_scan_at else None
+                "next_scan_at": state.next_scan_iso()
             })
         
             # Save history to memory (and log)
@@ -424,6 +457,11 @@ async def run_scan_task():
             
                 await _run_batch_speedtests()
 
+            # The discovery phase finalizes from inside the speedtests; with speedtests off
+            # or no clean server it never runs, so the period would never end
+            if not state.scan_cancelled:
+                await _finalize_discovery_if_due()
+
             # Once per completed cycle, after speedtests so the outputs include them
             if not state.scan_cancelled:
                 await _generate_outputs()
@@ -444,6 +482,12 @@ async def run_scan_task():
                 await state.db.set_scan_status(scan_id, status)
             except Exception as e:
                 logger.error(f"Failed to set scan status in DB: {e}")
+        if state.db and status == "complete":
+            # Startup prunes too, but a container can run for months between restarts
+            try:
+                await state.db.prune(RETENTION_DAYS)
+            except Exception as e:
+                logger.error(f"Failed to prune old history: {e}")
 
         # A restart may already have started a newer scan task; leave its state alone
         if state.scan_task in (None, asyncio.current_task()):
@@ -456,7 +500,7 @@ async def run_scan_task():
             state.scan_progress = _idle_progress()
             await broadcast_update("progress_update", {
                 "progress": state.scan_progress,
-                "next_scan_at": state.next_scan_at.astimezone().isoformat(),
+                "next_scan_at": state.next_scan_iso(),
             })
 
 
@@ -470,12 +514,6 @@ async def _run_batch_speedtests():
     
     # Apply city filter if set
     if state.enabled_cities:
-        # ... city filtering logic ...
-        # Simplified for brevity as logic mirrors app.py, 
-        # but in real extraction we should copy the logic.
-        # Let's copy the logic fully to be safe.
-         
-        original_count = len(clean_servers)
         configs = state.server_configs()
         scannable_configs = get_scannable_configs(configs)
         config_to_city = {}
@@ -573,17 +611,20 @@ async def _run_batch_speedtests():
                         controller, TESTS_PER_SERVER, INTER_TEST_DELAY, VPN_STABILIZATION_WAIT,
                         config_override=config_override, scan_id=state.current_scan_id,
                     )
-                    
+                    if server_index % 10 == 0:
+                        _save_performance_history()  # a crash mid-batch loses at most 10 checks
+
                     # Post-server wait
                     if server_index < total_speedtests and not state.scan_cancelled:
                         await _smart_wait(POST_SERVER_WAIT)
                         
         finally:
+            _save_performance_history()  # first: the teardown below may re-raise a cancel
             try:
-                await controller.disconnect()
-            except:
+                await _finish_teardown(controller.disconnect())
+            except Exception:
                 pass
-                
+
         # Completion broadcast (ban history and output generation happen in run_scan_task)
         if not state.scan_cancelled:
             await broadcast_update("speedtest_all_complete", {
@@ -730,6 +771,26 @@ async def _resolve_server_config(server):
         return None
 
 
+def _discovery_elapsed_days(scan_cfg) -> float:
+    try:
+        started = _parse_ts(scan_cfg.discovery_started_at)
+    except ValueError:
+        started = datetime.now(timezone.utc)
+        scan_cfg.discovery_started_at = started.isoformat()
+    return (datetime.now(timezone.utc) - started).total_seconds() / 86400
+
+
+async def _finalize_discovery_if_due() -> bool:
+    """Finalize a running discovery period whose time is up. True if it finalized."""
+    scan_cfg = config_manager.config.scan
+    if not (scan_cfg.port_discovery_enabled and scan_cfg.discovery_started_at):
+        return False
+    if _discovery_elapsed_days(scan_cfg) < scan_cfg.discovery_duration_days:
+        return False
+    await _finalize_discovery()
+    return True
+
+
 async def _run_discovery_phase(clean_servers, controller):
     """
     Port/entry discovery, run inside a scan's speedtest phase while the period is active.
@@ -746,15 +807,9 @@ async def _run_discovery_phase(clean_servers, controller):
         return
 
     if scan_cfg.discovery_started_at:
-        try:
-            started = _parse_ts(scan_cfg.discovery_started_at)
-        except ValueError:
-            started = datetime.now(timezone.utc)
-            scan_cfg.discovery_started_at = started.isoformat()
-        elapsed_days = (datetime.now(timezone.utc) - started).total_seconds() / 86400
-        if elapsed_days >= scan_cfg.discovery_duration_days:
-            await _finalize_discovery()
+        if await _finalize_discovery_if_due():
             return
+        elapsed_days = _discovery_elapsed_days(scan_cfg)
         logger.info(f"Discovery active: {scan_cfg.discovery_duration_days - elapsed_days:.1f} days remaining")
     else:
         reset_discovery(start=True)
@@ -924,8 +979,12 @@ async def _finalize_discovery():
         return
 
     def score(r):
-        rel = r.get("relative_score", 1.0)  # 1.0 = neutral when only one combo was comparable
-        return rel * r["success_rate"]
+        # Combos measured against others in the same scan rank first: a combo never compared
+        # used to get a neutral 1.0 and could beat compared combos scoring 0.95. Without any
+        # comparison, fall back to absolute download x success rate.
+        if "relative_score" in r:
+            return (1, r["relative_score"] * r["success_rate"])
+        return (0, r["download_mbps"] * r["success_rate"])
 
     best_key = max(qualified, key=lambda k: score(qualified[k]))
     best = qualified[best_key]
@@ -1006,7 +1065,12 @@ async def _run_single_server_speedtest(server, index, total, controller, tests_p
         if not result.success:
              await _report_speedtest_error(server, f"Failed to connect: {result.error}")
              return f"Failed to connect: {result.error}"
-             
+        exit_ips = {ip.ip for ip in (getattr(server, "scanned_ips", None) or []) if getattr(ip, "ip", None)}
+        if result.public_ip and exit_ips and result.public_ip not in exit_ips:
+            # Not an error (AirVPN can exit elsewhere), but the DroneBL check covered other IPs
+            logger.warning(f"{server.server_name}: tunnel exits via {result.public_ip}, which isn't one of "
+                           f"its DroneBL-checked exit IPs ({', '.join(sorted(exit_ips))})")
+
         # 2. Wait for VPN to stabilize
         state.scan_progress["next"] = "Stabilizing VPN..."
         await broadcast_update("progress_update", {"progress": state.scan_progress})
@@ -1048,6 +1112,15 @@ async def _run_single_server_speedtest(server, index, total, controller, tests_p
         if not results:
             msg = f"All {tests_per_server} speedtest run(s) failed" + (f": {last_error}" if last_error else "")
             await _report_speedtest_error(server, msg)
+            # Stored too, so history and the port/entry success rates show real failures
+            if state.db:
+                try:
+                    await state.db.add_speedtest_result({
+                        "vpn_server_name": server.server_name, "vpn_country_code": server.country_code,
+                        **_conf_port_entry(conf_file), "is_success": False, "error": msg,
+                    }, scan_id=scan_id)
+                except Exception as e:
+                    logger.error(f"Failed to save failed speedtest to DB: {e}")
             return msg
         if results:
             avg = _average_speedtest_results(results, server.server_name)
@@ -1056,14 +1129,7 @@ async def _run_single_server_speedtest(server, index, total, controller, tests_p
             dct["vpn_country_code"] = server.country_code
             
             # Include port/entry info from the config filename for comparison testing
-            try:
-                from ..wireguard import parse_filename
-                conf_name = conf_file.name if hasattr(conf_file, 'name') else str(conf_file).split('/')[-1]
-                meta = parse_filename(conf_name)
-                dct["vpn_port"] = meta["port"]
-                dct["vpn_entry"] = f"Entry {meta['entry_number']}"
-            except Exception:
-                pass
+            dct.update(_conf_port_entry(conf_file))
             
             # Calculate deviation if baseline exists
             if state.baseline_speedtest:
@@ -1115,9 +1181,39 @@ async def _run_single_server_speedtest(server, index, total, controller, tests_p
     finally:
         # Always disconnect VPN after test (cleanup for next server)
         try:
-            await controller.disconnect(conf_file)
+            await _finish_teardown(controller.disconnect(conf_file))
         except Exception as e:
             logger.warning(f"Failed to disconnect VPN: {e}")
+
+
+def _conf_port_entry(conf_file) -> dict:
+    """{"vpn_port", "vpn_entry"} from a config filename ({} if it doesn't parse)."""
+    try:
+        from ..wireguard import parse_filename
+        conf_name = conf_file.name if hasattr(conf_file, 'name') else str(conf_file).split('/')[-1]
+        meta = parse_filename(conf_name)
+        return {"vpn_port": meta["port"], "vpn_entry": f"Entry {meta['entry_number']}"}
+    except Exception:
+        return {}
+
+
+async def _finish_teardown(coro):
+    """Run a tunnel teardown to the end even if the job is cancelled meanwhile (Stop clicked
+    twice, Restart), so the lock is never released with the tunnel or kill switch half up.
+    A cancellation that arrived is re-raised afterwards."""
+    task = asyncio.ensure_future(coro)
+    cancelled = False
+    while True:
+        try:
+            result = await asyncio.shield(task)
+            break
+        except asyncio.CancelledError:
+            if task.done():
+                raise  # the teardown itself was cancelled
+            cancelled = True
+    if cancelled:
+        raise asyncio.CancelledError()
+    return result
 
 
 async def _report_speedtest_error(server, msg):
@@ -1179,6 +1275,7 @@ async def run_speedtest_task(server, current: int = None, total: int = None, con
                 if not state.is_scanning:
                     await broadcast_update("progress_update", {"progress": state.scan_progress})
     finally:
+        _save_performance_history()
         # Always tell the UI how a manual run ended (success, failure or skip)
         result = server.speedtest_result if not error else None
         await broadcast_update("speedtest_manual_done", {
@@ -1189,9 +1286,7 @@ async def run_speedtest_task(server, current: int = None, total: int = None, con
             "upload_mbps": result.get("upload_mbps") if result else None,
             "ping_ms": result.get("ping_ms") if result else None,
         })
-        if not controller:
-            try:
-                await ctrl.disconnect()
-            except Exception:
-                pass
+        # No disconnect here: _run_single_server_speedtest already tore the tunnel down
+        # while holding the network lock. Out here the lock is released, so a disconnect
+        # could hit the next job's tunnel and kill switch.
 

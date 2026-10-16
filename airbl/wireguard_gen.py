@@ -70,7 +70,9 @@ def _build_conf(profile: WireGuardProfileConfig, endpoint_ip: str, server_pubkey
 
 
 async def _get_entry_ip(server, profile: WireGuardProfileConfig) -> Optional[str]:
-    """Get the appropriate entry IP for a server based on profile settings."""
+    """Get the appropriate entry IP for a server based on profile settings.
+    A strict ENTRY1/ENTRY3 choice skips servers whose entry didn't answer (on purpose:
+    "best per country" then picks a reachable server instead)."""
     if profile.entry_ip == "ENTRY1":
         if server.entry1_ping and server.entry1_ping.is_alive:
             return server.entry1_ping.ip
@@ -193,12 +195,6 @@ async def generate_wireguard_configs():
         except Exception as e:
             logger.error(f"Cannot create output dir {output_dir}: {e}")
             continue
-        
-        if getattr(profile, "ip_protocol", "IPv4") == "IPv6":
-            # An IPv6 endpoint needs the servers' IPv6 entry addresses, which scans don't
-            # collect (entry pings are IPv4), so IPv6 endpoints are unsupported for now.
-            logger.warning(f"WG profile '{profile.name}': IPv6 endpoints are not supported "
-                           "(no IPv6 entry addresses known); using IPv4 endpoints")
         
         generated = 0
         best_server = None

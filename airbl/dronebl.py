@@ -13,6 +13,8 @@ How DNSBL works:
 
 import asyncio
 import ipaddress
+import logging
+import time
 from dataclasses import dataclass, field
 from typing import Optional
 from datetime import datetime
@@ -24,6 +26,7 @@ import dns.asyncresolver
 from .config import settings, get_dronebl_reason
 
 RETRY_BACKOFF_SECONDS = 0.75
+logger = logging.getLogger(__name__)
 
 _NAMESERVERS: Optional[list[str]] = None
 
@@ -189,6 +192,35 @@ async def check_dronebl(ip: str, timeout: float = None) -> DroneBLResult:
         )
 
 
+# DNSBL test entry (RFC 5782): 127.0.0.2 is always listed. A resolver that blocks or rewrites
+# dronebl.org answers NXDOMAIN for everything, which would make every IP look clean.
+CANARY_IP = "127.0.0.2"
+CANARY_TTL_SECONDS = 300
+_canary_checked_at: Optional[float] = None
+_canary_error: Optional[str] = None
+
+
+async def dnsbl_resolver_error() -> Optional[str]:
+    """None if the resolver really reaches DroneBL (its test entry is listed), else the reason.
+    Cached for a few minutes, so a scan checks it about once."""
+    global _canary_checked_at, _canary_error
+    now = time.monotonic()
+    if _canary_checked_at is not None and now - _canary_checked_at < CANARY_TTL_SECONDS:
+        return _canary_error
+    result = await check_dronebl(CANARY_IP)
+    if result.is_listed:
+        error = None
+    elif result.error:
+        error = f"DroneBL test lookup failed ({result.error})"
+    else:
+        error = ("The DNS resolver says DroneBL's test entry 127.0.0.2 is not listed, so it doesn't "
+                 "really answer for dronebl.org (blocked or filtered?). Set DNS_SERVERS to a plain resolver.")
+    if error:
+        logger.warning(error)
+    _canary_checked_at, _canary_error = now, error
+    return error
+
+
 async def check_dronebl_batch(
     ips: list[str],
     concurrency: int = None,
@@ -228,12 +260,13 @@ async def check_dronebl_batch(
     
     tasks = [check_with_semaphore(ip) for ip in ips]
     results = await asyncio.gather(*tasks)
-    
+
+    # "Not listed" only counts if the resolver demonstrably answers for DroneBL;
+    # a listing is still trustworthy either way
+    if ips and any(not r.is_listed and not r.error for r in results):
+        resolver_error = await dnsbl_resolver_error()
+        if resolver_error:
+            for r in results:
+                if not r.is_listed and not r.error:
+                    r.error = resolver_error
     return results
-
-
-# Synchronous wrapper for simple usage
-def check_dronebl_sync(ip: str) -> DroneBLResult:
-    """Synchronous wrapper for check_dronebl."""
-    return asyncio.run(check_dronebl(ip))
-

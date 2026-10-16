@@ -20,6 +20,8 @@ Gluetun only reads its server file at startup. Current Gluetun versions read `/g
 ### Servers marked "Unverified"
 The DroneBL lookup failed (DNS timeout, unexpected answer) or AirVPN DNS returned no exit IPs. The reason is shown in the server details. Check `DNS_SERVERS` and network access; the next scan retries.
 
+If **every** server is unverified with a note about "DroneBL's test entry 127.0.0.2", your DNS resolver doesn't really answer for `dronebl.org`. Filtering resolvers (Pi-hole, NextDNS, some router DNS) often block it, and then every IP would look clean. AirBL checks the test entry DroneBL always lists and refuses to call anything clean when it's missing. Set `DNS_SERVERS` to a plain resolver, e.g. `1.1.1.1,8.8.8.8`.
+
 ### Speedtests fail
 - **"No WireGuard handshake":** the config's key/endpoint is wrong, or UDP to that port is blocked.
 - **"Traffic is not leaving via AirVPN" / "Measured outside the VPN":** a leak was detected and the result discarded, by design.

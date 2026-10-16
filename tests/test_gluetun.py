@@ -553,3 +553,11 @@ async def test_set_names_400_stale_list_hint(http):
         "available Fuyue, Mirzam"))
     r = await gluetun.set_gluetun_server_names(GluetunConfig(), ["Toliman"])
     assert r["applied"] is False and "Restart Gluetun" in r["reason"]
+
+
+@pytest.mark.parametrize("body", ["<html>not gluetun</html>", "[1, 2]", "null"])
+async def test_status_unexpected_reply_is_an_error_not_a_crash(http, body):
+    box, _ = http
+    box["fn"] = lambda r: httpx.Response(200, text=body)
+    r = await gluetun.get_gluetun_status(GluetunConfig())
+    assert r["error"] and "Unexpected reply" in r["error"] and r["connected"] is False

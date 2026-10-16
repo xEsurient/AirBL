@@ -7,6 +7,11 @@ import asyncio
 import logging
 from .state import state
 
+
+def _network_owner():
+    from .tasks import network_owner  # lazy: tasks imports this module
+    return network_owner()
+
 logger = logging.getLogger("airbl.web.ws")
 
 
@@ -21,7 +26,7 @@ async def broadcast_update(update_type: str, data: dict):
         try:
             await asyncio.wait_for(client.send_json(message), timeout=5.0)
             return None  # Success
-        except Exception as e:
+        except Exception:
             return client  # Return client that failed
     
     # Send to all clients concurrently with timeout
@@ -60,6 +65,11 @@ async def websocket_handler(websocket: WebSocket):
             "is_paused": state.is_paused,
             "progress": state.scan_progress,
             "has_results": state.current_scan is not None,
+            # A reconnecting page may have missed the scan_complete that carried this
+            "next_scan_at": state.next_scan_iso(),
+            "auto_scan_enabled": state.auto_scan_enabled,
+            "results_restored": bool(getattr(state.current_scan, "restored", False)),
+            "network_owner": _network_owner(),
         }
         # Include summary stats if available
         if state.current_scan:

@@ -66,7 +66,8 @@ class AppState:
         self.scan_history: list[dict] = []
         
         # Performance tracking history (in-memory cache for quick access)
-        self.server_performance_history: dict[str, list[dict]] = config_manager.config.performance.history.copy()
+        # Deep copy: shared per-server lists would make config and state half-alias each other
+        self.server_performance_history: dict[str, list[dict]] = copy.deepcopy(config_manager.config.performance.history)
         
         # Ban frequency tracking: server_name -> total ban count across all scans
         self.ban_history: dict[str, int] = {}
@@ -104,11 +105,12 @@ class AppState:
         """Asynchronous startup initialization."""
         logger = logging.getLogger("airbl.state")
         
-        self.settings_updated_event = asyncio.Event()
         self._load_baseline()
         
         # Initialize Database
-        db_path = settings.cache_dir / "airbl.db"
+        # AIRBL_DB_PATH when set; otherwise the cache dir (the settings default for db_path
+        # is filled in at import and wouldn't follow a later cache_dir change)
+        db_path = settings.db_path if "db_path" in settings.model_fields_set else settings.cache_dir / "airbl.db"
         self.db = DatabaseManager(db_path)
         await self.db.init()
         
@@ -222,6 +224,10 @@ class AppState:
             except Exception as e:
                 logger.error(f"Failed to rebuild last scan from DB: {e}", exc_info=True)
 
+        # Last: the scheduler loop starts once this exists, and interval mode
+        # counts from the restored scan's time
+        self.settings_updated_event = asyncio.Event()
+
     def server_configs(self) -> list:
         """Per-server configs: conf/, or the generated ones when conf/ only has region configs."""
         from ..wireguard import scan_config_directory
@@ -241,7 +247,6 @@ class AppState:
         from ..pinger import PingResult
         from ..speedtest import SpeedTestResult
         from ..database import row_is_clean
-        from ..wireguard import scan_config_directory
         logger = logging.getLogger("airbl.state")
 
         scan = await self.db.get_last_complete_scan()
@@ -313,6 +318,7 @@ class AppState:
                 country_name=(conf.country_name if conf else None) or self.all_countries.get(code, code),
                 location=(conf.city if conf else None) or self.server_to_city_api.get(name, ""),
                 load_percent=row.get("load_percent") or 0,
+                load_known=row.get("load_percent") is not None,
                 users=row.get("users") or 0,
                 bandwidth_current=0,
                 bandwidth_max=0,
@@ -365,14 +371,21 @@ class AppState:
     def enabled_cities(self) -> dict[str, set[str]]:
         return {k: set(v) for k, v in config_manager.config.cities.items()}
      
+    def next_scan_iso(self) -> Optional[str]:
+        """Next scheduled scan for the UI, or None when automatic scans are off
+        (the stored time would otherwise keep a countdown running to "Now")."""
+        if not self.next_scan_at or not self.auto_scan_enabled:
+            return None
+        return self.next_scan_at.astimezone().isoformat()
+
     @property
     def auto_scan_enabled(self) -> bool:
         return config_manager.config.scan.auto_scan_enabled
     
     @auto_scan_enabled.setter
     def auto_scan_enabled(self, value: bool):
-        # Allow setting at runtime - update the config
-        config_manager.config.scan.auto_scan_enabled = value
+        # Runtime override (AUTO_SCAN / CLI): applies now, never written to the settings file
+        config_manager.set_runtime_override("scan", "auto_scan_enabled", bool(value))
         
     @property
     def speedtest_enabled(self) -> bool:
@@ -384,8 +397,9 @@ class AppState:
         
     @scan_interval_minutes.setter
     def scan_interval_minutes(self, value: int):
-        # Runtime override (SCAN_INTERVAL / --interval); same bounds as the settings page
-        config_manager.config.scan.scan_interval_minutes = max(5, min(1440, int(value)))
+        # Runtime override (SCAN_INTERVAL / --interval); same bounds as the settings page,
+        # never written to the settings file
+        config_manager.set_runtime_override("scan", "scan_interval_minutes", max(5, min(1440, int(value))))
 
 
 # Global state instance

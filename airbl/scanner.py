@@ -19,7 +19,6 @@ from datetime import datetime
 import ipaddress
 from pathlib import Path
 
-from .config import settings
 
 logger = logging.getLogger("airbl.scanner")
 from .airvpn import AirVPNServer, AirVPNStatus, get_airvpn_status
@@ -30,7 +29,6 @@ from .wireguard import (
     WireGuardConfig,
     scan_config_directory,
     no_configs_message,
-    get_unique_countries,
     get_scannable_configs,
 )
 
@@ -272,7 +270,9 @@ class ServerScanResult:
             "country_code": self.country_code,
             "country_name": self.country_name,
             "location": self.location,
-            "load_percent": self.load_percent,
+            # null when AirVPN's API had no entry for the server (the stored 0 is a placeholder)
+            "load_percent": self.load_percent if self.load_known else None,
+            "load_known": self.load_known,
             "users": self.users,
             "bandwidth_current": self.bandwidth_current,
             "bandwidth_max": self.bandwidth_max,
@@ -907,10 +907,3 @@ class EnhancedScanner:
                 )
         
         summary.completed_at = datetime.now()
-
-
-# Convenience function
-async def run_full_scan(config_dir: Path = None) -> ScanSummary:
-    """Run a full scan of all servers in config directory."""
-    scanner = EnhancedScanner(config_dir=config_dir)
-    return await scanner.scan_all()

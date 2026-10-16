@@ -10,7 +10,6 @@ import os
 import logging
 import time
 from pathlib import Path
-import asyncio
 
 from .config import config_manager
 from .web.state import state
@@ -68,7 +67,8 @@ async def _get_servers_for_gluetun_generation():
     speedtest_map = {}
     for st in recent_speedtests:
         name = st.get("vpn_server_name")
-        if name and name not in speedtest_map:
+        # Newest *successful* test: a failed one (download NULL) would fail the profile thresholds
+        if name and name not in speedtest_map and st.get("is_success", 1):
             speedtest_map[name] = st
             
     # 4. Get server -> city mapping from configs and API fallback
@@ -445,6 +445,15 @@ def _http_error(resp) -> str:
     return msg
 
 
+def _json_object(resp):
+    """The response body as a dict, or None if it isn't a JSON object."""
+    try:
+        data = resp.json()
+    except ValueError:
+        return None
+    return data if isinstance(data, dict) else None
+
+
 async def get_gluetun_status(cfg) -> dict:
     """
     Get the current Gluetun public IP and, if it matches scanned data, the server.
@@ -460,17 +469,21 @@ async def get_gluetun_status(cfg) -> dict:
             if resp.status_code != 200:
                 result["error"] = _http_error(resp)
                 return result
-            result["vpn_status"] = resp.json().get("status")
+            body = _json_object(resp)
+            if body is None:
+                result["error"] = f"Unexpected reply from {_base_url(cfg)}/v1/vpn/status (is this Gluetun's control server?)"
+                return result
+            result["vpn_status"] = body.get("status")
 
             resp = await client.get(f"{_base_url(cfg)}/v1/publicip/ip")
             if resp.status_code != 200:
                 result["error"] = _http_error(resp)
                 return result
             # Gluetun sends JSON without an application/json content-type.
-            try:
-                public_ip = (resp.json() or {}).get("public_ip")
-            except ValueError:
-                public_ip = resp.text.strip()
+            body = _json_object(resp)
+            public_ip = body.get("public_ip") if body is not None else resp.text.strip()
+            if not isinstance(public_ip, (str, type(None))):
+                public_ip = None
     except httpx.HTTPError as e:
         result["error"] = f"Could not reach Gluetun control server at {_base_url(cfg)}: {e.__class__.__name__}"
         return result
@@ -530,19 +543,3 @@ async def set_gluetun_server_names(cfg, names: list) -> dict:
     return {"applied": True, "names": names, "outcome": resp.text.strip()}
 
 
-def get_stability_ranked_servers():
-    """
-    Get servers ranked by stability (ban frequency), for CLEAN_ONLY mode Gluetun server selection.
-    Servers that are frequently banned score lower, making them less likely to be selected.
-    """
-    if not state.current_scan or not state.current_scan.servers:
-        return []
-
-    clean_servers = [s for s in state.current_scan.servers if s.is_clean]
-    ban_history = state.ban_history
-
-    # Sort by ban count (ascending = fewer bans is better), then by server name
-    return sorted(
-        clean_servers,
-        key=lambda s: (ban_history.get(s.server_name, 0), -s.score if s.score else 0)
-    )

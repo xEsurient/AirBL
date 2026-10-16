@@ -170,3 +170,53 @@ def test_settings_db_path_default(tmp_path):
     s = Settings(_env_file=None, cache_dir=tmp_path / "d")
     assert s.db_path == tmp_path / "d" / "airbl.db"
     assert (tmp_path / "d").is_dir()
+
+
+def test_runtime_override_never_saved(mgr_factory):
+    # SCAN_INTERVAL / AUTO_SCAN apply for this run only; any later save keeps the saved value
+    m = mgr_factory(user={"scan": {"scan_interval_minutes": 240}})
+    m.load()
+    m.set_runtime_override("scan", "scan_interval_minutes", 30)
+    m.set_runtime_override("scan", "auto_scan_enabled", False)
+    assert m.config.scan.scan_interval_minutes == 30
+    m.config.performance.threshold_download = 99.0  # an unrelated save
+    assert m.save()
+    saved = json.loads((mgr_factory.data / "airbl-settings.json").read_text())
+    assert saved["scan"]["scan_interval_minutes"] == 240
+    assert "auto_scan_enabled" not in saved["scan"]  # still the default
+    assert m.config.scan.scan_interval_minutes == 30  # still in effect this run
+    # Changed in the UI afterwards: that value is the user's and gets saved
+    m.config.scan.scan_interval_minutes = 60
+    assert m.save()
+    assert json.loads((mgr_factory.data / "airbl-settings.json").read_text())["scan"]["scan_interval_minutes"] == 60
+
+
+def test_out_of_range_values_dropped_not_used(mgr_factory):
+    # Only the API checked bounds: "scan_interval_minutes": 0 in a file meant a scan every minute,
+    # and an unknown day silently became Monday
+    m = mgr_factory(base={"scan": {"scan_interval_minutes": 0, "preferred_mtu": 9000,
+                                   "scan_schedule_days": ["Mon", "Funday"], "scan_mode": "hourly",
+                                   "available_ports": [], "post_server_wait": 150}})
+    cfg = m.load()
+    assert cfg.scan.scan_interval_minutes == 120 and cfg.scan.preferred_mtu == 1320
+    assert cfg.scan.scan_mode == "interval" and len(cfg.scan.scan_schedule_days) == 7
+    assert cfg.scan.available_ports == [1637, 47107, 51820]
+    assert cfg.scan.post_server_wait == 150  # in range: kept
+
+
+@pytest.mark.parametrize("content", ["[1, 2]", "\"text\"", "42"])
+def test_non_object_settings_file_does_not_crash(mgr_factory, content):
+    m = mgr_factory(user=content)
+    cfg = m.load()
+    assert cfg.scan.scan_interval_minutes == 120
+    assert list(mgr_factory.data.glob("airbl-settings.json.unreadable*"))  # kept aside
+
+
+def test_old_regions_mode_and_ipv6_profile_still_load(mgr_factory):
+    # regions.mode was never used and is gone; IPv6 endpoints silently fell back to IPv4
+    m = mgr_factory(user={"regions": {"mode": "manual", "countries": ["DE", "CH"]},
+                          "wireguard": {"profiles": [{"name": "Six", "ip_protocol": "IPv6", "port": 51820}]}})
+    cfg = m.load()
+    assert cfg.regions.countries == ["DE", "CH"] and not hasattr(cfg.regions, "mode")
+    (p,) = cfg.wireguard.profiles
+    assert (p.name, p.port, p.ip_protocol) == ("Six", 51820, "IPv4")  # profile kept, protocol fixed

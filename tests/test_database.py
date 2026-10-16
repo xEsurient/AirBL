@@ -61,8 +61,6 @@ async def test_only_complete_scans_returned(db):
     names = [r["server_name"] for r in await db.get_last_scan_servers()]
     assert names == ["Ran", "Toliman"]
     assert [h["id"] for h in await db.get_scan_history()] == [first]
-    stats = await db.get_stats()
-    assert stats["total_scans"] == 1
 
 
 async def test_ban_history_counts_complete_scans_only(db):
@@ -97,7 +95,6 @@ async def test_entry_pings_and_best_entry(db):
     assert {p["entry_type"] for p in pings} == {"ENTRY1", "ENTRY3"}
     assert await db.get_best_entry_for_server("Toliman") == "ENTRY3"
     assert await db.get_best_entry_for_server("Nobody") == "ENTRY3"
-    assert await db.get_best_entries_bulk(["Toliman", "Nobody"]) == {"Toliman": "ENTRY3", "Nobody": "ENTRY3"}
 
 
 def test_row_is_clean_reputation_and_legacy():
@@ -189,3 +186,27 @@ async def test_historical_averages_include_disabled(db):
                                          "disabled_servers": 3})
     avg = await db.get_historical_averages()
     assert avg["7d"]["avg_disabled"] == 3.0 and avg["7d"]["total_scans"] == 1
+
+
+async def test_old_schema_is_migrated(tmp_path):
+    # A DB from before the status/vpn/reputation columns: init adds them, data kept
+    import aiosqlite
+    path = tmp_path / "old.db"
+    async with aiosqlite.connect(path) as c:
+        await c.execute("CREATE TABLE scan_history (id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp TEXT NOT NULL, "
+                        "total_servers INTEGER DEFAULT 0, clean_servers INTEGER DEFAULT 0, "
+                        "blocked_servers INTEGER DEFAULT 0, disabled_servers INTEGER DEFAULT 0)")
+        await c.execute("INSERT INTO scan_history (timestamp, total_servers) VALUES ('2099-01-01T05:00:00', 28)")
+        await c.commit()
+    db = DatabaseManager(path)
+    await db.init()
+    try:
+        last = await db.get_last_complete_scan()
+        assert last and last["total_servers"] == 28 and last["status"] == "complete"
+        async with db._conn.execute("PRAGMA index_list(server_scan_history)") as cur:
+            assert "idx_server_scan_exit_ip" in {row[1] for row in await cur.fetchall()}
+    finally:
+        await db.close()
+    db2 = DatabaseManager(path)  # second init: nothing to add, no error
+    await db2.init()
+    await db2.close()

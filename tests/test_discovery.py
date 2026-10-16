@@ -359,3 +359,33 @@ async def test_pause_holds_discovery(servers, rig):
     state.is_paused = False
     await asyncio.wait_for(t, 5)
     assert ookla.calls == 15
+
+
+async def test_finalize_prefers_compared_combos():
+    # A combo never compared within a scan got a neutral 1.0 and beat compared ones at 0.95
+    cfg = config_manager.config.scan
+    tasks.reset_discovery(start=True)
+    state.port_discovery_results = {"51820_E1": _rec(51820, 1, 5, 5, dl=900.0),       # never compared
+                                    "1637_E3": _rec(1637, 3, 5, 5, rel=0.95)}
+    await tasks._finalize_discovery()
+    assert cfg.discovery_outcome == "1637/ENTRY3"
+
+
+async def test_period_end_finalizes_without_speedtests(fresh_config):
+    # The finalize used to live only in the speedtest phase: with speedtests off it never ran
+    cfg = fresh_config.scan
+    tasks.reset_discovery(start=True)
+    cfg.discovery_duration_days = 1
+    cfg.discovery_started_at = (datetime.now(timezone.utc) - timedelta(days=2)).isoformat()
+    state.port_discovery_results = {"1637_E3": _rec(1637, 3, 5, 5, rel=1.0)}
+    assert await tasks._finalize_discovery_if_due() is True
+    assert cfg.port_discovery_enabled is False and cfg.discovery_outcome == "1637/ENTRY3"
+    assert await tasks._finalize_discovery_if_due() is False  # once only
+
+
+async def test_period_running_does_not_finalize(fresh_config):
+    cfg = fresh_config.scan
+    tasks.reset_discovery(start=True)
+    cfg.discovery_duration_days = 3
+    assert await tasks._finalize_discovery_if_due() is False
+    assert cfg.port_discovery_enabled is True

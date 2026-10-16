@@ -66,4 +66,4 @@ Run the tests with `pip install -r requirements.txt pytest pytest-asyncio && pyt
 
 ## License
 
-GPL-3.0. AirBL is a community project and is not affiliated with AirVPN or DroneBL.
+GPL-3.0-only (see [LICENSE](LICENSE)). AirBL is a community project and is not affiliated with AirVPN or DroneBL.

@@ -1,6 +1,7 @@
 from fastapi import APIRouter, Request
 from fastapi.responses import HTMLResponse
 from fastapi.templating import Jinja2Templates
+from datetime import datetime
 from pathlib import Path
 import hashlib
 
@@ -24,6 +25,10 @@ def _asset_version() -> str:
 
 
 templates.env.globals["asset_version"] = _asset_version()
+# Stored timestamps are mostly local time without an offset; the browser needs the
+# server's offset to show them right (called per render, so DST changes apply)
+templates.env.globals["server_utc_offset_min"] = (
+    lambda: int(datetime.now().astimezone().utcoffset().total_seconds() // 60))
 
 @router.get("/", response_class=HTMLResponse)
 async def index(request: Request):

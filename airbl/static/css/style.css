@@ -110,6 +110,7 @@ header h1::before {
 
 .nav-links-row {
     display: flex;
+    flex-wrap: wrap;  /* phones: links wrap instead of widening the page */
     gap: 15px;
     justify-content: center;
     align-items: center;
@@ -141,6 +142,37 @@ header h1::before {
 .nav-links button {
     font-family: inherit;
     font-size: inherit;
+    cursor: pointer;
+}
+
+.chart-empty {
+    color: var(--text-secondary);
+    font-style: italic;
+    margin: 15px 0 0;
+}
+
+.restored-note {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    padding: 10px 16px;
+    margin-bottom: 15px;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    color: var(--text-secondary);
+    font-size: 0.85rem;
+}
+
+.restored-note[hidden] {
+    display: none;
+}
+
+.note-dismiss {
+    background: none;
+    border: none;
+    color: var(--text-secondary);
+    font-size: 1.1rem;
     cursor: pointer;
 }
 
@@ -261,6 +293,18 @@ header h1::before {
     transform: translateY(-1px);
 }
 
+.btn.btn-danger {
+    background: var(--danger);
+    border-color: var(--danger);
+    color: #fff;
+}
+
+.btn.btn-warning {
+    background: var(--warning);
+    border-color: var(--warning);
+    color: #000;
+}
+
 .btn-header.btn-danger {
     background: var(--danger);
 }
@@ -289,7 +333,7 @@ header h1::before {
 .filter-group {
     display: flex;
     align-items: center;
-    gap: 8px;
+    gap: 5px;
     flex-shrink: 0;
 }
 
@@ -303,7 +347,8 @@ header h1::before {
 
 .filter-group label {
     color: var(--text-secondary);
-    font-size: 0.85rem;
+    font-size: 0.75rem;
+    white-space: nowrap;
 }
 
 .filter-group select,
@@ -311,11 +356,22 @@ header h1::before {
     background: var(--bg-primary);
     color: var(--text-primary);
     border: 1px solid var(--border);
-    padding: 6px 10px;
+    padding: 4px 6px;
     border-radius: 6px;
     font-family: 'Inter', sans-serif;
-    font-size: 0.9rem;
+    font-size: 0.8rem;
     transition: all 0.2s ease;
+    max-width: 70px;
+}
+
+/* Selects show names ("All Countries"), not numbers */
+.filter-group select {
+    max-width: none;
+    width: 95px;
+}
+
+.filter-group #filterCountry {
+    width: 130px;
 }
 
 .filter-group select:focus,
@@ -670,7 +726,8 @@ footer {
 
 .charts-grid {
     display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(400px, 1fr));
+    /* min(): on phones narrower than 400px a column must still fit the screen */
+    grid-template-columns: repeat(auto-fit, minmax(min(400px, 100%), 1fr));
     gap: 20px;
 }
 
@@ -963,9 +1020,14 @@ footer {
 }
 
 .city-checkbox span,
+.city-checkbox label,
 .country-checkbox span {
     flex: 1;
     user-select: none;
+}
+
+.city-checkbox label {
+    cursor: pointer;
 }
 
 /* Signal Bars */
@@ -1039,7 +1101,6 @@ footer {
 /* Filter Bar - Inline layout for dashboard filters */
 .filter-bar {
     display: flex;
-    flex-wrap: nowrap;
     gap: 8px;
     align-items: center;
     background: var(--bg-card);
@@ -1048,26 +1109,15 @@ footer {
     padding: 10px 15px;
     margin-bottom: 20px;
     overflow-x: auto;
-}
-
-.filter-group {
-    display: flex;
-    align-items: center;
-    gap: 5px;
-    flex-shrink: 0;
-}
-
-.filter-group label {
-    color: var(--text-secondary);
-    font-size: 0.75rem;
-    white-space: nowrap;
-}
-
-.filter-group input,
-.filter-group select {
-    max-width: 70px;
-    padding: 4px 6px;
-    font-size: 0.8rem;
+    /* One row of filters is wider than the 1200px page column: let the bar extend past
+       it (centred) up to the window width, and wrap to a second row on narrower screens */
+    flex-wrap: wrap;
+    box-sizing: border-box;
+    width: max-content;
+    min-width: 100%;
+    max-width: calc(100vw - 40px);  /* same 20px side margins as the page */
+    margin-left: 50%;
+    transform: translateX(-50%);
 }
 
 .btn-reset {
@@ -1281,9 +1331,27 @@ footer {
 }
 
 /* Responsive modal */
+.detail-metrics-grid {
+    display: grid;
+    grid-template-columns: repeat(5, 1fr);
+    gap: 10px;
+}
+
 @media (max-width: 640px) {
     .modal-content {
         max-height: 90vh;
+    }
+
+    .nav-links-row {
+        gap: 4px;
+    }
+
+    .nav-links a {
+        padding: 6px 10px;
+    }
+
+    .detail-metrics-grid {
+        grid-template-columns: repeat(2, 1fr);
     }
 
     .info-grid {

@@ -5,16 +5,17 @@
 {% block page_title %}Advanced Historic Metrics{% endblock %}
 
 {% block head %}
-<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+<!-- Pinned with SRI: an unpinned URL would pull a future major version with breaking changes -->
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.5.1/dist/chart.umd.min.js" integrity="sha384-jb8JQMbMoBUzgWatfe6COACi2ljcDdZQ2OxczGA3bGNeWe+6DChMTBJemed7ZnvJ" crossorigin="anonymous"></script>
 {% endblock %}
 
 {% block content %}
 <div class="category-tabs" id="metricsTabs">
-    <button class="tab-btn active" onclick="filterMetrics('all')">ALL</button>
-    <button class="tab-btn" onclick="filterMetrics('ping')">PING</button>
-    <button class="tab-btn" onclick="filterMetrics('servers')">SERVERS</button>
-    <button class="tab-btn" onclick="filterMetrics('wireguard')">WIREGUARD</button>
-    <button class="tab-btn" onclick="filterMetrics('averages')">AVERAGES</button>
+    <button class="tab-btn active" onclick="filterMetrics('all', this)">ALL</button>
+    <button class="tab-btn" onclick="filterMetrics('ping', this)">PING</button>
+    <button class="tab-btn" onclick="filterMetrics('servers', this)">SERVERS</button>
+    <button class="tab-btn" onclick="filterMetrics('wireguard', this)">WIREGUARD</button>
+    <button class="tab-btn" onclick="filterMetrics('averages', this)">AVERAGES</button>
 </div>
 
 <!-- Avg Entry Ping by Country -->
@@ -101,11 +102,11 @@
         return chartsOk ? new Chart(canvas, cfg) : null;
     }
 
-    function filterMetrics(category) {
+    function filterMetrics(category, btn) {
         document.querySelectorAll('#metricsTabs .tab-btn').forEach(btn => {
             btn.classList.remove('active');
         });
-        event.target.classList.add('active');
+        btn.classList.add('active');
 
         document.querySelectorAll('[data-metric-category]').forEach(el => {
             if (category === 'all' || el.dataset.metricCategory === category) {
@@ -165,6 +166,7 @@
             const metricsData = await metricsRes.json();
 
             // Country-grouped stacked bar chart
+            if (metricsCountryChart) { metricsCountryChart.destroy(); metricsCountryChart = null; }
             if (metricsData.country_stats && metricsData.country_stats.length > 0) {
                 const countryLabels = metricsData.country_stats.map(c => c.country_code);
                 const countryDatasets = [
@@ -193,6 +195,7 @@
             }
 
             // Average Entry Ping by Country
+            if (pingCountryChart) { pingCountryChart.destroy(); pingCountryChart = null; }  // no stale chart when the data is gone
             if (metricsData.ping_by_country && metricsData.ping_by_country.length > 0) {
                 const pbc = metricsData.ping_by_country.filter(c => c.avg_entry1 != null || c.avg_entry3 != null);
                 if (pbc.length > 0) {
@@ -217,10 +220,13 @@
             }
 
             // Entry Ping per Server
+            if (pingServerChart) { pingServerChart.destroy(); pingServerChart = null; }  // no stale chart when the data is gone
             if (metricsData.ping_by_server && metricsData.ping_by_server.length > 0) {
                 const pbs = metricsData.ping_by_server.filter(s => s.entry1_ping != null || s.entry3_ping != null);
                 if (pbs.length > 0) {
                     if (pingServerChart) pingServerChart.destroy();
+                    // Two bars per server: give each row room, or Chart.js hides most labels
+                    document.getElementById('pingServerChartContainer').style.height = Math.max(400, pbs.length * 26) + 'px';
                     pingServerChart = makeChart(document.getElementById('pingServerChart'), {
                         type: 'bar',
                         data: {

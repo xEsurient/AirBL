@@ -5,7 +5,7 @@ import asyncio
 import pytest
 
 from airbl import dns_lookup
-from airbl.dns_lookup import DNSLookupError, lookup_exit_ips, lookup_server_exit_ips
+from airbl.dns_lookup import lookup_exit_ips
 
 
 class FakeProc:
@@ -109,9 +109,10 @@ async def test_nonzero_exit_error(fake_dig):
     assert "dig exit 10: some resolver error" in err
 
 
-async def test_lookup_server_exit_ips_raises(fake_dig):
+async def test_aaaa_only_answer_is_an_error(fake_dig):
+    # Both A queries failed: the IPv4 exits would go unchecked while the server looked clean
     table, _ = fake_dig
-    table["A"] = FileNotFoundError()
-    table["AAAA"] = FileNotFoundError()
-    with pytest.raises(DNSLookupError):
-        await lookup_server_exit_ips("Toliman")
+    table["A"] = lambda: FakeProc(b";; connection timed out; no servers could be reached\n", rc=9)
+    table["AAAA"] = lambda: FakeProc(b"2001:db8::1\n")
+    ips, err = await lookup_exit_ips("Toliman")
+    assert ips == set() and err and "timed out" in err

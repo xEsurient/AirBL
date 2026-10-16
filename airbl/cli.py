@@ -6,6 +6,8 @@ Installed as the `airbl` console script; `python main.py` is a thin wrapper.
 """
 
 import asyncio
+import os
+import sys
 from pathlib import Path
 
 import click
@@ -93,11 +95,11 @@ def scan(config_dir: Path, speedtest: bool, output: str):
         airbl scan --speedtest
         airbl scan -o json
     """
-    asyncio.run(_scan_async(config_dir, speedtest, output))
+    sys.exit(asyncio.run(_scan_async(config_dir, speedtest, output)))
 
 
-async def _scan_async(config_dir: Path, run_speedtest: bool, output: str):
-    """Async scan implementation."""
+async def _scan_async(config_dir: Path, run_speedtest: bool, output: str) -> int:
+    """Async scan implementation. Returns the exit code."""
     
     console.print(Panel(
         Text("AirBL - AirVPN DroneBL Checker", style="bold cyan", justify="center"),
@@ -110,14 +112,14 @@ async def _scan_async(config_dir: Path, run_speedtest: bool, output: str):
     if not config_dir.exists():
         console.print(f"[red]Error: Config directory not found: {config_dir}[/]")
         console.print("[dim]Create the directory and add your AirVPN .conf files[/]")
-        return
+        return 1
     
     configs = scan_config_directory(config_dir)
     scannable = get_scannable_configs(configs)
     
     if not configs:
         console.print(f"[red]Error: {no_configs_message(config_dir)}[/]")
-        return
+        return 1
     
     console.print(f"[green]✓[/] Found {len(configs)} config files")
     filtered = len(configs) - len(scannable)
@@ -170,9 +172,11 @@ async def _scan_async(config_dir: Path, run_speedtest: bool, output: str):
     if run_speedtest and summary.clean_servers:
         console.print()
         console.print("[bold cyan]Running speedtests on clean servers...[/]")
-        await run_speedtests(summary)
+        if not await run_speedtests(summary):
+            return 1
         console.print()
         display_results(summary)  # Refresh display with speedtest results
+    return 0
 
 
 def display_results(summary: ScanSummary):
@@ -202,10 +206,12 @@ def display_results(summary: ScanSummary):
         
         country_name = servers[0].country_name
         clean_count = len([s for s in servers if s.is_clean])
-        blocked_count = len(servers) - clean_count
+        unknown_count = len([s for s in servers if s.reputation == "unknown"])
+        blocked_count = len(servers) - clean_count - unknown_count
+        unknown_note = f", {unknown_count} unverified" if unknown_count else ""
         
         table = Table(
-            title=f"{flag_emoji(country_code)} {country_name} ({clean_count} clean, {blocked_count} blocked)",
+            title=f"{flag_emoji(country_code)} {country_name} ({clean_count} clean, {blocked_count} blocked{unknown_note})",
             box=box.ROUNDED,
             show_header=True,
             header_style="bold cyan",
@@ -229,6 +235,9 @@ def display_results(summary: ScanSummary):
             # Status
             if server.is_clean:
                 status = Text("✅ OK", style="green")
+            elif server.reputation == "unknown":
+                # The DroneBL lookup failed: not known to be listed, not known to be clean
+                status = Text("⚠ UNVERIFIED", style="yellow")
             else:
                 status = Text("🚫 BLOCKED", style="red")
             
@@ -275,13 +284,28 @@ def display_results(summary: ScanSummary):
         console.print()
 
 
-async def run_speedtests(summary: ScanSummary):
-    """Run speedtests on clean servers."""
+def _web_app_running() -> bool:
+    """True if the AirBL web app answers on this host: it owns the tunnel and kill switch."""
+    import httpx
+    port = os.getenv("PORT", "5665").strip() or "5665"
+    try:
+        return httpx.get(f"http://127.0.0.1:{port}/api/status", timeout=2).status_code == 200
+    except (httpx.HTTPError, ValueError):
+        return False
+
+
+async def run_speedtests(summary: ScanSummary) -> bool:
+    """Run speedtests on clean servers. False if they couldn't run at all."""
     
     clean_servers = summary.clean_servers
     if not clean_servers:
         console.print("[yellow]No clean servers to speedtest[/]")
-        return
+        return True
+    if _web_app_running():
+        # Both would use wg0, routing table 51820 and the kill switch at the same time
+        console.print("[red]The AirBL web app is running here and owns the VPN tunnel. "
+                      "Run speedtests from the dashboard, or stop the web app first.[/]")
+        return False
     
     # Same egress check as the web speedtests (a result seen from another IP leaked)
     from airbl.web.tasks import _reject_if_not_via_vpn
@@ -320,12 +344,12 @@ async def run_speedtests(summary: ScanSummary):
             else:
                 console.print(f"  [red]Speedtest failed: {speedtest.error}[/]")
             
-            # Disconnect
-            await controller.disconnect(server.config_file)
-            
         except Exception as e:
             console.print(f"  [red]Error: {e}[/]")
+        finally:
+            # Also on Ctrl+C: never leave the tunnel or kill switch up
             await controller.disconnect(server.config_file)
+    return True
 
 
 @cli.command()
@@ -382,21 +406,32 @@ def configs(config_dir: Path):
 def check(ip: str):
     """
     Check a single IP against DroneBL.
+
+    Exit code: 0 clean, 1 listed, 2 unverified (the lookup failed or the
+    resolver doesn't really answer for DroneBL).
     """
-    from airbl.dronebl import check_dronebl_sync
-    
+    from airbl.dronebl import check_dronebl_batch
+
     console.print(f"[dim]Checking {ip} against DroneBL...[/]")
-    
-    result = check_dronebl_sync(ip)
-    
+
+    # The batch path also checks that the resolver answers for DroneBL (test entry)
+    (result,) = asyncio.run(check_dronebl_batch([ip]))
+
     if result.is_listed:
         console.print(f"[red]🚫 BLOCKED[/] - {ip}")
         console.print(f"   Code: {result.listing_code}")
         console.print(f"   Reason: {result.listing_reason}")
+        code = 1
+    elif result.error:
+        console.print(f"[yellow]⚠ UNVERIFIED[/] - {ip}")
+        console.print(f"   {result.error}")
+        code = 2
     else:
         console.print(f"[green]✅ CLEAN[/] - {ip}")
-    
+        code = 0
+
     console.print(f"   Lookup time: {result.lookup_time_ms:.1f}ms")
+    sys.exit(code)
 
 
 @cli.command()
@@ -421,6 +456,7 @@ def ping(ip: str):
         console.print(f"[red]❌ UNREACHABLE[/] - {ip}")
         if result.error:
             console.print(f"[dim]   {result.error}[/]")
+        sys.exit(1)
 
 
 @cli.command()
@@ -454,6 +490,7 @@ def speedtest(country: str, server_id: int):
             console.print(f"[dim]Your IP: {result.client_ip}[/]")
     else:
         console.print(f"[red]✗[/] Error: {result.error}")
+        sys.exit(1)
 
 
 @cli.command()
@@ -477,16 +514,16 @@ def speedtest(country: str, server_id: int):
 )
 @click.option(
     "--interval", "-i",
-    default=120,
-    type=int,
-    help="Scan interval in minutes",
+    default=None,
+    type=click.IntRange(5, 1440),
+    help="Scan interval in minutes for this run (default: the saved setting)",
 )
 @click.option(
     "--auto-scan/--no-auto-scan",
-    default=True,
-    help="Start scanning automatically",
+    default=None,
+    help="Turn automatic scans on/off for this run (default: the saved setting)",
 )
-def web(host: str, port: int, config_dir: Path, interval: int, auto_scan: bool):
+def web(host: str, port: int, config_dir: Path, interval, auto_scan):
     """
     Start the web GUI server.
     
@@ -497,7 +534,7 @@ def web(host: str, port: int, config_dir: Path, interval: int, auto_scan: bool):
     console.print("[bold cyan]🌐 Starting AirBL Web Server[/]")
     console.print(f"[dim]URL: http://{host}:{port}[/]")
     console.print(f"[dim]Config: {config_dir}[/]")
-    console.print(f"[dim]Scan interval: {interval} minutes[/]")
+    console.print(f"[dim]Scan interval: {f'{interval} minutes' if interval else 'saved setting'}[/]")
     console.print()
     
     asyncio.run(run_server(
@@ -514,7 +551,11 @@ def status():
     """
     Show AirVPN network status summary.
     """
-    status_data = asyncio.run(get_airvpn_status())
+    try:
+        status_data = asyncio.run(get_airvpn_status())
+    except Exception as e:
+        console.print(f"[red]Could not get the AirVPN status: {e}[/]")
+        sys.exit(1)
     
     text = Text()
     text.append("🌐 AirVPN Network Status\n\n", style="bold cyan")
