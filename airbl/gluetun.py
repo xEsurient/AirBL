@@ -296,6 +296,7 @@ async def generate_gluetun_servers_json():
 WATCHDOG_COOLDOWN_SECONDS = 180
 _last_push_at = None  # monotonic() counts from boot, so 0.0 would mean "just pushed" on a fresh machine
 _watchdog_error = None
+_last_stay_logged = None  # watchdog logs "staying" once per server, not every minute
 
 
 async def gluetun_watchdog_check(force: bool = False) -> dict:
@@ -346,9 +347,16 @@ async def update_gluetun_server_selection(filtered, status: dict = None, quiet: 
     status: an already fetched Gluetun status (watchdog). quiet: log "staying" at debug
     level, and treat ALWAYS as "reset if outside the target set" so it doesn't push every minute.
     """
+    global _last_stay_logged
     cfg = config_manager.config.gluetun
     mode = cfg.force_update_mode
-    stay_log = logger.debug if quiet else logger.info
+
+    def stay_log(msg):
+        global _last_stay_logged
+        if quiet and msg == _last_stay_logged:
+            return
+        _last_stay_logged = msg
+        (logger.debug if quiet else logger.info)(msg)
 
     # Never steer Gluetun onto a blocklisted server, whatever the profile allows.
     ranked = sorted((s for s, _ in filtered if s.is_clean), key=lambda s: s.score or 0, reverse=True)
@@ -389,6 +397,7 @@ async def update_gluetun_server_selection(filtered, status: dict = None, quiet: 
                 return {"applied": False, "reason": "current server within target set"}
 
     names = sorted({_gluetun_name(s) for s in targets})
+    _last_stay_logged = None
     if quiet:
         where = status.get("server_name") or status.get("ip")
         logger.info(f"Gluetun watchdog: {where} doesn't fit {mode}; switching.")

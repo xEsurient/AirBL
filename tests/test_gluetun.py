@@ -275,6 +275,20 @@ async def test_watchdog_stays_within_targets(watchdog):
     assert calls["set"] == []  # ALWAYS doesn't re-push every minute
 
 
+async def test_watchdog_logs_staying_once(watchdog, make_summary, ranked, monkeypatch, caplog):
+    # A line per minute filled the 1000-entry debug buffer and pushed the scan logs out
+    cfg, status, calls = watchdog
+    cfg.force_update_mode = "CLEAN_ONLY"
+    state.current_scan = make_summary([s for s, _ in ranked])
+    monkeypatch.setattr(gluetun, "_last_stay_logged", None)
+    with caplog.at_level("DEBUG", logger=gluetun.logger.name):
+        for _ in range(3):
+            await gluetun.gluetun_watchdog_check()
+        status["value"] = {"ip": "192.0.2.2", "vpn_status": "running", "error": None}
+        await gluetun.gluetun_watchdog_check()
+    assert sum("staying connected" in r.message for r in caplog.records) == 2
+
+
 async def test_watchdog_switches_when_outside(watchdog, make_summary, ranked):
     cfg, status, calls = watchdog
     cfg.force_update_mode = "NOT_TOP4"

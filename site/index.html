@@ -1,0 +1,1038 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>AirBL: keep AirVPN on clean, fast servers</title>
+  <meta name="description"
+    content="AirBL scans AirVPN servers, checks their exit IPs against the DroneBL blocklist, speed-tests them through a verified WireGuard tunnel, and keeps Gluetun and your WireGuard configs on the clean, fast ones. Self-hosted, Docker, GPL-3.0.">
+  <meta name="theme-color" content="#09090b">
+  <meta property="og:type" content="website">
+  <meta property="og:title" content="AirBL: keep AirVPN on clean, fast servers">
+  <meta property="og:description"
+    content="Scan AirVPN servers, check exit IPs against DroneBL, speed-test through a verified tunnel, and steer Gluetun to the clean, fast ones.">
+  <meta property="og:url" content="https://xesurient.github.io/AirBL/">
+  <meta property="og:image" content="https://xesurient.github.io/AirBL/assets/og.jpg">
+  <meta property="og:image:width" content="1200">
+  <meta property="og:image:height" content="630">
+  <meta name="twitter:card" content="summary_large_image">
+  <link rel="icon"
+    href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%2309090b'/%3E%3Cpath d='M16 5l9 4v6c0 6-4 10-9 12-5-2-9-6-9-12V9z' fill='none' stroke='%2310b981' stroke-width='2.4' stroke-linejoin='round'/%3E%3Cpath d='M12 16l3 3 5-6' fill='none' stroke='%23fafafa' stroke-width='2.4' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E">
+  <style>
+    /* Same tokens as the dashboard (airbl/static/css/style.css) */
+    :root {
+      --bg-primary: #09090b;
+      --bg-card: #18181b;
+      --bg-hover: rgba(255, 255, 255, 0.04);
+      --text-primary: #fafafa;
+      --text-secondary: #a1a1aa;
+      --border: #27272a;
+      --border-hover: #3f3f46;
+      --success: #10b981;
+      --warning: #f59e0b;
+      --danger: #ef4444;
+      --muted: #71717a;
+      --radius: 12px;
+      --max: 1120px;
+    }
+
+    *,
+    *::before,
+    *::after {
+      box-sizing: border-box;
+    }
+
+    html {
+      scroll-behavior: smooth;
+    }
+
+    body {
+      margin: 0;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, Roboto, "Helvetica Neue", Arial, sans-serif;
+      background: var(--bg-primary);
+      color: var(--text-primary);
+      line-height: 1.6;
+      font-size: 1rem;
+      -webkit-font-smoothing: antialiased;
+    }
+
+    a {
+      color: inherit;
+    }
+
+    :focus-visible {
+      outline: 2px solid var(--success);
+      outline-offset: 3px;
+      border-radius: 4px;
+    }
+
+    .skip {
+      position: absolute;
+      left: -999px;
+      top: 8px;
+      background: var(--text-primary);
+      color: var(--bg-primary);
+      padding: 8px 14px;
+      border-radius: 6px;
+      z-index: 10;
+    }
+
+    .skip:focus {
+      left: 8px;
+    }
+
+    .wrap {
+      max-width: var(--max);
+      margin: 0 auto;
+      padding: 0 24px;
+    }
+
+    code,
+    pre {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 0.9em;
+    }
+
+    code {
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      border-radius: 5px;
+      padding: 1px 6px;
+    }
+
+    /* Header */
+    .site-header {
+      border-bottom: 1px solid var(--border);
+      position: sticky;
+      top: 0;
+      background: rgba(9, 9, 11, 0.85);
+      backdrop-filter: blur(8px);
+      z-index: 5;
+    }
+
+    .site-header .wrap {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      height: 64px;
+    }
+
+    .brand {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      font-weight: 700;
+      font-size: 1.15rem;
+      letter-spacing: 0.02em;
+      text-decoration: none;
+    }
+
+    .nav {
+      display: flex;
+      gap: 6px;
+      align-items: center;
+    }
+
+    .nav a {
+      color: var(--text-secondary);
+      text-decoration: none;
+      font-size: 0.92rem;
+      padding: 6px 10px;
+      border-radius: 6px;
+    }
+
+    .nav a:hover {
+      color: var(--text-primary);
+      background: var(--bg-hover);
+    }
+
+    .nav .gh {
+      color: var(--text-primary);
+      border: 1px solid var(--border);
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+    }
+
+    .menu {
+      display: none;
+    }
+
+    .menu summary {
+      list-style: none;
+      cursor: pointer;
+      padding: 6px 10px;
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      color: var(--text-secondary);
+      font-size: 0.92rem;
+    }
+
+    .menu summary::-webkit-details-marker {
+      display: none;
+    }
+
+    .menu nav {
+      position: absolute;
+      right: 24px;
+      top: 58px;
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 8px;
+      display: flex;
+      flex-direction: column;
+      min-width: 180px;
+    }
+
+    .menu nav a {
+      color: var(--text-secondary);
+      text-decoration: none;
+      padding: 8px 10px;
+      border-radius: 6px;
+    }
+
+    .menu nav a:hover {
+      color: var(--text-primary);
+      background: var(--bg-hover);
+    }
+
+    /* Hero */
+    .hero {
+      padding-top: 72px;
+      padding-bottom: 40px;
+      text-align: center;
+    }
+
+    .eyebrow {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      font-size: 0.85rem;
+      color: var(--text-secondary);
+      border: 1px solid var(--border);
+      border-radius: 999px;
+      padding: 4px 12px;
+      margin-bottom: 22px;
+    }
+
+    .dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: var(--success);
+      display: inline-block;
+    }
+
+    h1 {
+      font-size: clamp(2.1rem, 5vw, 3.4rem);
+      line-height: 1.12;
+      letter-spacing: -0.02em;
+      margin: 0 auto 18px;
+      max-width: 820px;
+    }
+
+    .lead {
+      color: var(--text-secondary);
+      font-size: 1.12rem;
+      max-width: 700px;
+      margin: 0 auto 30px;
+    }
+
+    .cta {
+      display: flex;
+      gap: 12px;
+      justify-content: center;
+      flex-wrap: wrap;
+    }
+
+    .btn {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      padding: 10px 20px;
+      border-radius: 8px;
+      font-weight: 600;
+      text-decoration: none;
+      font-size: 0.95rem;
+      border: 1px solid var(--border);
+      transition: background 0.15s, border-color 0.15s;
+    }
+
+    .btn-primary {
+      background: var(--text-primary);
+      color: var(--bg-primary);
+      border-color: var(--text-primary);
+    }
+
+    .btn-primary:hover {
+      background: #e4e4e7;
+    }
+
+    .btn-ghost:hover {
+      background: var(--bg-hover);
+      border-color: var(--border-hover);
+    }
+
+    .frame {
+      margin: 48px auto 0;
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      overflow: hidden;
+      background: var(--bg-card);
+      box-shadow: 0 30px 80px -30px rgba(0, 0, 0, 0.8);
+    }
+
+    .frame-bar {
+      height: 34px;
+      border-bottom: 1px solid var(--border);
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      padding: 0 14px;
+    }
+
+    .frame-bar span {
+      width: 10px;
+      height: 10px;
+      border-radius: 50%;
+      background: var(--border-hover);
+    }
+
+    .frame-bar em {
+      margin-left: 10px;
+      font-style: normal;
+      font-size: 0.78rem;
+      color: var(--muted);
+    }
+
+    img {
+      display: block;
+      max-width: 100%;
+      height: auto;
+    }
+
+    /* Sections */
+    section {
+      padding: 72px 0;
+      border-top: 1px solid var(--border);
+      scroll-margin-top: 64px; /* sticky header */
+    }
+
+    .hero+section {
+      border-top: 0;
+    }
+
+    h2 {
+      font-size: clamp(1.5rem, 3vw, 2rem);
+      letter-spacing: -0.01em;
+      margin: 0 0 10px;
+    }
+
+    .sub {
+      color: var(--text-secondary);
+      margin: 0 0 36px;
+      max-width: 720px;
+    }
+
+    .grid {
+      display: grid;
+      gap: 16px;
+    }
+
+    .g3 {
+      grid-template-columns: repeat(3, 1fr);
+    }
+
+    .g4 {
+      grid-template-columns: repeat(4, 1fr);
+    }
+
+    .card {
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 22px;
+    }
+
+    .card h3 {
+      margin: 0 0 6px;
+      font-size: 1.02rem;
+    }
+
+    .card p {
+      margin: 0;
+      color: var(--text-secondary);
+      font-size: 0.94rem;
+    }
+
+    .icon {
+      width: 36px;
+      height: 36px;
+      border-radius: 8px;
+      border: 1px solid var(--border);
+      display: grid;
+      place-items: center;
+      margin-bottom: 14px;
+      color: var(--text-primary);
+    }
+
+    .icon svg {
+      width: 18px;
+      height: 18px;
+    }
+
+    /* Server states */
+    .state {
+      border-left: 3px solid var(--border-hover);
+    }
+
+    .state.clean {
+      border-left-color: var(--success);
+    }
+
+    .state.blocked {
+      border-left-color: var(--danger);
+    }
+
+    .state.unverified {
+      border-left-color: var(--muted);
+    }
+
+    .tag {
+      display: inline-block;
+      font-size: 0.78rem;
+      font-weight: 700;
+      letter-spacing: 0.06em;
+      text-transform: uppercase;
+      margin-bottom: 6px;
+    }
+
+    .clean .tag {
+      color: var(--success);
+    }
+
+    .blocked .tag {
+      color: var(--danger);
+    }
+
+    .unverified .tag {
+      color: var(--text-secondary);
+    }
+
+    /* Steps */
+    .step-num {
+      font-size: 0.8rem;
+      font-weight: 700;
+      color: var(--muted);
+      letter-spacing: 0.08em;
+      margin-bottom: 8px;
+    }
+
+    .card ul {
+      margin: 10px 0 0;
+      padding-left: 18px;
+      color: var(--text-secondary);
+      font-size: 0.92rem;
+    }
+
+    .card li+li {
+      margin-top: 4px;
+    }
+
+    /* Screenshots */
+    .shots {
+      display: grid;
+      grid-template-columns: repeat(2, 1fr);
+      gap: 20px;
+    }
+
+    figure {
+      margin: 0;
+    }
+
+    figure a {
+      display: block;
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      overflow: hidden;
+      transition: border-color 0.15s;
+    }
+
+    figure a:hover {
+      border-color: var(--border-hover);
+    }
+
+    figcaption {
+      color: var(--text-secondary);
+      font-size: 0.9rem;
+      margin-top: 10px;
+    }
+
+    figcaption strong {
+      color: var(--text-primary);
+      font-weight: 600;
+    }
+
+    /* Quick start */
+    .qs {
+      display: grid;
+      grid-template-columns: 1fr 1.4fr;
+      gap: 24px;
+      align-items: start;
+    }
+
+    .qs>* {
+      min-width: 0; /* let the command block scroll instead of widening the page */
+    }
+
+    .req li {
+      margin-bottom: 6px;
+    }
+
+    ol.steps {
+      list-style: none;
+      counter-reset: s;
+      margin: 0;
+      padding: 0;
+    }
+
+    ol.steps>li {
+      counter-increment: s;
+      position: relative;
+      padding: 0 0 22px 44px;
+    }
+
+    ol.steps>li::before {
+      content: counter(s);
+      position: absolute;
+      left: 0;
+      top: 0;
+      width: 28px;
+      height: 28px;
+      border-radius: 50%;
+      border: 1px solid var(--border-hover);
+      display: grid;
+      place-items: center;
+      font-size: 0.85rem;
+      font-weight: 700;
+    }
+
+    ol.steps h3 {
+      margin: 2px 0 4px;
+      font-size: 1rem;
+    }
+
+    ol.steps p {
+      margin: 0;
+      color: var(--text-secondary);
+      font-size: 0.94rem;
+    }
+
+    .code {
+      margin-top: 10px;
+      display: flex;
+      flex-direction: column;
+    }
+
+    .code pre code {
+      background: none;
+      border: 0;
+      padding: 0;
+    }
+
+    .code pre {
+      margin: 0;
+      background: #000;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 12px 14px;
+      overflow-x: auto;
+      color: var(--text-primary);
+    }
+
+    .copy {
+      align-self: flex-end;
+      margin-bottom: 6px;
+      background: var(--bg-card);
+      color: var(--text-secondary);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      font: inherit;
+      font-size: 0.78rem;
+      padding: 3px 9px;
+      cursor: pointer;
+    }
+
+    .copy:hover {
+      color: var(--text-primary);
+      border-color: var(--border-hover);
+    }
+
+    /* Docs */
+    .docs a.card {
+      text-decoration: none;
+      display: block;
+      transition: border-color 0.15s, background 0.15s;
+    }
+
+    .docs a.card:hover {
+      border-color: var(--border-hover);
+      background: #1c1c20;
+    }
+
+    .docs h3::after {
+      content: " \2192";
+      color: var(--muted);
+    }
+
+    /* Footer */
+    footer {
+      border-top: 1px solid var(--border);
+      padding: 32px 0 48px;
+      color: var(--muted);
+      font-size: 0.88rem;
+    }
+
+    footer .wrap {
+      display: flex;
+      justify-content: space-between;
+      gap: 16px;
+      flex-wrap: wrap;
+    }
+
+    footer a {
+      color: var(--text-secondary);
+    }
+
+    /* Gentle entrance; off for reduced motion */
+    @media (prefers-reduced-motion: no-preference) {
+      .reveal {
+        animation: rise 0.6s ease-out both;
+      }
+
+      .reveal.d1 {
+        animation-delay: 0.08s;
+      }
+
+      .reveal.d2 {
+        animation-delay: 0.16s;
+      }
+
+      @keyframes rise {
+        from {
+          opacity: 0;
+          transform: translateY(10px);
+        }
+
+        to {
+          opacity: 1;
+          transform: none;
+        }
+      }
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+      html {
+        scroll-behavior: auto;
+      }
+    }
+
+    @media (max-width: 900px) {
+
+      .g3,
+      .g4 {
+        grid-template-columns: repeat(2, 1fr);
+      }
+
+      .qs {
+        grid-template-columns: 1fr;
+      }
+    }
+
+    @media (max-width: 760px) {
+      .nav {
+        display: none;
+      }
+
+      .menu {
+        display: block;
+      }
+
+      .shots {
+        grid-template-columns: 1fr;
+      }
+    }
+
+    @media (max-width: 560px) {
+
+      .g3,
+      .g4 {
+        grid-template-columns: 1fr;
+      }
+
+      .hero {
+        padding-top: 48px;
+      }
+
+      h1 {
+        font-size: 1.95rem;
+      }
+
+      section {
+        padding: 56px 0;
+      }
+    }
+  </style>
+</head>
+
+<body>
+  <a class="skip" href="#main">Skip to content</a>
+
+  <header class="site-header">
+    <div class="wrap">
+      <a class="brand" href="#top" aria-label="AirBL home">
+        <svg width="26" height="26" viewBox="0 0 32 32" aria-hidden="true">
+          <rect width="32" height="32" rx="7" fill="#18181b" stroke="#27272a" />
+          <path d="M16 5l9 4v6c0 6-4 10-9 12-5-2-9-6-9-12V9z" fill="none" stroke="#10b981" stroke-width="2.2"
+            stroke-linejoin="round" />
+          <path d="M12 16l3 3 5-6" fill="none" stroke="#fafafa" stroke-width="2.2" stroke-linecap="round"
+            stroke-linejoin="round" />
+        </svg>
+        AirBL
+      </a>
+      <nav class="nav" aria-label="Main">
+        <a href="#how">How it works</a>
+        <a href="#features">Features</a>
+        <a href="#screenshots">Screenshots</a>
+        <a href="#quick-start">Quick start</a>
+        <a href="#docs">Docs</a>
+        <a class="gh" href="https://github.com/xesurient/AirBL">
+          <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true">
+            <path
+              d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z" />
+          </svg>
+          GitHub
+        </a>
+      </nav>
+      <details class="menu">
+        <summary aria-label="Open menu">Menu</summary>
+        <nav aria-label="Mobile">
+          <a href="#how">How it works</a>
+          <a href="#features">Features</a>
+          <a href="#screenshots">Screenshots</a>
+          <a href="#quick-start">Quick start</a>
+          <a href="#docs">Docs</a>
+          <a href="https://github.com/xesurient/AirBL">GitHub</a>
+        </nav>
+      </details>
+    </div>
+  </header>
+
+  <main id="main">
+    <div class="wrap hero" id="top">
+      <div class="eyebrow reveal"><span class="dot" aria-hidden="true"></span> Self-hosted · Docker · GPL-3.0</div>
+      <h1 class="reveal d1">Keep your AirVPN connection on clean, fast servers</h1>
+      <p class="lead reveal d2">AirBL scans AirVPN servers, checks their exit IPs against the DroneBL blocklist,
+        speed-tests them through a verified WireGuard tunnel, and keeps Gluetun and your WireGuard configs on the
+        good ones.</p>
+      <div class="cta reveal d2">
+        <a class="btn btn-primary" href="#quick-start">Quick start</a>
+        <a class="btn btn-ghost" href="https://github.com/xesurient/AirBL">View on GitHub</a>
+      </div>
+      <div class="frame reveal d2">
+        <div class="frame-bar" aria-hidden="true"><span></span><span></span><span></span><em>AirBL dashboard</em>
+        </div>
+        <img src="assets/overview.jpg" width="1400" height="900"
+          alt="AirBL overview: 25 servers scanned, 2 clean, 23 blocked, with speedtest and ping charts for the clean servers">
+      </div>
+    </div>
+
+    <section aria-labelledby="states-title">
+      <div class="wrap">
+        <h2 id="states-title">Every server gets a clear status</h2>
+        <p class="sub">A server only counts as clean when every exit IP was checked and found unlisted. A failed
+          lookup is never treated as clean.</p>
+        <div class="grid g3">
+          <div class="card state clean">
+            <span class="tag">Clean</span>
+            <p>Every exit IP was verified as not listed on DroneBL. Only clean servers are used for Gluetun and
+              generated configs.</p>
+          </div>
+          <div class="card state blocked">
+            <span class="tag">Blocked</span>
+            <p>At least one exit IP is listed. The dashboard shows DroneBL's reason, such as an open proxy.</p>
+          </div>
+          <div class="card state unverified">
+            <span class="tag">Unverified</span>
+            <p>A lookup failed, so the result is unknown. AirBL won't pick the server until it's verified.</p>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section id="how" aria-labelledby="how-title">
+      <div class="wrap">
+        <h2 id="how-title">How it works</h2>
+        <p class="sub">Each scan runs these steps for the countries and servers you choose, on a schedule in your
+          own time zone.</p>
+        <div class="grid g4">
+          <div class="card">
+            <div class="step-num">STEP 1</div>
+            <h3>Scan</h3>
+            <p>Looks up each server's exit IPs through AirVPN's DNS (IPv4 and IPv6) and pings entry and exit IPs
+              over ICMP and TCP.</p>
+          </div>
+          <div class="card">
+            <div class="step-num">STEP 2</div>
+            <h3>Check</h3>
+            <p>Checks every exit IP against the DroneBL blocklist and marks the server Clean, Blocked or
+              Unverified.</p>
+          </div>
+          <div class="card">
+            <div class="step-num">STEP 3</div>
+            <h3>Measure</h3>
+            <p>Speed-tests through its own WireGuard tunnel, after confirming the handshake and that traffic leaves
+              via AirVPN. Servers that stay slow are disabled.</p>
+          </div>
+          <div class="card">
+            <div class="step-num">STEP 4</div>
+            <h3>Use</h3>
+            <p>Moves Gluetun to the best clean servers and writes server lists and WireGuard configs for the rest
+              of your setup.</p>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section id="features" aria-labelledby="features-title">
+      <div class="wrap">
+        <h2 id="features-title">Features</h2>
+        <p class="sub">Everything runs in one container with a web dashboard.</p>
+        <div class="grid g4">
+          <div class="card">
+            <div class="icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <circle cx="12" cy="12" r="9" />
+                <path d="M3 12h18M12 3a14 14 0 010 18M12 3a14 14 0 000 18" />
+              </svg></div>
+            <h3>DNS-guided endpoints</h3>
+            <p>Exit IPs come from AirVPN's DNS, and each IP is pinged over ICMP and TCP because some hosts block
+              one of them.</p>
+          </div>
+          <div class="card">
+            <div class="icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M12 3l8 3.5V12c0 5-3.5 8.5-8 9.5C7.5 20.5 4 17 4 12V6.5z" />
+                <path d="M9 12l2 2 4-4" />
+              </svg></div>
+            <h3>DroneBL verification</h3>
+            <p>Every exit IP is checked. Blocked servers show the listing reason; failed lookups stay
+              Unverified.</p>
+          </div>
+          <div class="card">
+            <div class="icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M12 14l4-4" />
+                <path d="M3.3 17a9 9 0 1117.4 0" />
+              </svg></div>
+            <h3>Verified speedtests</h3>
+            <p>A kill switch and an exit-IP check on every result make sure nothing is measured over your normal
+              connection.</p>
+          </div>
+          <div class="card">
+            <div class="icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <circle cx="11" cy="11" r="7" />
+                <path d="M21 21l-4.3-4.3" />
+              </svg></div>
+            <h3>Port &amp; entry discovery</h3>
+            <p>Tests ports 1637, 47107 and 51820 on Entry 1 and 3 over several days and keeps the best
+              combination.</p>
+          </div>
+          <div class="card">
+            <div class="icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M4 12a8 8 0 0114-5.3L20 9" />
+                <path d="M20 4v5h-5" />
+                <path d="M20 12a8 8 0 01-14 5.3L4 15" />
+                <path d="M4 20v-5h5" />
+              </svg></div>
+            <h3>Gluetun control</h3>
+            <p>Switches a local or remote Gluetun through its control API (API key supported) using rules like
+              Clean Only or Top 4, and checks every minute that it stays there.</p>
+          </div>
+          <div class="card">
+            <div class="icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <rect x="4" y="11" width="16" height="10" rx="2" />
+                <path d="M8 11V7a4 4 0 018 0v4" />
+              </svg></div>
+            <h3>WireGuard profiles</h3>
+            <p>Generates <code>.conf</code> files per server, the best server per country or city, or just the
+              fastest, plus an always-current <code>wg0.conf</code>.</p>
+          </div>
+          <div class="card">
+            <div class="icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M4 20V10M10 20V4M16 20v-7M22 20H2" />
+              </svg></div>
+            <h3>History &amp; metrics</h3>
+            <p>Scan history, speedtests, ban frequency, disabled servers and port/entry performance, kept in
+              SQLite and charted.</p>
+          </div>
+          <div class="card">
+            <div class="icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <rect x="3" y="7" width="18" height="12" rx="2" />
+                <path d="M7 7V4h4v3M13 7V4h4v3" />
+              </svg></div>
+            <h3>Docker-native</h3>
+            <p>One container with <code>NET_ADMIN</code>. The dashboard stays reachable while tests run, and
+              schedules follow your <code>TZ</code>.</p>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section id="screenshots" aria-labelledby="shots-title">
+      <div class="wrap">
+        <h2 id="shots-title">Screenshots</h2>
+        <p class="sub">From a real installation scanning four countries. Click an image for full size.</p>
+        <div class="shots">
+          <figure>
+            <a href="assets/servers.jpg"><img src="assets/servers.jpg" width="1400" height="900" loading="lazy"
+                alt="Servers page: servers grouped by country, clean ones with a green edge and blocked ones in red, with entry and exit pings, load, speeds and score"></a>
+            <figcaption><strong>Servers.</strong> Every scanned server by country, with pings, load, speeds and
+              score. Filter by status, load, ping or speed.</figcaption>
+          </figure>
+          <figure>
+            <a href="assets/server-detail.jpg"><img src="assets/server-detail.jpg" width="1400" height="900"
+                loading="lazy"
+                alt="Server details for Mirzam in Frankfurt: status Clean, entry and exit pings, load, and speedtest results on port 1637 Entry 3"></a>
+            <figcaption><strong>Server details.</strong> Status, pings and the latest speedtest with the port and
+              entry it used. Run a new speedtest from here.</figcaption>
+          </figure>
+          <figure>
+            <a href="assets/metrics.jpg"><img src="assets/metrics.jpg" width="1400" height="900" loading="lazy"
+                alt="Metrics page: server status by country as stacked bars (clean, blocked, disabled) and the list of auto-disabled servers with their recent speeds"></a>
+            <figcaption><strong>Metrics.</strong> Status by country, auto-disabled servers with the results that
+              disabled them, ban history and long-term averages.</figcaption>
+          </figure>
+          <figure>
+            <a href="assets/overview.jpg"><img src="assets/overview.jpg" width="1400" height="900" loading="lazy"
+                alt="Overview page: scanner controls, status with time to next scan, server counts and performance charts"></a>
+            <figcaption><strong>Overview.</strong> Scanner controls, the next scheduled scan, server counts and
+              speed and ping charts.</figcaption>
+          </figure>
+        </div>
+      </div>
+    </section>
+
+    <section id="quick-start" aria-labelledby="qs-title">
+      <div class="wrap">
+        <h2 id="qs-title">Quick start</h2>
+        <p class="sub">Runs on a Raspberry Pi, NAS or any Linux server with Docker.</p>
+        <div class="qs">
+          <div class="card req">
+            <h3>You need</h3>
+            <ul>
+              <li>Docker with Compose</li>
+              <li>An AirVPN account and WireGuard <code>.conf</code> files from the AirVPN Config Generator</li>
+              <li>The <code>NET_ADMIN</code> capability (set in the provided compose file)</li>
+            </ul>
+          </div>
+          <ol class="steps">
+            <li>
+              <h3>Add your WireGuard configs</h3>
+              <p>Put one AirVPN <code>.conf</code> per server you want to scan into <code>docker/conf/</code>.</p>
+            </li>
+            <li>
+              <h3>Set your time zone (optional)</h3>
+              <p>Create <code>docker/.env</code> with e.g. <code>TZ=Europe/London</code> so schedules like
+                05:00 use your local time.</p>
+            </li>
+            <li>
+              <h3>Start it</h3>
+              <div class="code">
+                <button class="copy" type="button" data-copy="cmd" hidden>Copy</button>
+                <pre><code id="cmd">cd docker &amp;&amp; docker compose up -d --build</code></pre>
+              </div>
+            </li>
+            <li>
+              <h3>Open the dashboard</h3>
+              <p>Go to <code>http://&lt;host&gt;:5665</code> and choose countries, servers and a schedule under
+                Settings.</p>
+            </li>
+          </ol>
+        </div>
+      </div>
+    </section>
+
+    <section id="docs" class="docs" aria-labelledby="docs-title">
+      <div class="wrap">
+        <h2 id="docs-title">Documentation</h2>
+        <p class="sub">Guides in the repository.</p>
+        <div class="grid g3">
+          <a class="card" href="https://github.com/xesurient/AirBL/blob/main/docs/Installation.md">
+            <h3>Installation</h3>
+            <p>Compose setup, environment variables and persistence.</p>
+          </a>
+          <a class="card" href="https://github.com/xesurient/AirBL/blob/main/docs/Configuration.md">
+            <h3>Configuration</h3>
+            <p>Every Settings section, thresholds, scoring and server states.</p>
+          </a>
+          <a class="card" href="https://github.com/xesurient/AirBL/blob/main/docs/Gluetun-Integration.md">
+            <h3>Gluetun integration</h3>
+            <p>Switch modes, the control API and API key setup.</p>
+          </a>
+          <a class="card" href="https://github.com/xesurient/AirBL/blob/main/docs/WireGuard-Integration.md">
+            <h3>WireGuard generation</h3>
+            <p>Profile modes, <code>wg0.conf</code> and key handling.</p>
+          </a>
+          <a class="card" href="https://github.com/xesurient/AirBL/blob/main/docs/Troubleshooting.md">
+            <h3>Troubleshooting</h3>
+            <p>Gluetun errors, unverified servers and failed speedtests.</p>
+          </a>
+          <a class="card" href="https://github.com/xesurient/AirBL">
+            <h3>Source code</h3>
+            <p>README, issues and releases on GitHub.</p>
+          </a>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <footer>
+    <div class="wrap">
+      <span>AirBL is free software under the GPL-3.0. Not affiliated with AirVPN or DroneBL.</span>
+      <a href="https://github.com/xesurient/AirBL">github.com/xesurient/AirBL</a>
+    </div>
+  </footer>
+
+  <script>
+    // Close the mobile menu after choosing a section
+    document.querySelectorAll('.menu nav a').forEach(a => a.addEventListener('click', () => {
+      a.closest('details').open = false;
+    }));
+
+    // Copy buttons only appear when the Clipboard API is available; the command stays selectable otherwise.
+    if (navigator.clipboard) {
+      document.querySelectorAll('.copy').forEach(btn => {
+        btn.hidden = false;
+        btn.addEventListener('click', async () => {
+          try {
+            await navigator.clipboard.writeText(document.getElementById(btn.dataset.copy).textContent);
+            btn.textContent = 'Copied';
+          } catch (e) {
+            btn.textContent = 'Select and copy';
+          }
+          setTimeout(() => { btn.textContent = 'Copy'; }, 2000);
+        });
+      });
+    }
+  </script>
+</body>
+
+</html>

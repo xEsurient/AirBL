@@ -447,8 +447,10 @@ def setup_debug_logging():
     root_logger.setLevel(logging.DEBUG)
     
     # Suppress DEBUG logs from third-party libraries
-    logging.getLogger("httpcore").setLevel(logging.INFO)
-    logging.getLogger("httpx").setLevel(logging.INFO)
+    # httpx logs every request at INFO: the Gluetun watchdog's polling filled the
+    # 1000-line buffer within hours and pushed the scan logs out
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
+    logging.getLogger("httpx").setLevel(logging.WARNING)
     logging.getLogger("urllib3").setLevel(logging.INFO)
     logging.getLogger("asyncio").setLevel(logging.INFO)
     
