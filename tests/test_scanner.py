@@ -257,3 +257,47 @@ async def test_region_config_scans_every_api_server(monkeypatch, tmp_path, fresh
     s = updates[-1].server
     assert s.is_clean and s.config_file.name == "CH-Zurich_Toliman-1637-E3.conf"
     assert s.config_file.parent == Path(fresh_config.scan.confgen_dir)
+
+
+# --- scan list follows the AirVPN API -------------------------------------------
+
+def _keyed_conf(d: Path, name: str, ip: str):
+    d.joinpath(name).write_text(
+        "[Interface]\nPrivateKey = " + "A" * 43 + "=\nAddress = 10.128.0.2/32\n"
+        "[Peer]\nPublicKey = " + "B" * 43 + f"=\nEndpoint = {ip}:1637\n")
+
+
+def _api(*names_cc_city):
+    from airbl.airvpn import AirVPNServer, AirVPNStatus
+    servers = [AirVPNServer(public_name=n, country_name=cc, country_code=cc.lower(), location=city,
+                            continent="Europe", bandwidth_current=1, bandwidth_max=10, users=1,
+                            load_percent=5, ip_v4_in1=f"192.0.2.{i * 4 + 1}", ip_v4_in3=f"192.0.2.{i * 4 + 3}")
+               for i, (n, cc, city) in enumerate(names_cc_city)]
+    return AirVPNStatus(servers=servers, countries=[])
+
+
+def test_sync_skips_retired_servers_and_adds_none(tmp_path, fresh_config):
+    for name in ("Copernicus", "Lupus", "Norma"):
+        _keyed_conf(tmp_path, f"AirVPN_SE-Stockholm_{name}_UDP-1637-Entry3.conf", "192.0.2.50")
+    _keyed_conf(tmp_path, "AirVPN_SE-Uppsala_Albali_UDP-1637-Entry3.conf", "192.0.2.60")  # retired
+    sc = EnhancedScanner(config_dir=tmp_path, us_near_europe_only=False)
+    sc.load_configs()
+    sc._api_status = _api(("Copernicus", "SE", "Stockholm"), ("Lupus", "SE", "Stockholm"),
+                          ("Norma", "SE", "Stockholm"), ("Formosa", "SE", "Stockholm"))
+    sc.sync_configs_with_api()
+    # Retired Albali is skipped; Formosa has no .conf, so it isn't tested
+    assert sorted(c.server_name for c, _ in sc.get_servers_for_country("SE")) == ["Copernicus", "Lupus", "Norma"]
+    assert not any(Path(fresh_config.scan.confgen_dir).glob("*.conf"))
+
+
+def test_sync_keeps_configs_when_api_reply_looks_truncated(tmp_path, fresh_config):
+    for name in ("Copernicus", "Lupus", "Norma"):
+        _keyed_conf(tmp_path, f"AirVPN_SE-Stockholm_{name}_UDP-1637-Entry3.conf", "192.0.2.50")
+    sc = EnhancedScanner(config_dir=tmp_path, us_near_europe_only=False)
+    sc.load_configs()
+    sc._api_status = _api(("Copernicus", "SE", "Stockholm"))
+    sc.sync_configs_with_api()
+    assert len(sc.get_servers_for_country("SE")) == 3
+    sc._api_status = None  # API down: list untouched
+    sc.sync_configs_with_api()
+    assert len(sc.get_servers_for_country("SE")) == 3

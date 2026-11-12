@@ -410,6 +410,29 @@ class ScanUpdate:
     total_expected: int = 0
 
 
+def live_configs(configs: list, api_servers: list, log: bool = False) -> list:
+    """Configs whose server is still in AirVPN's API list.
+
+    Returns the configs unchanged if half or more would go (looks like a
+    truncated API reply rather than retired servers).
+    """
+    def norm(name: str) -> str:
+        return name.lower().replace(" ", "").strip()
+
+    api_names = {norm(s.public_name) for s in api_servers}
+    retired = sorted({c.server_name for c in configs if norm(c.server_name) not in api_names})
+    if not retired:
+        return configs
+    if len(retired) * 2 >= len({norm(c.server_name) for c in configs}):
+        if log:
+            logger.warning(f"{len(retired)} configured servers missing from the AirVPN list; "
+                           "keeping them (API reply looks incomplete)")
+        return configs
+    if log:
+        logger.info(f"Skipping {len(retired)} retired server(s) (not in the AirVPN list): {', '.join(retired)}")
+    return [c for c in configs if norm(c.server_name) in api_names]
+
+
 class EnhancedScanner:
     """
     Enhanced scanner with .conf file integration.
@@ -455,6 +478,16 @@ class EnhancedScanner:
         """Load and cache WireGuard configs."""
         self._configs = scan_config_directory(self.config_dir)
         return self._configs
+
+    def sync_configs_with_api(self) -> None:
+        """Skip configs for servers AirVPN has retired (no longer in the API list).
+
+        The .conf files decide which servers are tested; the API decides which
+        still exist. Retired servers' IPs are gone, so they only gave blank rows
+        (and could even count as clean). No change when the API fetch failed.
+        """
+        if self._api_status and self._api_status.servers:
+            self._configs = live_configs(self._configs, self._api_status.servers, log=True)
     
     def get_countries_to_scan(self) -> list[str]:
         """Get list of country codes from API (with fallback to configs), applying filters."""
@@ -805,6 +838,7 @@ class EnhancedScanner:
         except Exception as e:
             logger.warning(f"Failed to fetch API: {e}")
             self._api_status = None
+        self.sync_configs_with_api()
         
         # Get countries to scan
         countries = self.get_countries_to_scan()
@@ -874,6 +908,8 @@ class EnhancedScanner:
             self._configs = configs_from_api(self._api_status.servers, self.config_dir)
             if self._configs:
                 logger.info(f"No per-server configs: generated {len(self._configs)} from the AirVPN server list")
+        else:
+            self.sync_configs_with_api()
         
         if not self._configs:
             # An empty "complete" scan looked like success (Idle 0/0, no error)

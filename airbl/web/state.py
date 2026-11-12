@@ -197,6 +197,17 @@ class AppState:
             status = None
             logger.warning(f"Failed to fetch API data: {e}")
 
+        if configs and status and status.servers:
+            # Servers AirVPN has retired aren't selectable (scans skip them too)
+            from ..scanner import live_configs
+            live = live_configs(configs, status.servers)
+            if len(live) < len(configs):
+                self.countries_with_configs = {c.country_code.upper() for c in live}
+                self.servers_with_configs = {c.server_name for c in live}
+                self.cities_by_country = {}
+                for c in live:
+                    self.cities_by_country.setdefault(c.country_code.upper(), set()).add(c.city)
+
         if not configs:
             from ..confgen import extract_client_identity
             from ..wireguard import no_configs_message
@@ -221,6 +232,10 @@ class AppState:
         if self.current_scan is None and self.db:
             try:
                 self.current_scan = await self._restore_last_scan()
+                if self.current_scan and status and status.servers:
+                    # Don't show servers AirVPN has retired since that scan (same rule as scans)
+                    from ..scanner import live_configs
+                    self.current_scan.servers = live_configs(self.current_scan.servers, status.servers)
             except Exception as e:
                 logger.error(f"Failed to rebuild last scan from DB: {e}", exc_info=True)
 

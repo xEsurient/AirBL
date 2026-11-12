@@ -156,3 +156,36 @@ async def test_startup_with_region_config_uses_api_list(monkeypatch, tmp_path, f
         state.region_configs = False
         if state.db:
             await state.db.close()
+
+
+async def test_startup_hides_servers_retired_from_api(monkeypatch, tmp_path, sample_conf_dir, fresh_config):
+    """A .conf whose server left AirVPN's list: not selectable, not in the restored results."""
+    from airbl.airvpn import AirVPNServer, AirVPNStatus
+    monkeypatch.setattr(settings, "cache_dir", tmp_path)
+    seed = DatabaseManager(tmp_path / "airbl.db")
+    await seed.init()
+    await _populate(seed)
+    await seed.close()
+
+    def srv(name, cc, city):
+        return AirVPNServer(public_name=name, country_name=cc, country_code=cc.lower(), location=city,
+                            continent="Europe", bandwidth_current=1, bandwidth_max=10, users=1,
+                            load_percent=5, ip_v4_in1="192.0.2.1")
+
+    async def fake_api():  # Alchiba (NL) retired; Formosa new but has no .conf
+        return AirVPNStatus(servers=[srv("Toliman", "CH", "Zurich"), srv("Achernar", "CH", "Zurich"),
+                                     srv("Ran", "DE", "Frankfurt"), srv("Taurus", "DE", "Frankfurt"),
+                                     srv("Formosa", "SE", "Stockholm")], countries=[])
+
+    monkeypatch.setattr(airvpn, "get_airvpn_status", fake_api)
+    state.config_dir = sample_conf_dir
+    state.current_scan = None
+    try:
+        await state.startup()
+        assert "Alchiba" not in state.servers_with_configs and "NL" not in state.countries_with_configs
+        assert "Formosa" not in state.servers_with_configs and "Formosa" in state.all_servers
+        assert "Toliman" in state.servers_with_configs
+        assert {s.server_name for s in state.current_scan.servers} == {"Toliman", "Ran", "Taurus", "Achernar"}
+    finally:
+        if state.db:
+            await state.db.close()

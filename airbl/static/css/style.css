@@ -467,6 +467,8 @@ header h1::before {
 
 .server-item {
     display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
     justify-content: space-between;
     align-items: center;
     padding: 10px 12px;
@@ -500,7 +502,19 @@ header h1::before {
 }
 
 .server-info {
-    flex: 1;
+    /* Name and city on one line above the metrics (cards are too narrow for side by side) */
+    flex: 1 1 100%;
+    min-width: 0;
+    display: flex;
+    align-items: baseline;
+    gap: 8px;
+}
+
+.server-info .server-name,
+.server-info .server-location {
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
 }
 
 .server-name {
@@ -512,13 +526,18 @@ header h1::before {
     font-size: 0.85rem;
 }
 
+/* One 5-column grid for both rows: columns line up and none is narrower than its
+   widest value, so "↑ 304.0" can't spill over the ping next to it */
 .server-metrics {
-    display: flex;
-    flex-direction: column;
-    gap: 8px;
+    flex: 1 1 100%;
+    display: grid;
+    grid-template-columns: repeat(5, minmax(max-content, 1fr));
+    gap: 6px 10px;
     font-size: 0.85rem;
-    min-width: 0;
-    max-width: 100%;
+}
+
+.server-metrics > .metrics-row {
+    display: contents;
 }
 
 .metrics-row {

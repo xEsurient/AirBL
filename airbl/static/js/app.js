@@ -790,7 +790,7 @@ function renderCountryCard(countryCode, servers) {
                 </div>
                 <div class="server-metrics">
                     <!-- Row 1: Entry1 ping, Exit ping, upload, deviation, load -->
-                    <div class="metrics-row" style="display: grid; grid-template-columns: repeat(5, 1fr); gap: 10px;">
+                    <div class="metrics-row">
                         <div class="metric" title="${pingTitle(server.entry1_ping)}">
                             <span class="metric-value ${e1Ping ? getPingClass(e1Ping) : ''}">${e1Ping ? Math.round(e1Ping) + 'ms' : '-'}</span>
                             <span class="metric-label">Entry 1</span>
@@ -814,7 +814,7 @@ function renderCountryCard(countryCode, servers) {
                     </div>
                     
                     <!-- Row 2: Entry 3 ping, Speedtest ping, download, (empty space), Score -->
-                    <div class="metrics-row" style="display: grid; grid-template-columns: repeat(5, 1fr); gap: 10px; margin-top: 10px;">
+                    <div class="metrics-row">
                         <div class="metric">
                             <span class="metric-value ${e3Ping ? getPingClass(e3Ping) : ''}">${e3Ping ? Math.round(e3Ping) + 'ms' : '-'}</span>
                             <span class="metric-label">Entry 3</span>
