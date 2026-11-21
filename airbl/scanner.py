@@ -37,6 +37,21 @@ PREFERRED_CONF_PORT = 1637
 PREFERRED_CONF_ENTRY = 3
 
 
+def speedtest_score(result: Optional[dict]) -> Optional[float]:
+    """Score of one stored speedtest result: percentage of baseline speed retained
+    (deviation_score), else Ookla's 0-10 score x 10. None = no usable result (none, or failed)."""
+    if not result or result.get("error"):
+        return None
+    if result.get("deviation_score") is not None:
+        # Percentage of baseline speed retained (100 = baseline, 150 = faster)
+        score = result["deviation_score"]
+    elif result.get("score") is not None:
+        score = result["score"] * 10  # SpeedTestResult.score is 0-10
+    else:
+        score = 0.0
+    return max(0.0, float(score))  # no upper cap: faster-than-baseline servers must still rank
+
+
 def _ping_protocols(ping) -> dict:
     """Which protocol gave latency_ms, plus per-protocol averages."""
     rnd = lambda v: round(v, 1) if v is not None else None
@@ -234,15 +249,7 @@ class ServerScanResult:
             return 0.0
         
         if self.speedtest_result:
-            if self.speedtest_result.get("error"):
-                score = 0.0
-            elif self.speedtest_result.get("deviation_score") is not None:
-                # Percentage of baseline speed retained (100 = baseline, 150 = faster)
-                score = self.speedtest_result["deviation_score"]
-            elif self.speedtest_result.get("score") is not None:
-                score = self.speedtest_result["score"] * 10  # SpeedTestResult.score is 0-10
-            else:
-                score = 0.0
+            score = speedtest_score(self.speedtest_result) or 0.0  # a failed test scores 0
         else:
             best = self.best_ip
             latency = best.latency_ms if best else None
@@ -263,8 +270,15 @@ class ServerScanResult:
         
         return max(0.0, min(100.0, float(score)))
     
+    @property
+    def speed_score(self) -> Optional[float]:
+        """Speed-only score (100 = baseline speed, may exceed it), ignoring DroneBL reputation: the seedbox ranking.
+        None without a successful speedtest, so untested and failed servers are never ranked."""
+        return speedtest_score(self.speedtest_result)
+
     def to_dict(self) -> dict:
         """Convert to dictionary for JSON."""
+        speed = self.speed_score
         return {
             "server_name": self.server_name,
             "country_code": self.country_code,
@@ -287,6 +301,7 @@ class ServerScanResult:
             "best_ip": self.best_ip.to_dict() if self.best_ip else None,
             "exit_ips": [ip.to_dict() for ip in self.scanned_ips],
             "score": round(self.score, 2),
+            "speed_score": round(speed, 2) if speed is not None else None,
             "speedtest": self.speedtest_result,
             "scanned_at": self.scanned_at.isoformat(),
             "exit_ping": {

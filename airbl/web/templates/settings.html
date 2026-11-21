@@ -131,6 +131,22 @@
             </div>
         </div>
 
+        <div class="setting-row">
+            <div class="setting-info">
+                <div class="setting-label">Seedbox: Listed Servers to Test</div>
+                <div class="setting-description">Normally only clean servers are speedtested. For a seedbox, a DroneBL
+                    listing rarely matters, so this also tests up to this many listed servers per scan (those with the
+                    lowest ping). Their results only feed the "Fastest (any reputation)" list and the Second Control
+                    Target; your main Gluetun never uses listed servers. 0 = off.</div>
+                <div class="setting-description" id="blockedTopNEstimate" style="margin-top: 6px;"></div>
+            </div>
+            <!-- Pinned to the top: the estimate line below the description must not move the box -->
+            <div class="setting-control" style="align-self: flex-start;">
+                <input type="number" id="speedtestBlockedTopN" min="0" max="50" value="0"
+                    onchange="markChanged(); updateBlockedEstimate()" oninput="updateBlockedEstimate()" style="width: 70px;">
+            </div>
+        </div>
+
     </div>
 </div>
 
@@ -323,6 +339,34 @@
                 <input type="number" id="performanceCheckCount" min="1" max="10" value="3" onchange="markChanged()">
             </div>
         </div>
+
+        <div class="setting-row">
+            <div class="setting-info">
+                <div class="setting-label">Retest Auto-Disabled Servers After (days)</div>
+                <div class="setting-description">Auto-disabled servers (main and seedbox lists) are scanned and tested
+                    again after this many days. On the retest one result below the thresholds disables them again;
+                    a good one keeps them. Servers you disabled by hand are never retested. 0 = never.</div>
+            </div>
+            <div class="setting-control">
+                <input type="number" id="performanceRetestAfterDays" min="0" max="365" value="7" onchange="markChanged()"
+                    style="width: 80px;">
+            </div>
+        </div>
+
+        <div class="setting-row">
+            <div class="setting-info">
+                <div class="setting-label">Seedbox Thresholds (Mbps, ↓ / ↑)</div>
+                <div class="setting-description">DroneBL-listed servers tested for the seedbox ranking have their own
+                    thresholds and their own disabled list (below), so they never land on the main list. Same check
+                    count. 0 / 0 = never auto-disable them.</div>
+            </div>
+            <div class="setting-control" style="display: flex; gap: 8px;">
+                <input type="number" id="seedboxThresholdDownload" min="0" max="100000" step="1" value="0"
+                    onchange="markChanged()" style="width: 90px;" aria-label="Seedbox download threshold">
+                <input type="number" id="seedboxThresholdUpload" min="0" max="100000" step="1" value="0"
+                    onchange="markChanged()" style="width: 90px;" aria-label="Seedbox upload threshold">
+            </div>
+        </div>
     </div>
 </div>
 
@@ -413,6 +457,8 @@
         </p>
 
         <div id="disabledServersList" style="margin-top: 15px;"></div>
+        <h3 style="margin: 20px 0 5px;">Seedbox (DroneBL-listed servers)</h3>
+        <div id="seedboxDisabledList" style="margin-top: 10px;"></div>
     </div>
 </div>
 
@@ -558,6 +604,161 @@
                 <code
                     style="background: var(--bg-primary); padding: 10px; border-radius: 4px; display: block; margin-top: 5px; color: var(--accent); user-select: all; cursor: pointer;"
                     title="Double click to copy">curl -s "http://localhost:5665/api/export/gluetun?country=US"</code>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Second Control Target (seedbox) -->
+<div class="settings-section" data-category="gluetun">
+    <h2 onclick="toggleSection(this)">🌱 Second Control Target (<span id="secTitleName">Seedbox</span>)</h2>
+    <div class="section-content">
+        <p class="setting-description" style="margin-bottom: 15px;">
+            A separate, optional target, independent of the Gluetun control above: a second Gluetun, or the AirBL
+            companion on a Mac/Linux seedbox (see <code>companion/README.md</code>). It can follow the fastest servers,
+            DroneBL-listed ones included, ranked by speedtest only, and has its own address, key, switch mode and
+            watchdog. Names are sent fastest first; the companion uses that order as its preference.
+        </p>
+
+        <div class="setting-row">
+            <div class="setting-info">
+                <div class="setting-label">Control Second Target</div>
+                <div class="setting-description">After each scan and on its own watchdog, keep this target on the
+                    servers its mode allows</div>
+            </div>
+            <div class="setting-control">
+                <label class="toggle" for="secEnabled">
+                    <input type="checkbox" id="secEnabled" onchange="markChanged()">
+                    <span class="toggle-slider"></span>
+                </label>
+            </div>
+        </div>
+
+        <div class="setting-row">
+            <div class="setting-info">
+                <div class="setting-label">Name</div>
+                <div class="setting-description">Shown in logs, e.g. "Seedbox"</div>
+            </div>
+            <div class="setting-control">
+                <input type="text" id="secName" maxlength="40" placeholder="Seedbox" onchange="markChanged()"
+                    oninput="syncSecTitle()" style="width: 140px;">
+            </div>
+        </div>
+
+        <div class="setting-row">
+            <div class="setting-info">
+                <div class="setting-label">Host / Port</div>
+                <div class="setting-description">Control server of the second target (the companion's LAN address).
+                    Must differ from the main Gluetun above. Changing it removes the saved key: enter it again.</div>
+            </div>
+            <div class="setting-control" style="display: flex; gap: 8px;">
+                <input type="text" id="secHost" placeholder="e.g. 192.168.1.20" onchange="markChanged()" style="width: 140px;">
+                <input type="number" id="secPort" min="1" max="65535" value="8000" onchange="markChanged()" style="width: 90px;">
+            </div>
+        </div>
+
+        <div class="setting-row">
+            <div class="setting-info">
+                <div class="setting-label">API Key</div>
+                <div class="setting-description">Sent as <code>X-API-Key</code>. <span id="secApiKeyStatus"></span></div>
+            </div>
+            <div class="setting-control" style="display: flex; gap: 8px; align-items: center;">
+                <input type="password" id="secApiKey" placeholder="Not set" autocomplete="new-password"
+                    oninput="markChanged()" style="width: 180px;">
+                <button class="btn btn-secondary" style="padding: 4px 10px;" onclick="window.clearSecApiKey()"
+                    title="Remove the saved API key">Clear</button>
+            </div>
+        </div>
+
+        <div class="setting-row">
+            <div class="setting-info">
+                <div class="setting-label">Switch Mode / Top N</div>
+                <div class="setting-description">Top N: stay while the current server is among the N fastest. Best:
+                    move to the fastest. Stay while allowed: only move when the current server is no longer allowed
+                    (disabled, filtered out, or listed with blocked servers off). The minimum dwell applies in every
+                    mode.</div>
+            </div>
+            <div class="setting-control" style="display: flex; gap: 8px;">
+                <select id="secMode" onchange="markChanged()" style="padding: 6px 10px;">
+                    <option value="NOT_TOPN">Reset if not Top N</option>
+                    <option value="NOT_BEST">Reset if not Best</option>
+                    <option value="ALLOWED">Stay while allowed</option>
+                </select>
+                <input type="number" id="secTopN" min="1" max="20" value="3" onchange="markChanged()" style="width: 70px;">
+            </div>
+        </div>
+
+        <div class="setting-row">
+            <div class="setting-info">
+                <div class="setting-label">Allow Blocked Servers</div>
+                <div class="setting-description">Let this target use DroneBL-listed servers. They need speed
+                    results, so set "Seedbox: Listed Servers to Test" (Speedtest section) above 0.</div>
+            </div>
+            <div class="setting-control">
+                <label class="toggle" for="secAllowBlocked">
+                    <input type="checkbox" id="secAllowBlocked" onchange="syncSecRankBy(); markChanged()">
+                    <span class="toggle-slider"></span>
+                </label>
+            </div>
+        </div>
+
+        <div class="setting-row">
+            <div class="setting-info">
+                <div class="setting-label">Rank By</div>
+                <div class="setting-description">Speed: speedtest result only (untested and failed servers are never
+                    picked). Score: AirBL's normal score, only with blocked servers off (listed servers all score
+                    0).</div>
+            </div>
+            <div class="setting-control">
+                <select id="secRankBy" onchange="markChanged()" style="padding: 6px 10px;">
+                    <option value="speed">Speed</option>
+                    <option value="score">Score</option>
+                </select>
+            </div>
+        </div>
+
+        <div class="setting-row">
+            <div class="setting-info">
+                <div class="setting-label">Minimum Dwell (minutes)</div>
+                <div class="setting-description">After a switch, don't move to a faster server for this long while the
+                    current one is still allowed. Every switch drops all torrent peers. 0 = no limit.</div>
+            </div>
+            <div class="setting-control">
+                <input type="number" id="secMinDwell" min="0" max="1440" value="30" onchange="markChanged()" style="width: 90px;">
+            </div>
+        </div>
+
+        <div class="setting-row">
+            <div class="setting-info">
+                <div class="setting-label">Watchdog Interval (seconds)</div>
+                <div class="setting-description">How often to check this target between scans. 0 = only after scans.</div>
+            </div>
+            <div class="setting-control">
+                <input type="number" id="secWatchdog" min="0" max="3600" value="60" onchange="markChanged()" style="width: 90px;">
+            </div>
+        </div>
+
+        <div class="setting-row">
+            <div class="setting-info">
+                <div class="setting-label">Profile Filter</div>
+                <div class="setting-description">Optional: use an enabled profile's speed thresholds and countries/cities.
+                    Its "clean only" option is ignored when blocked servers are allowed.</div>
+            </div>
+            <div class="setting-control">
+                <select id="secProfile" onchange="secProfileValue = this.value; markChanged()" style="padding: 6px 10px;"></select>
+            </div>
+        </div>
+
+        <div class="setting-row">
+            <div class="setting-info">
+                <div class="setting-label">Connection</div>
+                <div class="setting-description" id="secTestResult">Test uses the values above. Apply Now uses saved
+                    settings and ignores the cooldown and dwell.</div>
+                <div class="setting-description" id="secCompanionStatus"></div>
+            </div>
+            <div class="setting-control" style="display: flex; gap: 8px;">
+                <button class="btn btn-secondary" onclick="window.testGluetunConnection('secondary')">Test</button>
+                <button class="btn btn-secondary" onclick="window.checkGluetunNow('secondary')">Apply Now</button>
             </div>
         </div>
     </div>
@@ -716,6 +917,139 @@
             sel.appendChild(opt);
         });
         sel.value = currentGluetunProfiles.some(p => p.name === current) ? current : '';
+        renderSecProfileSelect();
+    }
+
+    let secProfileValue = '';
+    let secApiKeyClear = false;
+    function renderSecProfileSelect() {
+        const sel = document.getElementById('secProfile');
+        if (!sel) return;
+        sel.innerHTML = '';
+        const none = document.createElement('option');
+        none.value = '';
+        none.textContent = 'None (all scanned servers)';
+        sel.appendChild(none);
+        currentGluetunProfiles.filter(p => p.enabled).forEach(p => {
+            const opt = document.createElement('option');
+            opt.value = p.name;
+            opt.textContent = p.name;
+            sel.appendChild(opt);
+        });
+        // Keep a saved choice whose profile is disabled or gone: dropping it here would make the
+        // next (unrelated) save remove the filter. AirBL then refuses to switch and says why.
+        if (secProfileValue && !currentGluetunProfiles.some(p => p.enabled && p.name === secProfileValue)) {
+            const opt = document.createElement('option');
+            opt.value = secProfileValue;
+            opt.textContent = secProfileValue + ' (not enabled: the target will not switch)';
+            sel.appendChild(opt);
+        }
+        sel.value = secProfileValue;
+    }
+
+    function fillSecondary(sec) {
+        sec = sec || {};
+        document.getElementById('secEnabled').checked = Boolean(sec.enabled);
+        document.getElementById('secName').value = sec.name || 'Seedbox';
+        syncSecTitle();
+        document.getElementById('secHost').value = sec.control_server_host || '';
+        document.getElementById('secPort').value = sec.control_server_port || 8000;
+        document.getElementById('secMode').value = sec.force_update_mode || 'NOT_TOPN';
+        document.getElementById('secTopN').value = sec.top_n || 3;
+        document.getElementById('secAllowBlocked').checked = sec.allow_blocked !== false;
+        document.getElementById('secRankBy').value = sec.rank_by || 'speed';
+        document.getElementById('secMinDwell').value = sec.min_dwell_minutes ?? 30;
+        document.getElementById('secWatchdog').value = sec.watchdog_interval_seconds ?? 60;
+        secApiKeyClear = false;
+        document.getElementById('secApiKey').value = '';
+        document.getElementById('secApiKey').placeholder = sec.api_key_set ? '•••••• (saved)' : 'Not set';
+        document.getElementById('secApiKeyStatus').textContent = sec.api_key_set ? 'A key is saved.' : '';
+        secProfileValue = sec.control_profile || '';
+        renderSecProfileSelect();
+        syncSecRankBy();
+    }
+
+    // The card title shows the target's name, as the logs do ("Gluetun control [<name>]")
+    window.syncSecTitle = function () {
+        const name = document.getElementById('secName').value.trim() || 'Seedbox';
+        document.getElementById('secTitleName').textContent = name;  // text, never HTML
+    };
+
+    // "Score" ranks every listed server at 0: only offered while blocked servers are off
+    window.syncSecRankBy = function () {
+        const allow = document.getElementById('secAllowBlocked').checked;
+        const sel = document.getElementById('secRankBy');
+        sel.querySelector('option[value="score"]').disabled = allow;
+        if (allow && sel.value === 'score') sel.value = 'speed';
+    };
+
+    // Rough extra scan time for the blocked queue: per server the tests (~40 s each), the VPN
+    // settle wait (30 s) and the cooldown between servers
+    window.updateBlockedEstimate = function () {
+        const out = document.getElementById('blockedTopNEstimate');
+        const n = parseInt(document.getElementById('speedtestBlockedTopN').value) || 0;
+        if (!out) return;
+        if (n <= 0) { out.textContent = ''; return; }
+        const tests = parseInt(document.getElementById('speedtestTestCount').value) || 3;
+        const wait = parseInt(document.getElementById('postServerWait').value) || 120;
+        const mins = Math.round(n * (tests * 40 + 30 + wait) / 60);
+        let txt = `⏱️ This makes each scan about ${mins} minutes longer.`;
+        const mode = document.getElementById('scanMode').value;
+        const interval = parseInt(document.getElementById('scanInterval').value) || 0;
+        if (mode === 'interval' && interval && mins >= interval) {
+            txt += ` ⚠️ That's longer than your ${interval}-minute scan interval.`;
+        }
+        out.textContent = txt;
+    };
+
+    function getSecondaryData() {
+        secProfileValue = document.getElementById('secProfile').value;
+        return {
+            enabled: document.getElementById('secEnabled').checked,
+            name: document.getElementById('secName').value,
+            control_server_host: document.getElementById('secHost').value,
+            control_server_port: parseInt(document.getElementById('secPort').value),
+            api_key: document.getElementById('secApiKey').value,
+            api_key_clear: secApiKeyClear,
+            force_update_mode: document.getElementById('secMode').value,
+            top_n: parseInt(document.getElementById('secTopN').value),
+            allow_blocked: document.getElementById('secAllowBlocked').checked,
+            rank_by: document.getElementById('secRankBy').value,
+            min_dwell_minutes: parseInt(document.getElementById('secMinDwell').value),
+            watchdog_interval_seconds: parseInt(document.getElementById('secWatchdog').value),
+            control_profile: secProfileValue,
+        };
+    }
+
+    window.clearSecApiKey = function () {
+        secApiKeyClear = true;
+        document.getElementById('secApiKey').value = '';
+        document.getElementById('secApiKey').placeholder = 'Will be removed on save';
+        markChanged();
+    };
+
+    // While Settings is open, the second target's "Now:" line follows it (AirBL's watchdog may
+    // switch it at any time)
+    setInterval(() => { if (!document.hidden) refreshSecondaryStatus(); }, 60000);
+
+    async function refreshSecondaryStatus() {
+        const out = document.getElementById('secCompanionStatus');
+        if (!out) return;
+        try {
+            const d = await (await fetch('/api/gluetun/status?target=secondary')).json();
+            if (!d.enabled) { out.textContent = ''; return; }
+            if (d.error) { out.textContent = '⚠️ ' + d.error; return; }
+            let txt = `Now: ${d.server_name || d.ip || 'unknown'} (VPN ${d.vpn_status || 'unknown'})`;
+            const c = d.companion;
+            if (c) {
+                if (c.handshake_age_s != null) txt += `, handshake ${Math.round(c.handshake_age_s)} s ago`;
+                if (c.qbit && c.qbit.connection_status) txt += `, qBittorrent ${c.qbit.connection_status}`;
+                if (c.last_error) txt += `. Last error: ${c.last_error}`;
+            }
+            out.textContent = txt;  // textContent: values come from the remote target
+        } catch (e) {
+            out.textContent = '';
+        }
     }
 
     window.clearGluetunApiKey = function () {
@@ -725,37 +1059,42 @@
         markChanged();
     };
 
-    window.testGluetunConnection = async function () {
-        const out = document.getElementById('gluetunTestResult');
+    window.testGluetunConnection = async function (target) {
+        const sec = target === 'secondary';
+        const out = document.getElementById(sec ? 'secTestResult' : 'gluetunTestResult');
         out.textContent = 'Testing...';
         try {
-            const res = await fetch('/api/gluetun/test', {
+            const res = await fetch('/api/gluetun/test' + (sec ? '?target=secondary' : ''), {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({
-                    host: document.getElementById('gluetunControlHost').value,
-                    port: parseInt(document.getElementById('gluetunControlPort').value),
-                    api_key: document.getElementById('gluetunApiKey').value
+                    host: document.getElementById(sec ? 'secHost' : 'gluetunControlHost').value,
+                    port: parseInt(document.getElementById(sec ? 'secPort' : 'gluetunControlPort').value),
+                    api_key: document.getElementById(sec ? 'secApiKey' : 'gluetunApiKey').value
                 })
             });
             const d = await res.json();
             if (!d.ok) {
                 out.textContent = '❌ ' + d.error;
             } else {
-                const where = d.server_name ? ` on ${d.server_name} (${d.city}, ${d.country})` : (d.ip ? ' (server not in scan data)' : '');
-                out.textContent = `✅ Connected. VPN ${d.vpn_status || 'unknown'}, public IP ${d.ip || 'n/a'}${where}`;
+                const where = d.server_name ? ` on ${d.server_name} (${d.city}, ${d.country})`
+                    : (d.ip ? ' (server not in scan data)' : (d.selected_names ? ` on one of ${d.selected_names.join(', ')}` : ''));
+                out.textContent = `✅ Connected. VPN ${d.vpn_status || 'unknown'}, public IP ${d.ip || 'n/a'}${where}`
+                    + (d.note ? `. ⚠️ ${d.note}.` : '');
             }
         } catch (e) {
             out.textContent = '❌ Test failed: ' + e;
         }
+        if (sec) refreshSecondaryStatus();  // keep the "Now:" line in step with the result
     };
 
-    const GLUETUN_MODE_LABELS = { CLEAN_ONLY: 'Clean Only', NOT_TOP4: 'Top 4', NOT_BEST: 'Best', ALWAYS: 'Always Reset' };
-    window.checkGluetunNow = async function () {
-        const out = document.getElementById('gluetunTestResult');
+    const GLUETUN_MODE_LABELS = { CLEAN_ONLY: 'Clean Only', NOT_TOP4: 'Top 4', NOT_TOPN: 'Top N', NOT_BEST: 'Best', ALWAYS: 'Always Reset' };
+    window.checkGluetunNow = async function (target) {
+        const sec = target === 'secondary';
+        const out = document.getElementById(sec ? 'secTestResult' : 'gluetunTestResult');
         out.textContent = 'Checking (uses saved settings)...';
         try {
-            const res = await fetch('/api/gluetun/check', { method: 'POST' });
+            const res = await fetch('/api/gluetun/check' + (sec ? '?target=secondary' : ''), { method: 'POST' });
             const d = await res.json().catch(() => ({}));
             if (!res.ok) {
                 out.textContent = '❌ Check failed: ' + (d.error || d.detail || 'HTTP ' + res.status);
@@ -763,9 +1102,12 @@
             }
             const on = d.current ? ` (on ${d.current})` : '';
             const mode = GLUETUN_MODE_LABELS[d.mode] || d.mode || '';
+            if (sec) refreshSecondaryStatus();
             if (d.applied) {
-                out.textContent = `🔄 Switched${d.current ? ' from ' + d.current : ''}. Gluetun limited to: ${(d.names || []).join(', ')}`;
-                if (window.refreshGluetunStatus) window.refreshGluetunStatus();
+                out.textContent = `🔄 Switched${d.current ? ' from ' + d.current : ''}. Limited to: ${(d.names || []).join(', ')}`;
+                // The target reconnects after a switch: show where it ended up
+                if (sec) setTimeout(refreshSecondaryStatus, 30000);
+                else if (window.refreshGluetunStatus) window.refreshGluetunStatus();
             } else if (d.reason === 'current server still clean' || d.reason === 'current server within target set') {
                 out.textContent = `✅ OK${on}: fits ${mode}, no switch needed.`;
             } else {
@@ -823,6 +1165,10 @@
             document.getElementById('discoveryEntryFilter').value = data.discovery_entry_filter || 'ALL';
             document.getElementById('discoveryTestCount').value = data.discovery_test_count || 3;
             document.getElementById('speedtestTestCount').value = data.speedtest_test_count || 3;
+            document.getElementById('speedtestBlockedTopN').value = data.speedtest_blocked_top_n ?? 0;
+            document.getElementById('seedboxThresholdDownload').value = data.seedbox_threshold_download ?? 0;
+            document.getElementById('seedboxThresholdUpload').value = data.seedbox_threshold_upload ?? 0;
+            document.getElementById('performanceRetestAfterDays').value = data.performance_retest_after_days ?? 7;
 
             // Handle Preferred Port Dropdown labels
             const portSelect = document.getElementById('preferredPort');
@@ -902,6 +1248,9 @@
             document.getElementById('gluetunApiKey').placeholder = data.gluetun_api_key_set ? '•••••• (saved)' : 'Not set';
             document.getElementById('gluetunApiKeyStatus').textContent = data.gluetun_api_key_set ? 'A key is saved.' : '';
             gluetunControlProfile = data.gluetun_control_profile || '';
+            fillSecondary(data.gluetun_secondary);
+            updateBlockedEstimate();
+            refreshSecondaryStatus();
 
             if (data.gluetun_profiles !== undefined) {
                 currentGluetunProfiles = data.gluetun_profiles || [];
@@ -1007,6 +1356,7 @@
 
     // Shared list in app.js; the argument is ignored (details come from /api/servers/disabled)
     function renderDisabledServers() {
+        loadDisabledServers('seedboxDisabledList', null, 'seedbox');
         loadDisabledServers('disabledServersList', (serverName, disabled) => {
             // Re-render the server grid so the server reappears, keeping current (unsaved) checks
             const selected = getSelectedServers();
@@ -1529,6 +1879,7 @@
         const p = currentGluetunProfiles[index];
         if (!p) return;
         if (gluetunControlProfile && gluetunControlProfile === p.name) gluetunControlProfile = name;
+        if (secProfileValue && secProfileValue === p.name) secProfileValue = name;
         p.name = name;
         renderGluetunControlProfileSelect();
     };
@@ -1974,6 +2325,11 @@
         document.getElementById('discoveryEntryFilter').value = originalSettings.discovery_entry_filter || 'ALL';
         document.getElementById('discoveryTestCount').value = originalSettings.discovery_test_count || 3;
         document.getElementById('speedtestTestCount').value = originalSettings.speedtest_test_count || 3;
+        document.getElementById('speedtestBlockedTopN').value = originalSettings.speedtest_blocked_top_n ?? 0;
+        document.getElementById('seedboxThresholdDownload').value = originalSettings.seedbox_threshold_download ?? 0;
+        document.getElementById('seedboxThresholdUpload').value = originalSettings.seedbox_threshold_upload ?? 0;
+        document.getElementById('performanceRetestAfterDays').value = originalSettings.performance_retest_after_days ?? 7;
+        updateBlockedEstimate();
         document.getElementById('preferredPort').value = originalSettings.preferred_port || 1637;
         document.getElementById('preferredEntryIp').value = originalSettings.preferred_entry_ip || 'ENTRY3';
 
@@ -2012,6 +2368,7 @@
         document.getElementById('gluetunWatchdogInterval').value = originalSettings.gluetun_watchdog_interval ?? 60;
         document.getElementById('gluetunControlHost').value = originalSettings.gluetun_control_host || '127.0.0.1';
         document.getElementById('gluetunControlPort').value = originalSettings.gluetun_control_port || 8000;
+        fillSecondary(originalSettings.gluetun_secondary);
 
         // Reset WireGuard profiles
         if (originalSettings.wg_profiles !== undefined) {
@@ -2063,6 +2420,7 @@
                 : parseInt(document.getElementById('preferredMtu').value),
             discovery_test_count: parseInt(document.getElementById('discoveryTestCount').value),
             speedtest_test_count: parseInt(document.getElementById('speedtestTestCount').value) || 3,
+            speedtest_blocked_top_n: parseInt(document.getElementById('speedtestBlockedTopN').value),
             discovery_duration_days: parseInt(document.getElementById('discoveryDurationDays').value),
             discovery_entry_filter: document.getElementById('discoveryEntryFilter').value,
             post_server_wait: parseInt(document.getElementById('postServerWait').value),
@@ -2072,6 +2430,9 @@
             performance_threshold_download: parseFloat(document.getElementById('performanceThresholdDownload').value),
             performance_threshold_upload: parseFloat(document.getElementById('performanceThresholdUpload').value),
             performance_check_count: parseInt(document.getElementById('performanceCheckCount').value),
+            performance_retest_after_days: parseInt(document.getElementById('performanceRetestAfterDays').value),
+            seedbox_threshold_download: parseFloat(document.getElementById('seedboxThresholdDownload').value),
+            seedbox_threshold_upload: parseFloat(document.getElementById('seedboxThresholdUpload').value),
             deviation_download_weight: Math.max(0, Math.min(100, parseInt(document.getElementById('scoringDownloadWeight').value) || 0)) / 100,
             signal_good_threshold: parseInt(document.getElementById('signalGoodThreshold').value) || 80,
             signal_medium_threshold: parseInt(document.getElementById('signalMediumThreshold').value) || 50,
@@ -2089,6 +2450,7 @@
             gluetun_api_key_clear: gluetunApiKeyClear,
             gluetun_control_profile: document.getElementById('gluetunControlProfile').value,
             gluetun_watchdog_interval: parseInt(document.getElementById('gluetunWatchdogInterval').value),
+            gluetun_secondary: getSecondaryData(),
             gluetun_profiles: getGluetunProfilesData(),
 
             // WireGuard settings
@@ -2096,7 +2458,9 @@
         };
 
         // Don't send NaN (cleared number fields); the backend would reject or crash on null
-        const badNumbers = Object.keys(settings).filter(k => typeof settings[k] === 'number' && !Number.isFinite(settings[k]));
+        const badNumbers = Object.keys(settings).filter(k => typeof settings[k] === 'number' && !Number.isFinite(settings[k]))
+            .concat(Object.keys(settings.gluetun_secondary).filter(k => typeof settings.gluetun_secondary[k] === 'number'
+                && !Number.isFinite(settings.gluetun_secondary[k])).map(k => 'second target ' + k));
         if (badNumbers.length) {
             showToast('Please enter a valid number for: ' + badNumbers.join(', '), 'error');
             return;
@@ -2131,6 +2495,14 @@
                 document.getElementById('gluetunApiKey').value = '';
                 document.getElementById('gluetunApiKey').placeholder = originalSettings.gluetun_api_key_set ? '•••••• (saved)' : 'Not set';
                 document.getElementById('gluetunApiKeyStatus').textContent = originalSettings.gluetun_api_key_set ? 'A key is saved.' : '';
+                const prevSec = (originalSettings.gluetun_secondary || {});
+                const savedSec = { ...settings.gluetun_secondary };
+                savedSec.api_key_set = savedSec.api_key_clear ? false : (savedSec.api_key ? true : Boolean(prevSec.api_key_set));
+                delete savedSec.api_key;
+                delete savedSec.api_key_clear;
+                originalSettings.gluetun_secondary = savedSec;
+                fillSecondary(savedSec);
+                refreshSecondaryStatus();
                 hasChanges = false;
                 document.getElementById('saveBar').classList.remove('visible');
 

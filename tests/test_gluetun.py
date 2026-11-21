@@ -253,8 +253,8 @@ async def test_name_match_when_exit_ip_unknown(control, ranked):
 def watchdog(control, ranked, monkeypatch):
     cfg, status, calls = control
     cfg.force_update_enabled = True
-    monkeypatch.setattr(gluetun, "_last_push_at", None)
-    monkeypatch.setattr(gluetun, "_watchdog_error", None)
+    monkeypatch.setattr(gluetun._ctl_state["primary"], "last_push_at", None)
+    monkeypatch.setattr(gluetun._ctl_state["primary"], "watchdog_error", None)
     monkeypatch.setattr(gluetun, "_control_profile", lambda c: object())
 
     async def servers_():
@@ -280,7 +280,7 @@ async def test_watchdog_logs_staying_once(watchdog, make_summary, ranked, monkey
     cfg, status, calls = watchdog
     cfg.force_update_mode = "CLEAN_ONLY"
     state.current_scan = make_summary([s for s, _ in ranked])
-    monkeypatch.setattr(gluetun, "_last_stay_logged", None)
+    monkeypatch.setattr(gluetun._ctl_state["primary"], "last_stay_logged", None)
     with caplog.at_level("DEBUG", logger=gluetun.logger.name):
         for _ in range(3):
             await gluetun.gluetun_watchdog_check()
@@ -311,9 +311,9 @@ async def test_watchdog_cooldown_and_skips(watchdog, monkeypatch):
     cfg, status, calls = watchdog
     cfg.force_update_mode = "NOT_BEST"
     status["value"] = {"ip": "192.0.2.3", "vpn_status": "running", "error": None}
-    monkeypatch.setattr(gluetun, "_last_push_at", gluetun.time.monotonic())
+    monkeypatch.setattr(gluetun._ctl_state["primary"], "last_push_at", gluetun.time.monotonic())
     assert (await gluetun.gluetun_watchdog_check())["reason"] == "cooldown after a switch"
-    monkeypatch.setattr(gluetun, "_last_push_at", None)
+    monkeypatch.setattr(gluetun._ctl_state["primary"], "last_push_at", None)
     state.is_scanning = True
     assert (await gluetun.gluetun_watchdog_check())["reason"] == "scan running"
     state.is_scanning = False
@@ -329,7 +329,7 @@ async def test_check_now_forces(watchdog, monkeypatch):
     cfg, status, calls = watchdog
     cfg.force_update_mode = "NOT_BEST"
     cfg.force_update_enabled = False
-    monkeypatch.setattr(gluetun, "_last_push_at", gluetun.time.monotonic())
+    monkeypatch.setattr(gluetun._ctl_state["primary"], "last_push_at", gluetun.time.monotonic())
     status["value"] = {"ip": "192.0.2.3", "server_name": "S3", "vpn_status": "running", "error": None}
     r = await gluetun.gluetun_watchdog_check(force=True)
     assert r["applied"] is True and r["current"] == "S3" and r["mode"] == "NOT_BEST"
@@ -348,7 +348,7 @@ async def test_no_profile_uses_all_clean_servers(control, servers, make_summary,
     cfg, status, calls = control
     cfg.profiles = []
     cfg.force_update_enabled, cfg.force_update_mode = True, "CLEAN_ONLY"
-    monkeypatch.setattr(gluetun, "_last_push_at", None)
+    monkeypatch.setattr(gluetun._ctl_state["primary"], "last_push_at", None)
     fresh_config.performance.disabled_servers = ["Slow"]
     scan = [servers("Good", ip="192.0.2.1"), servers("Slow", ip="192.0.2.2"),
             servers("Bad", rep="blocked", ip="192.0.2.3")]
@@ -388,10 +388,10 @@ async def test_watchdog_no_cooldown_after_fresh_boot(watchdog, monkeypatch):
 
 async def test_set_names_starts_cooldown(http, monkeypatch):
     box, _ = http
-    monkeypatch.setattr(gluetun, "_last_push_at", None)
+    monkeypatch.setattr(gluetun._ctl_state["primary"], "last_push_at", None)
     box["fn"] = lambda r: httpx.Response(400, text="bad")
     await gluetun.set_gluetun_server_names(GluetunConfig(), ["A"])
-    assert gluetun.time.monotonic() - gluetun._last_push_at < 5  # failed attempts count too
+    assert gluetun.time.monotonic() - gluetun._ctl_state["primary"].last_push_at < 5  # failed attempts count too
 
 
 # --- HTTP layer (httpx.MockTransport) ---------------------------------------------------

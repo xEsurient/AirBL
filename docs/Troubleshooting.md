@@ -5,7 +5,8 @@ AirBL takes the server from a config's file name (`AirVPN_AT-Vienna_Alderamin_UD
 
 ### Dashboard unreachable during speedtests
 AirBL keeps dashboard replies out of the VPN with a routing rule for the dashboard port, and replies to private (LAN/Docker) addresses always bypass the tunnel.
-- Use the default bridge network, not `network_mode: host`.
+- Use the default bridge network, not `network_mode: host`. In host mode AirBL refuses VPN tests ("Refusing to bring up a VPN tunnel: host network namespace detected").
+- **"Unknown host name" when opening the dashboard:** you reach it by a name with a public-looking domain (e.g. through a reverse proxy). Add that name to `AIRBL_ALLOWED_HOSTS`.
 - Keep `PORT` consistent: it's used by the server, the healthcheck, the routing rule and the kill switch.
 - If your LAN uses addresses inside 10.128.0.0/10 (AirVPN's internal range), the dashboard can be unreachable during tests. Use a different LAN range.
 

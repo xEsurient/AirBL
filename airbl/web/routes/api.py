@@ -36,7 +36,9 @@ async def trigger_baseline_speedtest(background_tasks: BackgroundTasks):
     if state.is_scanning:
         # The scan runs its own baseline; a queued one would wait for the whole cycle
         return {"error": "A scan is running (it measures its own baseline). Try again when it finishes."}
-    background_tasks.add_task(run_baseline_speedtest)
+    # A tracked task, not a FastAPI background task: uvicorn waits for those on shutdown, so
+    # a stop would be killed mid-test instead of tearing down cleanly (_shutdown cancels these)
+    _run_in_background(run_baseline_speedtest(), "Baseline speedtest")
     return {"status": "started", "message": "Baseline speedtest started"}
 
 @router.get("/baseline-speedtest")
@@ -278,18 +280,28 @@ async def _wireguard_stats() -> dict:
     return {"wg_port_stats": out("port"), "wg_entry_stats": out("entry")}
 
 
-def _disabled_server_details() -> list:
-    """Auto-disabled servers with location and the results that disabled them."""
+def _disabled_server_details(seedbox: bool = False) -> list:
+    """Auto-disabled servers with location and the results that disabled them
+    (seedbox: the separate list for DroneBL-listed servers)."""
     perf = config_manager.config.performance
+    names = perf.seedbox_disabled_servers if seedbox else perf.disabled_servers
+    live, saved = ((state.seedbox_history, perf.seedbox_history) if seedbox
+                   else (state.server_performance_history, perf.history))
     details = []
-    for name in sorted(perf.disabled_servers, key=str.lower):
+    for name in sorted(names, key=str.lower):
         short = name.replace("AirVPN ", "")
         code = (state.servers_by_country.get(name) or state.servers_by_country.get(short) or "??").upper()
-        history = (state.server_performance_history.get(name) or perf.history.get(name) or [])[-perf.check_count:]
+        history = (live.get(name) or saved.get(name) or [])[-perf.check_count:]
         downloads = [h.get("download") or 0.0 for h in history]
         uploads = [h.get("upload") or 0.0 for h in history]
+        from ..tasks import _disabled_since
+        since = _disabled_since(name, seedbox)
+        retest = (since + timedelta(days=perf.retest_after_days)
+                  if since is not None and perf.retest_after_days else None)
         details.append({
             "name": name,
+            "disabled_at": since.isoformat() if since else None,
+            "retest_at": retest.isoformat() if retest else None,  # None: never (off, or disabled by hand)
             "country_code": code,
             "country_name": state.all_countries.get(code, code),
             "city": state.server_to_city_api.get(name) or state.server_to_city_api.get(short) or "",
@@ -302,13 +314,16 @@ def _disabled_server_details() -> list:
 
 
 @router.get("/servers/disabled")
-async def get_disabled_servers():
-    """Auto-disabled servers with details, plus the thresholds that disabled them."""
+async def get_disabled_servers(list: str = "main"):
+    """Auto-disabled servers with details, plus the thresholds that disabled them.
+    ?list=seedbox: the DroneBL-listed servers disabled by the seedbox thresholds."""
     perf = config_manager.config.performance
+    seedbox = list == "seedbox"
     return {
-        "servers": _disabled_server_details(),
-        "threshold_download": perf.threshold_download,
-        "threshold_upload": perf.threshold_upload,
+        "list": "seedbox" if seedbox else "main",
+        "servers": _disabled_server_details(seedbox),
+        "threshold_download": perf.seedbox_threshold_download if seedbox else perf.threshold_download,
+        "threshold_upload": perf.seedbox_threshold_upload if seedbox else perf.threshold_upload,
         "check_count": perf.check_count,
     }
 
@@ -492,32 +507,44 @@ async def export_gluetun_servers(country: str = None):
 
 # --- Gluetun Status ---
 
+def _target_key(target: Optional[str]) -> str:
+    """Query value -> "primary" | "secondary" (anything else means the primary)."""
+    return "secondary" if (target or "").lower() == "secondary" else "primary"
+
+
 @router.get("/gluetun/status")
-async def get_gluetun_vpn_status():
-    """Get current Gluetun VPN connection status."""
-    cfg = config_manager.config.gluetun
-    if not cfg.force_update_enabled:
-        return {"connected": False, "enabled": False}
-    
-    from ...gluetun import get_gluetun_status
+async def get_gluetun_vpn_status(target: str = "primary"):
+    """Current VPN status of a control target (primary Gluetun, or ?target=secondary)."""
+    from ...gluetun import get_companion_status, get_gluetun_status, target_config
+    key = _target_key(target)
+    cfg = target_config(key)
+    name = (cfg.name or "Seedbox") if key == "secondary" else "Gluetun"
+    if not (cfg.enabled if key == "secondary" else cfg.force_update_enabled):
+        return {"connected": False, "enabled": False, "target": key, "name": name}
+
     status = await get_gluetun_status(cfg)
     status["enabled"] = True
+    status["target"] = key
+    status["name"] = name  # shown in the header (plain text there)
+    if key == "secondary" and not status.get("error"):
+        status["companion"] = await get_companion_status(cfg)  # None for a real Gluetun
     return status
 
 
 @router.post("/gluetun/test")
-async def test_gluetun_connection(request: Request):
-    """Test the Gluetun control server connection (reachability + API key).
+async def test_gluetun_connection(request: Request, target: str = "primary"):
+    """Test a control server connection (reachability + API key).
 
     Accepts unsaved host/port/api_key from the settings form; empty api_key uses the saved one.
     """
+    from ...gluetun import target_config
     try:
         data = await request.json()
     except ValueError:
         data = None
     if not isinstance(data, dict):
         return JSONResponse({"ok": False, "error": "Expected a JSON object"}, status_code=400)
-    saved = config_manager.config.gluetun
+    saved = target_config(_target_key(target))
     cfg = saved.model_copy()
     try:
         if data.get("host"):
@@ -548,10 +575,35 @@ async def test_gluetun_connection(request: Request):
 
 @router.post("/gluetun/check")
 @router.post("/gluetun/apply")  # old name of the same action
-async def check_gluetun_now():
-    """Check Gluetun's server against the switch mode now and switch if needed (skips the watchdog cooldown)."""
+async def check_gluetun_now(target: str = "primary"):
+    """Check a target's server against its switch mode now and switch if needed (skips cooldown and dwell)."""
     from ...gluetun import gluetun_watchdog_check
-    return await gluetun_watchdog_check(force=True)
+    return await gluetun_watchdog_check(force=True, target=_target_key(target))
+
+
+@router.get("/ranking/speed")
+async def speed_ranking(include_blocked: bool = True, limit: int = 20):
+    """Seedbox ranking: servers with a successful speedtest, fastest first, reputation ignored
+    (include_blocked=false keeps clean servers only). Same ranking code as the second control
+    target. Read-only, for the dashboard and scripts."""
+    from dataclasses import replace
+    from ...gluetun import _rank, _view
+    if state.current_scan is None:
+        return {"servers": [], "scanned_at": None}
+    limit = max(1, min(200, limit))
+    view = replace(_view("secondary"), allow_blocked=include_blocked, rank_by="speed")
+    rows = []
+    for s in _rank(view, [(s, []) for s in state.current_scan.servers])[:limit]:
+        st = s.speedtest_result or {}
+        rows.append({
+            "server_name": s.server_name, "country_code": s.country_code, "location": s.location,
+            "reputation": s.reputation, "speed_score": round(s.speed_score, 2),
+            "download_mbps": st.get("download_mbps"), "upload_mbps": st.get("upload_mbps"),
+            "ping_ms": st.get("ping_ms"), "tested_at": st.get("tested_at") or st.get("timestamp"),
+            "stale": bool(st.get("stale")),
+        })
+    return {"servers": rows, "scanned_at": state.current_scan.completed_at.isoformat()
+            if getattr(state.current_scan, "completed_at", None) else None}
 
 
 # --- Discovery ---
@@ -594,6 +646,7 @@ async def get_settings():
         "scan_schedule_days": getattr(cfg.scan, 'scan_schedule_days', ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]),
         "auto_scan_enabled": cfg.scan.auto_scan_enabled,
         "speedtest_enabled": cfg.scan.speedtest_enabled,
+        "speedtest_blocked_top_n": cfg.scan.speedtest_blocked_top_n,
         # Port discovery
         "port_discovery_enabled": cfg.scan.port_discovery_enabled,
         "preferred_port": cfg.scan.preferred_port,
@@ -627,6 +680,9 @@ async def get_settings():
         "performance_threshold_upload": cfg.performance.threshold_upload,
         "performance_check_count": cfg.performance.check_count,
         "disabled_servers": list(cfg.performance.disabled_servers),
+        "performance_retest_after_days": cfg.performance.retest_after_days,
+        "seedbox_threshold_download": cfg.performance.seedbox_threshold_download,
+        "seedbox_threshold_upload": cfg.performance.seedbox_threshold_upload,
         "speedtest_blacklist_duration_days": cfg.speedtest_blacklist.duration_days,
         "speedtest_blacklist_max_failures": cfg.speedtest_blacklist.max_failures,
         "speedtest_max_blacklist_failures": cfg.speedtest_blacklist.max_failures,  # name the form uses
@@ -646,6 +702,11 @@ async def get_settings():
         "gluetun_api_key_set": bool(cfg.gluetun.api_key),
         "gluetun_control_profile": cfg.gluetun.control_profile,
         "gluetun_watchdog_interval": cfg.gluetun.watchdog_interval_seconds,
+        # Second control target (seedbox companion); its key is never sent back either
+        "gluetun_secondary": {
+            **cfg.gluetun.secondary.model_dump(mode="json", exclude={"api_key"}),
+            "api_key_set": bool(cfg.gluetun.secondary.api_key),
+        },
         "gluetun_profiles": [
             {
                 "name": p.name,
@@ -769,6 +830,15 @@ def _control_host(value) -> str:
     return s
 
 
+def _is_wg_key(value: str) -> bool:
+    import base64
+    import binascii
+    try:
+        return len(value) == 44 and len(base64.b64decode(value, validate=True)) == 32
+    except (binascii.Error, ValueError):
+        return False
+
+
 def _wg_profile(wp: dict) -> dict:
     """Validate the fields of one submitted WireGuard profile (others pass to the model)."""
     out = dict(wp)
@@ -789,9 +859,99 @@ def _wg_profile(wp: dict) -> dict:
         for key in ("enabled", "auto_update_wg0"):
             if key in wp:
                 out[key] = _as_bool(wp, key)
+        # Keys go verbatim into generated .conf files: only real WireGuard keys, so nothing
+        # (e.g. a "PostUp = ..." line) can be smuggled into a config wg-quick may run
+        for key in ("private_key", "public_key"):
+            if key in wp:
+                val = str(wp[key] or "").strip()
+                if val and not _is_wg_key(val):
+                    raise _BadSetting(f"{key}: not a WireGuard key (44 characters of base64)")
+                out[key] = val
+        if "\n" in name or "\r" in name:
+            raise _BadSetting("name: line breaks are not allowed")
     except _BadSetting as e:
         raise _BadSetting(f"WireGuard profile '{name}': {e}")
     return out
+
+
+def _same_control_address(a_host: str, a_port: int, b_host: str, b_port: int) -> bool:
+    """Do two control-server settings point at the same server? Compared after URL parsing,
+    with every local spelling (localhost, 127.x, ::1, 0.0.0.0) treated as one."""
+    from urllib.parse import urlsplit
+    from ...gluetun import _base_url
+    from types import SimpleNamespace as NS
+    import ipaddress as _ip
+
+    def norm(h, p):
+        u = urlsplit(_base_url(NS(control_server_host=(h or "").strip(), control_server_port=p)))
+        host = (u.hostname or "").lower()
+        try:
+            a = _ip.ip_address(host)
+            if a.is_loopback or a.is_unspecified:
+                host = "local"
+        except ValueError:
+            if host == "localhost":
+                host = "local"
+        return host, u.port or (443 if u.scheme == "https" else 80), (u.path or "").rstrip("/")
+    return bool((a_host or "").strip() and (b_host or "").strip()) and norm(a_host, a_port) == norm(b_host, b_port)
+
+
+def _secondary_target(d, current):
+    """Validated ControlTargetConfig from the settings form (missing keys keep their value),
+    plus a warning or None. api_key: a non-empty value replaces the saved key, api_key_clear
+    removes it; a new address without a new key drops the saved key (never sent elsewhere)."""
+    from airbl.config import ControlTargetConfig
+    if not isinstance(d, dict):
+        raise _BadSetting("gluetun_secondary: expected an object")
+    k = "second target"
+    out = current.model_dump()
+    warning = None
+    try:
+        if "enabled" in d:
+            out["enabled"] = _as_bool(d, "enabled")
+        if "name" in d:
+            name = str(d["name"] or "").strip()[:40]
+            out["name"] = name or "Seedbox"
+        if "control_server_host" in d:
+            host = str(d["control_server_host"] or "").strip()
+            out["control_server_host"] = _control_host(host) if host else ""
+        if "control_server_port" in d:
+            out["control_server_port"] = _as_int(d, "control_server_port", 1, 65535)
+        if "control_profile" in d:
+            out["control_profile"] = str(d["control_profile"] or "").strip()
+        if "force_update_mode" in d:
+            out["force_update_mode"] = _as_choice(d, "force_update_mode", ("NOT_TOPN", "NOT_BEST", "ALLOWED"))
+        if "top_n" in d:
+            out["top_n"] = _as_int(d, "top_n", 1, 20)
+        if "allow_blocked" in d:
+            out["allow_blocked"] = _as_bool(d, "allow_blocked")
+        if "rank_by" in d:
+            out["rank_by"] = _as_choice(d, "rank_by", ("speed", "score"))
+        if "min_dwell_minutes" in d:
+            out["min_dwell_minutes"] = _as_int(d, "min_dwell_minutes", 0, 1440)
+        if "watchdog_interval_seconds" in d:
+            out["watchdog_interval_seconds"] = _as_int(d, "watchdog_interval_seconds", 0, 3600)
+    except _BadSetting as e:
+        # The shared validators name the primary's fields; say which target is meant
+        msg = str(e).replace("gluetun_control_host", "host")
+        raise _BadSetting(f"{k}: {msg}")
+    moved = (out["control_server_host"], out["control_server_port"]) != (
+        current.control_server_host, current.control_server_port)
+    if d.get("api_key_clear"):
+        out["api_key"] = ""
+    elif d.get("api_key"):
+        out["api_key"] = str(d["api_key"]).strip()
+    elif moved and current.api_key:
+        out["api_key"] = ""
+        warning = "Second target: the saved API key was removed because the address changed; enter it again"
+    if out["enabled"] and not out["control_server_host"]:
+        raise _BadSetting(f"{k}: enter the host of the second target (the companion's or second Gluetun's address)")
+    try:
+        return ControlTargetConfig(**out), warning
+    except ValueError as e:
+        errs = getattr(e, "errors", None)
+        msg = errs()[0]["msg"] if callable(errs) else str(e)
+        raise _BadSetting(f"{k}: {msg.removeprefix('Value error, ')}")
 
 
 def _parse_settings(data: dict, cfg) -> tuple[dict, list[str]]:
@@ -837,6 +997,8 @@ def _parse_settings(data: dict, cfg) -> tuple[dict, list[str]]:
         p["preferred_mtu"] = _as_int(data, "preferred_mtu", 1280, 1500)
     if "speedtest_test_count" in data:
         p["speedtest_test_count"] = _as_int(data, "speedtest_test_count", 1, 10)
+    if "speedtest_blocked_top_n" in data:
+        p["speedtest_blocked_top_n"] = _as_int(data, "speedtest_blocked_top_n", 0, 50)
     if "preferred_entry_ip" in data:
         p["preferred_entry_ip"] = _as_choice(data, "preferred_entry_ip", ("ENTRY1", "ENTRY3", "AUTO"))
     if "discovery_test_count" in data:
@@ -874,6 +1036,11 @@ def _parse_settings(data: dict, cfg) -> tuple[dict, list[str]]:
         p["performance_threshold_upload"] = _as_float(data, "performance_threshold_upload", 1.0, 100000.0)
     if "performance_check_count" in data:
         p["performance_check_count"] = _as_int(data, "performance_check_count", 1, 10)
+    for key in ("seedbox_threshold_download", "seedbox_threshold_upload"):
+        if key in data:
+            p[key] = _as_float(data, key, 0.0, 100000.0)
+    if "performance_retest_after_days" in data:
+        p["performance_retest_after_days"] = _as_int(data, "performance_retest_after_days", 0, 365)
     if "speedtest_blacklist_duration_days" in data:
         p["speedtest_blacklist_duration_days"] = _as_int(data, "speedtest_blacklist_duration_days", 1, 365)
     if "speedtest_max_blacklist_failures" in data:
@@ -901,10 +1068,32 @@ def _parse_settings(data: dict, cfg) -> tuple[dict, list[str]]:
         p["gluetun_api_key"] = ""
     elif data.get("gluetun_api_key"):
         p["gluetun_api_key"] = str(data["gluetun_api_key"]).strip()
+    elif cfg.gluetun.api_key and not _same_control_address(
+            p.get("gluetun_control_host", cfg.gluetun.control_server_host),
+            p.get("gluetun_control_port", cfg.gluetun.control_server_port),
+            cfg.gluetun.control_server_host, cfg.gluetun.control_server_port):
+        # Never send the saved key to an address it wasn't saved for (as the Test button does)
+        p["gluetun_api_key"] = ""
+        warnings.append("Gluetun: the saved API key was removed because the control server address "
+                        "changed; enter it again")
     if "gluetun_control_profile" in data:
         p["gluetun_control_profile"] = str(data["gluetun_control_profile"] or "").strip()
     if "gluetun_watchdog_interval" in data:
         p["gluetun_watchdog_interval"] = _as_int(data, "gluetun_watchdog_interval", 0, 3600)
+    if "gluetun_secondary" in data:
+        p["gluetun_secondary"], warn = _secondary_target(data["gluetun_secondary"], cfg.gluetun.secondary)
+        if warn:
+            warnings.append(warn)
+    # Never let the second target (which may use DroneBL-listed servers) drive the primary Gluetun
+    sec = p.get("gluetun_secondary", cfg.gluetun.secondary)
+    primary_on = (p.get("gluetun_force_update", cfg.gluetun.force_update_enabled)
+                  and p.get("gluetun_force_update_mode", cfg.gluetun.force_update_mode) != "DISABLED")
+    if sec.enabled and primary_on and _same_control_address(
+            p.get("gluetun_control_host", cfg.gluetun.control_server_host),
+            p.get("gluetun_control_port", cfg.gluetun.control_server_port),
+            sec.control_server_host, sec.control_server_port):
+        raise _BadSetting("second target: it points at the same control server as the main Gluetun. "
+                          "Use the companion's or a second Gluetun's address.")
 
     # Profiles: an invalid entry keeps the previous list (reported as a warning, not an error)
     if "gluetun_profiles" in data:
@@ -970,16 +1159,24 @@ def _parse_settings(data: dict, cfg) -> tuple[dict, list[str]]:
     return p, warnings
 
 
+def _primary_control_fields(g) -> tuple:
+    return (g.force_update_enabled, g.force_update_mode, g.control_server_host, g.control_server_port,
+            g.api_key, g.control_profile)
+
+
 def _schedule_fields(scan) -> tuple:
     return (scan.scan_mode, scan.scan_interval_minutes, scan.scan_schedule_time,
             tuple(scan.scan_schedule_days or ()), scan.auto_scan_enabled)
 
 
-def _drop_performance_history(names_lower: set) -> None:
+def _drop_performance_history(names_lower: set, seedbox: bool = False) -> None:
     """Forget the speed-check history of these servers (case-insensitive), in memory and config."""
     if not names_lower:
         return
-    for history in (state.server_performance_history, config_manager.config.performance.history):
+    perf = config_manager.config.performance
+    pair = ((state.seedbox_history, perf.seedbox_history) if seedbox
+            else (state.server_performance_history, perf.history))
+    for history in pair:
         for name in [n for n in history if n.lower() in names_lower]:
             del history[name]
 
@@ -1048,7 +1245,7 @@ async def update_settings(request: Request):
         elif was_enabled and not now_enabled:
             cfg.scan.discovery_started_at = None  # abandon the running period
         cfg.scan.port_discovery_enabled = now_enabled
-    for key in ("preferred_port", "preferred_mtu", "speedtest_test_count", "preferred_entry_ip",
+    for key in ("preferred_port", "preferred_mtu", "speedtest_test_count", "speedtest_blocked_top_n", "preferred_entry_ip",
                 "discovery_test_count", "discovery_duration_days", "discovery_entry_filter", "post_server_wait"):
         if key in p:
             setattr(cfg.scan, key, p[key])
@@ -1092,6 +1289,12 @@ async def update_settings(request: Request):
         cfg.performance.threshold_upload = p["performance_threshold_upload"]
     if "performance_check_count" in p:
         cfg.performance.check_count = p["performance_check_count"]
+    if "performance_retest_after_days" in p:
+        cfg.performance.retest_after_days = p["performance_retest_after_days"]
+    if "seedbox_threshold_download" in p:
+        cfg.performance.seedbox_threshold_download = p["seedbox_threshold_download"]
+    if "seedbox_threshold_upload" in p:
+        cfg.performance.seedbox_threshold_upload = p["seedbox_threshold_upload"]
     if "speedtest_blacklist_duration_days" in p:
         cfg.speedtest_blacklist.duration_days = p["speedtest_blacklist_duration_days"]
     if "speedtest_max_blacklist_failures" in p:
@@ -1102,7 +1305,10 @@ async def update_settings(request: Request):
         cfg.performance.disabled_servers = p["disabled_servers"]
     # Servers taken off the list start over: their old below-threshold history would
     # otherwise make every speedtest skip them, so they could never recover
-    _drop_performance_history(disabled_before - {s.lower() for s in cfg.performance.disabled_servers})
+    removed = disabled_before - {s.lower() for s in cfg.performance.disabled_servers}
+    _drop_performance_history(removed)
+    for n in [n for n in cfg.performance.disabled_at if n.lower() in removed]:
+        del cfg.performance.disabled_at[n]
 
     # Scoring Settings (the two weights always sum to 1.0)
     if "deviation_download_weight" in p:
@@ -1120,6 +1326,7 @@ async def update_settings(request: Request):
         cfg.scoring.signal_medium_threshold = max(1, cfg.scoring.signal_good_threshold - 1)
     
     # Gluetun Settings
+    primary_before = _primary_control_fields(cfg.gluetun)
     if "gluetun_force_update" in p:
         cfg.gluetun.force_update_enabled = p["gluetun_force_update"]
     if "gluetun_force_update_mode" in p:
@@ -1134,8 +1341,14 @@ async def update_settings(request: Request):
         cfg.gluetun.control_profile = p["gluetun_control_profile"]
     if "gluetun_watchdog_interval" in p:
         cfg.gluetun.watchdog_interval_seconds = p["gluetun_watchdog_interval"]
-    gluetun_changed = "gluetun_profiles" in p
-    if gluetun_changed:
+    secondary_changed = "gluetun_secondary" in p and p["gluetun_secondary"] != cfg.gluetun.secondary
+    if "gluetun_secondary" in p:
+        cfg.gluetun.secondary = p["gluetun_secondary"]
+    # The Settings page always sends the profiles: only an actual change (or a change to the
+    # main control) regenerates and pushes, so unrelated saves never reconnect Gluetun
+    gluetun_changed = ("gluetun_profiles" in p and p["gluetun_profiles"] != cfg.gluetun.profiles) or (
+        _primary_control_fields(cfg.gluetun) != primary_before)
+    if "gluetun_profiles" in p:
         cfg.gluetun.profiles = p["gluetun_profiles"]
 
     # WireGuard Settings
@@ -1151,13 +1364,20 @@ async def update_settings(request: Request):
         if state.settings_updated_event and _schedule_fields(cfg.scan) != schedule_before:
             state.settings_updated_event.set()
 
-        # Trigger generation asynchronously if Gluetun config changed
-        if gluetun_changed:
+        # Trigger generation asynchronously if Gluetun config changed. Not while a scan runs:
+        # its results are half done, and the scan pushes (with the new settings) when it ends.
+        if state.is_scanning and (gluetun_changed or secondary_changed):
+            logger.info("Gluetun settings saved; they apply when the running scan finishes.")
+        elif gluetun_changed:
             has_enabled = any(prof.enabled for prof in cfg.gluetun.profiles)
             control_on = cfg.gluetun.force_update_enabled and cfg.gluetun.force_update_mode != "DISABLED"
-            if has_enabled or control_on:
+            if has_enabled or control_on or cfg.gluetun.secondary.enabled:
                 from ...gluetun import generate_gluetun_servers_json
                 _run_in_background(generate_gluetun_servers_json(), "Gluetun output generation")
+        elif secondary_changed and cfg.gluetun.secondary.enabled:
+            # Only the second target: saving it must never reconnect the main Gluetun
+            from ...gluetun import push_target
+            _run_in_background(push_target("secondary"), "Second target update")
     else:
         logger.error("Failed to save settings.")
         return JSONResponse({"error": "Failed to persist settings"}, status_code=500)
@@ -1173,17 +1393,28 @@ async def update_settings(request: Request):
 
 
 @router.post("/servers/{server_name}/enable")
-async def enable_server(server_name: str):
-    """Re-enable one disabled server (case-insensitive) without touching the rest of the list."""
+async def enable_server(server_name: str, list: str = "main"):
+    """Re-enable one disabled server (case-insensitive) without touching the rest of the list.
+    ?list=seedbox re-enables it on the seedbox list (DroneBL-listed servers)."""
+    import builtins
     perf = config_manager.config.performance
     target = server_name.strip().lower()
-    perf.disabled_servers = [s for s in perf.disabled_servers if s.lower() != target]
-    # Drop its performance history too, or the next speedtest re-disables it on the old numbers
-    _drop_performance_history({target})
+    for n in [n for n in perf.disabled_at if n.lower() == target]:
+        del perf.disabled_at[n]
+    perf.probation = [n for n in perf.probation if n.lower() != target]  # re-enabled by hand: full trust
+    if list == "seedbox":
+        perf.seedbox_disabled_servers = [s for s in perf.seedbox_disabled_servers if s.lower() != target]
+        _drop_performance_history({target}, seedbox=True)
+        names = perf.seedbox_disabled_servers
+    else:
+        perf.disabled_servers = [s for s in perf.disabled_servers if s.lower() != target]
+        # Drop its performance history too, or the next speedtest re-disables it on the old numbers
+        _drop_performance_history({target})
+        names = perf.disabled_servers
     if not config_manager.save():
         return JSONResponse({"error": "Failed to persist settings"}, status_code=500)
-    logger.info(f"Server re-enabled: {server_name}")
-    return {"status": "ok", "disabled_servers": list(perf.disabled_servers)}
+    logger.info(f"Server re-enabled{' (seedbox list)' if list == 'seedbox' else ''}: {server_name}")
+    return {"status": "ok", "disabled_servers": builtins.list(names)}
 
 
 # --- Scan Control ---
@@ -1295,9 +1526,22 @@ async def run_single_speedtest(server_name: str, background_tasks: BackgroundTas
          # app.py logic didn't seem to block it strictly, but let's assume valid server.
          pass
 
-    # Manually trigger speedtest task
-    background_tasks.add_task(run_speedtest_task, server, 1, 1, None)
+    # One queued test per server: each holds the VPN for minutes and delays scans
+    if server_name in _queued_speedtests:
+        return {"error": f"A speedtest for {server_name} is already queued or running"}
+    _queued_speedtests.add(server_name)
+
+    async def run_and_release():
+        try:
+            await run_speedtest_task(server, 1, 1, None)
+        finally:
+            _queued_speedtests.discard(server_name)
+    # Tracked task (see trigger_baseline_speedtest): a stop cancels it and the tunnel is torn down
+    _run_in_background(run_and_release(), f"Speedtest {server_name}")
     return {"status": f"Speedtest queued for {server_name}"}
+
+
+_queued_speedtests: set = set()
 
 
 # --- Debug ---

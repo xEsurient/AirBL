@@ -33,7 +33,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     dnsutils \
     procps \
     curl \
-    wget \
     tini \
     # WireGuard
     wireguard-tools \
@@ -98,7 +97,7 @@ EXPOSE 5665
 
 # Health check
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
-    CMD curl -f "http://localhost:${PORT:-5665}/api/status" || exit 1
+    CMD curl -f "http://localhost:${PORT:-5665}/healthz" || exit 1
 
 # Root is required: the tester creates WireGuard interfaces, policy routes and the
 # iptables kill switch (needs NET_ADMIN, which only root gets via cap_add). It only

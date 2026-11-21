@@ -1,0 +1,31 @@
+{
+  "api": {
+    "listen": "0.0.0.0",
+    "port": 8000,
+    "api_key": "CHANGE-ME-long-random-string",
+    "allow_from": ["192.168.1.10"]
+  },
+  "wireguard": {
+    "interface": "airbl",
+    "private_key": "PrivateKey from the AirVPN config generator (a separate device for this Mac)",
+    "preshared_key": "PresharedKey from the same config",
+    "address": "10.x.x.x/32, fd7d:76ee:e68f:a993:x:x:x:x/128",
+    "dns": "10.128.0.1, fd7d:76ee:e68f:a993::1",
+    "port": 1637,
+    "entry": "ENTRY3",
+    "mtu": 1320,
+    "keepalive": 15,
+    "allowed_ips": "0.0.0.0/0, ::/0"
+  },
+  "initial_servers": ["Achernar"],
+  "qbittorrent": {
+    "enabled": true,
+    "url": "http://127.0.0.1:8080",
+    "username": "",
+    "password": "",
+    "forwarded_port": 0,
+    "enforce_bind": false,
+    "pause_when_down": false,
+    "restart_if_unreachable": true
+  }
+}

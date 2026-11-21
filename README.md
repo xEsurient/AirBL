@@ -32,9 +32,11 @@ AirBL keeps your AirVPN connection on servers that aren't on the [DroneBL](https
    ```bash
    docker run --detach \
        --name airbl \
-       --cap-add NET_ADMIN \
+       --cap-drop ALL \
+       --cap-add NET_ADMIN --cap-add NET_RAW --cap-add DAC_OVERRIDE \
+       --security-opt no-new-privileges:true \
+       --stop-timeout 30 \
        --sysctl net.ipv4.conf.all.src_valid_mark=1 \
-       --sysctl net.ipv4.ip_forward=1 \
        --sysctl net.ipv6.conf.all.disable_ipv6=1 \
        --publish 5665:5665 \
        --env TZ=Europe/London \
@@ -51,6 +53,10 @@ AirBL keeps your AirVPN connection on servers that aren't on the [DroneBL](https
 ## Using it with Gluetun
 
 In **Settings → Gluetun**, enter Gluetun's control server address and API key, then pick a switch mode such as *Clean Only*. AirBL then moves Gluetun to clean servers after each scan, checks every minute that it stays on one, and does the same on demand with **Apply Now**. It can also write a filtered server list file for Gluetun. Details are in the [Gluetun guide](docs/Gluetun-Integration.md).
+
+### Seedbox: follow the fastest server, blocked ones included
+
+For torrents, a DroneBL listing rarely matters but speed does. Set **Seedbox: Listed Servers to Test** (Settings → Speedtest) and AirBL also speedtests the lowest-ping listed servers and ranks everything by speed in a separate **Fastest (any reputation)** list. A **Second Control Target** then keeps a second Gluetun on the fastest servers, or the [AirBL companion](companion/README.md), which switches a Mac's (or Linux box's) WireGuard tunnel in place and keeps a native qBittorrent reannounced and reachable. Your main Gluetun stays clean-only.
 
 ## Documentation
 

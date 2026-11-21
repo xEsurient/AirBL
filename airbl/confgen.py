@@ -9,6 +9,7 @@ configs in /app/conf/, with fallback to WireGuard profile settings.
 """
 
 import logging
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -194,8 +195,11 @@ def generate_config(
     if identity.preshared_key:
         lines.append(f"PresharedKey = {identity.preshared_key}")
     
-    conf_path.write_text("\n".join(lines) + "\n")
-    conf_path.chmod(0o600)  # contains the private key
+    # Created 0600 (it contains the private key): never world-readable, not even briefly
+    fd = os.open(conf_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        f.write("\n".join(lines) + "\n")
+    conf_path.chmod(0o600)
     logger.debug(f"Generated config: {filename}")
     return conf_path
 

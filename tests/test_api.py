@@ -437,7 +437,7 @@ def test_gluetun_check_endpoint(client, monkeypatch):
     import airbl.gluetun as gl
     seen = []
 
-    async def fake_check(force=False):
+    async def fake_check(force=False, target="primary"):
         seen.append(force)
         return {"applied": False, "reason": "current server still clean", "current": "Fuyue"}
 

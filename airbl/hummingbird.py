@@ -132,6 +132,14 @@ class WireGuardController:
         logger = logging.getLogger("airbl.hummingbird")
         
         start_time = datetime.now()
+        host_net = self.host_network_reason()
+        if host_net and os.environ.get("AIRBL_ALLOW_HOST_NETWORK", "").lower() not in ("1", "true", "yes"):
+            # Refuse: in the host's namespace this would replace its wg0/table 51820 and route
+            # the whole host through the test tunnel. Run AirBL in its own network (bridge).
+            msg = (f"Refusing to bring up a VPN tunnel: {host_net}. Run the container with its own "
+                   "network (not network_mode: host), or set AIRBL_ALLOW_HOST_NETWORK=1 at your own risk.")
+            logger.error(msg)
+            return ConnectionResult(success=False, config_file=str(config_file), error=msg)
         fwmark = str(self._fwmark)
         table = fwmark  # routing table ID matches fwmark
         
@@ -335,6 +343,21 @@ class WireGuardController:
     PRIVATE_V6 = ["fe80::/10", "fc00::/7"]
     KERNEL_FALLBACK_DEVICES = {"tunl0", "sit0", "ip6tnl0", "ip6gre0", "gre0", "gretap0",
                                "erspan0", "ip_vti0", "ip6_vti0"}
+
+    @staticmethod
+    def host_network_reason() -> Optional[str]:
+        """Why this looks like the host's network namespace (network_mode: host), else None.
+        There, wg0 and routing table 51820 may be the host's own WireGuard (e.g. PiVPN) and
+        AirBL's cleanup and policy routing would break it or cut the host off."""
+        try:
+            ifaces = os.listdir("/sys/class/net")
+        except OSError:
+            return None
+        foreign = [i for i in ifaces
+                   if not re.fullmatch(r"lo|eth\d+|wg\d+", i) and i not in WireGuardController.KERNEL_FALLBACK_DEVICES]
+        if foreign:
+            return f"host network namespace detected (interfaces: {', '.join(sorted(foreign)[:5])})"
+        return None
 
     @staticmethod
     def kill_switch_blocker() -> Optional[str]:

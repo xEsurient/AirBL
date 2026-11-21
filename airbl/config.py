@@ -8,6 +8,7 @@ from typing import Annotated, Literal, Optional, List, Dict, Any
 from pathlib import Path
 import json
 import logging
+import os
 import shutil
 from datetime import datetime
 
@@ -96,6 +97,8 @@ class ScanConfig(BaseModel):
     scan_schedule_time: str = Field(default="20:00", pattern=r"^([01]\d|2[0-3]):[0-5]\d$")
     scan_schedule_days: List[DayName] = Field(default_factory=lambda: ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"])
     speedtest_enabled: bool = True
+    # Seedbox ranking: also speedtest the N lowest-ping DroneBL-blocked servers each scan (0 = off)
+    speedtest_blocked_top_n: int = Field(default=0, ge=0, le=50)
     # Port/Entry discovery: test all combos each scan for N days to find optimal
     port_discovery_enabled: bool = False
     preferred_port: int = Field(default=1637, ge=1, le=65535)  # Discovered or manually set best port
@@ -131,6 +134,17 @@ class PerformanceConfig(BaseModel):
     check_count: int = Field(default=3, ge=1, le=10)
     # History is now better stored in SQLite, but keeping for backward compatibility in config until migration
     history: Dict[str, List[Dict]] = Field(default_factory=dict)
+    # Seedbox: DroneBL-listed servers have their own thresholds, history and disabled list, so a
+    # slow listed server never lands on the main list (that would stop scanning it entirely)
+    seedbox_threshold_download: float = Field(default=0.0, ge=0)  # 0 = no auto-disable
+    seedbox_threshold_upload: float = Field(default=0.0, ge=0)
+    seedbox_disabled_servers: List[str] = Field(default_factory=list)
+    seedbox_history: Dict[str, List[Dict]] = Field(default_factory=dict)
+    # Retest: auto-disabled servers (both lists) get another chance after this many days, on
+    # probation (one more result below the thresholds disables them again at once). 0 = never.
+    retest_after_days: int = Field(default=7, ge=0, le=365)
+    disabled_at: Dict[str, str] = Field(default_factory=dict)  # auto-disable time (ISO, UTC) per server
+    probation: List[str] = Field(default_factory=list)          # re-enabled for a retest
 
 class ScoringConfig(BaseModel):
     """Scoring and signal bar settings."""
@@ -154,6 +168,32 @@ class GluetunProfileConfig(BaseModel):
     allowed_countries: List[str] = Field(default_factory=list)
     allowed_cities: List[str] = Field(default_factory=list)
 
+class ControlTargetConfig(BaseModel):
+    """A second Gluetun-compatible control target (e.g. the AirBL macOS companion for a seedbox).
+    Field names match GluetunConfig's control fields, so the same control code serves both."""
+    enabled: bool = False
+    name: str = "Seedbox"
+    control_server_host: str = ""  # required when enabled; never the primary's host:port
+    control_server_port: int = Field(default=8000, ge=1, le=65535)
+    api_key: str = ""
+    control_profile: str = ""  # Gluetun profile whose thresholds/locations filter the candidates; "" = none
+    # NOT_TOPN: stay while the current server is in the top N; NOT_BEST: only the best;
+    # ALLOWED: stay on any allowed server (moves only when the current one drops out)
+    force_update_mode: Literal["NOT_BEST", "NOT_TOPN", "ALLOWED"] = "NOT_TOPN"
+    top_n: int = Field(default=3, ge=1, le=20)
+    allow_blocked: bool = True                  # DroneBL-listed servers may be chosen
+    rank_by: Literal["score", "speed"] = "speed"  # speed = speedtest only; score needs allow_blocked off
+    min_dwell_minutes: int = Field(default=30, ge=0, le=1440)  # no switch sooner after a push (each drops peers)
+    watchdog_interval_seconds: int = Field(default=60, ge=0, le=3600)
+
+    @model_validator(mode="after")
+    def _score_needs_clean(self) -> "ControlTargetConfig":
+        # Every listed server scores 0, so "score" with blocked servers ranks them arbitrarily
+        if self.allow_blocked and self.rank_by == "score":
+            raise ValueError("rank_by 'score' can't be combined with allow_blocked (listed servers all score 0)")
+        return self
+
+
 class GluetunConfig(BaseModel):
     """Global settings and list of profiles for Gluetun generation."""
     force_update_enabled: bool = False
@@ -166,6 +206,7 @@ class GluetunConfig(BaseModel):
     watchdog_interval_seconds: int = 60
     # Same clean 120/120 profile for both Gluetun storage layouts; AirBL's
     # /app/gluetun is meant to be the same folder as Gluetun's /gluetun.
+    secondary: ControlTargetConfig = Field(default_factory=ControlTargetConfig)
     profiles: List[GluetunProfileConfig] = Field(default_factory=lambda: [
         GluetunProfileConfig(
             name="Clean 120/120 (current Gluetun)",
@@ -413,16 +454,23 @@ class SettingsManager:
             config_data = self._diff_model(AirBLConfig, current, self._base_dump())
             
             # Keep the previous version, then write atomically
+            # The file holds the Gluetun API key and profile private keys: owner-only (0600),
+            # and fsynced before the rename so a power cut can't leave a truncated file
             if self.user_settings_path.exists():
                 try:
-                    shutil.copy2(self.user_settings_path, self.user_settings_path.with_name(self.user_settings_path.name + ".bak"))
+                    bak = self.user_settings_path.with_name(self.user_settings_path.name + ".bak")
+                    shutil.copy2(self.user_settings_path, bak)
+                    os.chmod(bak, 0o600)
                 except Exception as e:
                     logger.warning(f"Could not write settings backup: {e}")
             temp_path = self.user_settings_path.with_suffix('.tmp')
-            with open(temp_path, 'w') as f:
+            fd = os.open(temp_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, 'w') as f:
                 json.dump(config_data, f, indent=2)
-            
-            shutil.move(temp_path, self.user_settings_path)
+                f.flush()
+                os.fsync(f.fileno())
+            os.chmod(temp_path, 0o600)  # an older temp file may have kept its mode
+            os.replace(temp_path, self.user_settings_path)
             logger.info(f"Saved settings to {self.user_settings_path}")
             return True
         except Exception as e:

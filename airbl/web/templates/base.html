@@ -27,8 +27,14 @@
             <nav class="nav-links">
                 {% block nav_links %}
                 <div class="nav-links-row">
-                    <span id="gluetunConnected" style="display:none; color: var(--success); font-size: 0.85rem; font-weight: 600; padding-right: 12px; border-right: 1px solid var(--border); margin-right: 8px;">
-                        Connected: <span id="gluetunServerName">--</span>
+                    <!-- VPN status: main Gluetun, and below it the second control target (if enabled) -->
+                    <span id="vpnStatus" class="vpn-status" style="display:none;">
+                        <span id="gluetunConnected" class="vpn-line" style="display:none;">
+                            <span class="gl-dot" aria-hidden="true">●</span><span class="gl-text"> Connected: <span id="gluetunServerName" class="vpn-server">--</span></span>
+                        </span>
+                        <span id="secondaryConnected" class="vpn-line" style="display:none;">
+                            <span class="gl-dot" aria-hidden="true">●</span><span class="gl-text"> <span id="secondaryName" class="vpn-name">Seedbox</span>: <span id="secondaryServerName" class="vpn-server">--</span></span>
+                        </span>
                     </span>
                     <a href="/" class="{% if request.url.path == '/' %}active{% endif %}">Overview</a>
                     <a href="/servers" class="{% if request.url.path == '/servers' %}active{% endif %}">Servers</a>
@@ -58,28 +64,60 @@
     <script src="/static/js/app.js?v={{ asset_version }}"></script>
     {% block scripts %}{% endblock %}
     <script>
-        async function pollGluetunStatus() {
+        // Short label for a target's status (full details go in the tooltip)
+        function vpnLabel(data) {
+            const names = data.selected_names || [];
+            const label = data.server_name
+                ? `${data.server_name}${data.country ? ' (' + data.country + ')' : ''}`
+                : (data.ip || (names.length ? names[0] + (names.length > 1 ? ` +${names.length - 1}` : '') : 'Unknown'));
+            const tip = (names.length && !data.server_name && !data.ip ? `One of: ${names.join(', ')}. ` : '')
+                + (data.note || label);
+            return { label, tip };
+        }
+
+        async function fetchStatus(url) {
             try {
-                const res = await fetch('/api/gluetun/status');
-                if (!res.ok) return;  // keep the last shown state
-                const data = await res.json();
-                const el = document.getElementById('gluetunConnected');
-                const nameEl = document.getElementById('gluetunServerName');
-                if (data.enabled && data.connected) {
-                    const label = data.server_name
-                        ? `${data.server_name} (${data.country || ''})`
-                        : (data.ip || 'Unknown');
-                    nameEl.textContent = label;
-                    el.style.display = '';
-                } else {
-                    el.style.display = 'none';
-                }
+                const res = await fetch(url);
+                return res.ok ? await res.json() : null;
             } catch (e) {
-                // Silently fail — Gluetun may not be reachable
+                return null;  // the target may not be reachable
             }
         }
+
+        async function pollGluetunStatus() {
+            const [main, second] = await Promise.all([
+                fetchStatus('/api/gluetun/status'), fetchStatus('/api/gluetun/status?target=secondary')]);
+            const box = document.getElementById('vpnStatus');
+            const mainEl = document.getElementById('gluetunConnected');
+            const secEl = document.getElementById('secondaryConnected');
+            if (main) {  // null = request failed: keep the last shown state
+                if (main.enabled && main.connected) {
+                    const { label, tip } = vpnLabel(main);
+                    document.getElementById('gluetunServerName').textContent = label;
+                    mainEl.title = tip;
+                    mainEl.style.display = '';
+                } else {
+                    mainEl.style.display = 'none';
+                }
+            }
+            if (second) {
+                if (second.enabled) {
+                    // Shown whenever it's enabled: green when connected, amber when not
+                    document.getElementById('secondaryName').textContent = second.name || 'Seedbox';
+                    const ok = second.connected && !second.error;
+                    const { label, tip } = ok ? vpnLabel(second) : { label: 'not connected', tip: second.error || 'not connected' };
+                    document.getElementById('secondaryServerName').textContent = label;
+                    secEl.title = `${second.name || 'Seedbox'}: ${tip}`;
+                    secEl.classList.toggle('vpn-down', !ok);
+                    secEl.style.display = '';
+                } else {
+                    secEl.style.display = 'none';
+                }
+            }
+            box.style.display = (mainEl.style.display !== 'none' || secEl.style.display !== 'none') ? '' : 'none';
+        }
         pollGluetunStatus();
-        setInterval(pollGluetunStatus, 300000); // 5 minutes
+        setInterval(pollGluetunStatus, 120000); // 2 minutes
         // Call this after a forced VPN reset to refresh status after 30s
         window.refreshGluetunStatus = function() {
             setTimeout(pollGluetunStatus, 30000);

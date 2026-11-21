@@ -1436,3 +1436,21 @@ footer {
         gap: 8px;
     }
 }
+
+/* VPN status in the header: main Gluetun, and below it the second control target. Text on wide
+   screens; below 1200 px just dots (the tooltips have the details), or the nav would drop below
+   the title */
+.vpn-status {
+    display: inline-flex; flex-direction: column; justify-content: center; line-height: 1.25;
+    padding-right: 12px; border-right: 1px solid var(--border); margin-right: 8px;
+}
+.vpn-line { color: var(--success); font-size: 0.85rem; font-weight: 600; white-space: nowrap; }
+.vpn-line.vpn-down { color: var(--warning, #f59e0b); }
+.vpn-server { display: inline-block; max-width: 150px; overflow: hidden; text-overflow: ellipsis; vertical-align: bottom; }
+.vpn-name { display: inline-block; max-width: 80px; overflow: hidden; text-overflow: ellipsis; vertical-align: bottom; }
+.vpn-status .gl-dot { display: none; }
+@media (max-width: 1199px) {
+    .vpn-status { flex-direction: row; gap: 3px; padding-right: 0; border-right: none; margin-right: 2px; }
+    .vpn-status .gl-text { display: none; }
+    .vpn-status .gl-dot { display: inline; font-size: 0.7rem; }
+}

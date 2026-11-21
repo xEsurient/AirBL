@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>org.airbl.companion</string>
+    <!-- Everything this root daemon runs is root-owned: Apple's python3 and the copies of
+         wg, wg-quick, wireguard-go and bash that install.sh puts in /opt/airbl-companion/bin.
+         Homebrew's folders belong to your user account, so they are deliberately not on PATH. -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/bin/python3</string>
+        <string>/opt/airbl-companion/lib/airbl_companion.py</string>
+        <string>-c</string>
+        <string>/opt/airbl-companion/etc/config.json</string>
+        <string>serve</string>
+    </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/opt/airbl-companion/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    </dict>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <!-- Keep wireguard-go (started by wg-quick) running when the companion restarts or crashes;
+         the companion adopts the running tunnel instead of reconnecting -->
+    <key>AbandonProcessGroup</key>
+    <true/>
+    <!-- A config error makes it exit; don't respawn faster than once a minute -->
+    <key>ThrottleInterval</key>
+    <integer>60</integer>
+    <!-- The companion logs to /var/log/airbl-companion.log itself; this only catches crashes -->
+    <key>StandardErrorPath</key>
+    <string>/var/log/airbl-companion.err.log</string>
+</dict>
+</plist>

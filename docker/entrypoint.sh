@@ -19,13 +19,7 @@ check_capabilities() {
 
 # Setup WireGuard interface
 setup_wireguard() {
-    # Enable IP forwarding (may fail in read-only filesystem, that's OK)
-    if [ -w /proc/sys/net/ipv4/ip_forward ]; then
-        echo 1 > /proc/sys/net/ipv4/ip_forward 2>/dev/null || true
-    else
-        echo "Note: /proc/sys/net/ipv4/ip_forward is read-only (may need --privileged or sysctls)"
-    fi
-    
+    # (No IP forwarding: AirBL only tunnels its own traffic, it never routes for others)
     # Set src_valid_mark for WireGuard routing (set via docker-compose sysctls,
     # but also set here as a fallback if /proc/sys is writable)
     if [ -w /proc/sys/net/ipv4/conf/all/src_valid_mark ]; then
@@ -61,6 +55,7 @@ clean_python_cache() {
 
 # Setup Policy Routing so Web UI remains accessible
 setup_policy_routing() {
+    host_network && return 0  # never add rules to the host's own routing
     # Find the primary interface IP (dynamically detect the default interface)
     local default_iface=$(ip route show default | awk '/default/ {print $5}' | head -n 1)
     if [ -z "$default_iface" ]; then
@@ -84,7 +79,25 @@ setup_policy_routing() {
 }
 
 # Remove VPN state left behind by a crash (kill switch chain, tunnel, policy rules)
+# In the host's network namespace (network_mode: host), wg0 and table 51820 may belong to the
+# host (e.g. PiVPN, wg-quick): don't touch them. AirBL refuses VPN tests there too.
+host_network() {
+    for i in /sys/class/net/*; do
+        n=$(basename "$i")
+        case "$n" in
+            lo|eth[0-9]*|wg[0-9]*|tunl0|sit0|ip6tnl0|ip6gre0|gre0|gretap0|erspan0|ip_vti0|ip6_vti0) ;;
+            *) return 0 ;;
+        esac
+    done
+    return 1
+}
+
 cleanup_stale_vpn_state() {
+    if host_network; then
+        echo "WARNING: host network namespace detected; not touching wg0 / routing table 51820."
+        echo "         Run AirBL with its own network (not network_mode: host) for VPN tests."
+        return 0
+    fi
     for ipt in iptables ip6tables; do
         command -v "$ipt" >/dev/null 2>&1 || continue
         while $ipt -w 5 -D OUTPUT -j AIRBL_KS 2>/dev/null; do :; done

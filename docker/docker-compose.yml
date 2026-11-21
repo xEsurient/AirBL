@@ -6,19 +6,30 @@ services:
     image: airbl:latest
     container_name: airbl
     
-    # Required for VPN operations (wg, ip link, ip route, etc.)
+    # Least privilege: drop every capability Docker grants by default, then add back only
+    # what AirBL uses. NET_ADMIN: WireGuard interface, routes and the kill switch (wg, ip,
+    # iptables). NET_RAW: ping. DAC_OVERRIDE: root may use conf/, data/, gluetun/ and
+    # wireguard/ even when they belong to your host user (e.g. created with mkdir).
+    cap_drop:
+      - ALL
     cap_add:
       - NET_ADMIN
+      - NET_RAW
+      - DAC_OVERRIDE
+    # No process in the container can gain privileges (e.g. through setuid programs)
+    security_opt:
+      - no-new-privileges:true
+    # Give a stop during a speedtest time to take the tunnel and kill switch down cleanly
+    stop_grace_period: 30s
     
     # Required sysctls for networking
     sysctls:
       - net.ipv4.conf.all.src_valid_mark=1
-      - net.ipv4.ip_forward=1
       - net.ipv6.conf.all.disable_ipv6=1
     
-    # Network mode for VPN
-    # Use 'host' for full network access (uncomment below and remove ports section)
-    # network_mode: host
+    # Keep the container's own network. Do NOT use network_mode: host: AirBL's VPN tests
+    # replace wg0 and routing table 51820, which on the host may be your own WireGuard.
+    # (AirBL refuses VPN tests in the host's namespace unless AIRBL_ALLOW_HOST_NETWORK=1.)
     
     # Expose web server port
     # Set PORT in docker/.env to move the dashboard (default 5665)
@@ -67,6 +78,11 @@ services:
       # DNS servers for DroneBL lookups
       - DNS_SERVERS=1.1.1.1,8.8.8.8
       
+      # Optional login: set AIRBL_AUTH_TOKEN in docker/.env (a long random string). The browser
+      # then asks for it (any user name, the token as password); scripts send
+      # "Authorization: Bearer <token>". Unset = no login, as before.
+      - AIRBL_AUTH_TOKEN=${AIRBL_AUTH_TOKEN:-}
+
       # VPN kill switch during speedtests (container-only firewall; on by default).
       # Automatically skipped with network_mode: host. Set to 0 to disable.
       # - AIRBL_KILL_SWITCH=1
@@ -74,7 +90,7 @@ services:
     restart: unless-stopped
     
     healthcheck:
-      test: ["CMD-SHELL", "curl -f http://localhost:$${PORT:-5665}/api/status || exit 1"]
+      test: ["CMD-SHELL", "curl -f http://localhost:$${PORT:-5665}/healthz || exit 1"]
       interval: 30s
       timeout: 10s
       retries: 3

@@ -1,5 +1,7 @@
 import aiosqlite
 import logging
+import os
+import shutil
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import List, Dict, Optional, Any
@@ -8,6 +10,12 @@ logger = logging.getLogger("airbl.database")
 
 # History older than this is pruned at startup
 RETENTION_DAYS = 180
+
+# SQLite never gives deleted space back to the disk: the file stays at its biggest size and
+# fragments. After a prune, VACUUM rewrites it compactly, at most this often and only if
+# enough of the file is free pages (it briefly locks the DB and needs a temporary copy).
+VACUUM_INTERVAL_DAYS = 7
+VACUUM_MIN_FREE_FRACTION = 0.10
 
 async def _add_column(conn, table: str, column_def: str) -> None:
     """ALTER TABLE ADD COLUMN unless it exists. A real failure (locked or read-only DB)
@@ -44,6 +52,8 @@ class DatabaseManager:
     async def _ensure_tables(self):
         try:
             conn = self._conn
+            # Small key/value store for housekeeping (e.g. the last VACUUM)
+            await conn.execute("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT)")
             # Scan History Table
             await conn.execute("""
                 CREATE TABLE IF NOT EXISTS scan_history (
@@ -87,7 +97,8 @@ class DatabaseManager:
             """)
             
             # Migration: add vpn columns to existing DBs
-            for col in ["vpn_server_name TEXT", "vpn_country_code TEXT", "vpn_port INTEGER", "vpn_entry TEXT"]:
+            for col in ["vpn_server_name TEXT", "vpn_country_code TEXT", "vpn_port INTEGER", "vpn_entry TEXT",
+                        "deviation_score REAL"]:  # % of the no-VPN baseline (NULL: no baseline / older rows)
                 await _add_column(conn, "speedtest_history", col)
             
             # Server Scan History Table
@@ -155,6 +166,56 @@ class DatabaseManager:
         await self._conn.commit()
         if removed:
             logger.info(f"Pruned {removed} history rows older than {days} days")
+        await self.vacuum_if_due()
+
+    async def _meta(self, key: str) -> Optional[str]:
+        async with self._conn.execute("SELECT value FROM meta WHERE key = ?", (key,)) as cur:
+            row = await cur.fetchone()
+        return row[0] if row else None
+
+    async def vacuum_if_due(self, force: bool = False) -> bool:
+        """Shrink the database file: checkpoint and truncate the WAL, then VACUUM. Runs at
+        most every VACUUM_INTERVAL_DAYS, only when free pages make up a real share of the file,
+        and only with room on the disk for SQLite's temporary copy. Returns True if it ran."""
+        try:
+            last = await self._meta("last_vacuum")
+            if not force and last and datetime.now() - datetime.fromisoformat(last) < timedelta(days=VACUUM_INTERVAL_DAYS):
+                return False
+            async with self._conn.execute("PRAGMA page_count") as cur:
+                pages = (await cur.fetchone())[0]
+            async with self._conn.execute("PRAGMA freelist_count") as cur:
+                free = (await cur.fetchone())[0]
+            if not force and (pages == 0 or free / pages < VACUUM_MIN_FREE_FRACTION):
+                await self._conn.commit()
+                await self._exec("PRAGMA wal_checkpoint(TRUNCATE)")  # still trim the WAL file
+                await self._set_last_vacuum()
+                return False
+            size = os.path.getsize(self.db_path) if os.path.exists(self.db_path) else 0
+            if shutil.disk_usage(os.path.dirname(os.path.abspath(self.db_path))).free < 2 * size:
+                logger.warning("Not compacting the database: not enough free disk space for a temporary copy")
+                return False
+            await self._conn.commit()  # VACUUM can't run inside a transaction
+            await self._exec("PRAGMA wal_checkpoint(TRUNCATE)")
+            await self._exec("VACUUM")
+            await self._exec("PRAGMA wal_checkpoint(TRUNCATE)")
+            await self._set_last_vacuum()
+            after = os.path.getsize(self.db_path) if os.path.exists(self.db_path) else 0
+            logger.info(f"Database compacted: {size / 1e6:.1f} MB -> {after / 1e6:.1f} MB")
+            return True
+        except Exception as e:  # housekeeping must never break a scan or startup
+            logger.warning(f"Database compaction skipped: {e}")
+            return False
+
+    async def _exec(self, sql: str) -> None:
+        """Run a statement and close its cursor (an open cursor makes VACUUM fail)."""
+        cur = await self._conn.execute(sql)
+        await cur.fetchall()
+        await cur.close()
+
+    async def _set_last_vacuum(self) -> None:
+        await self._conn.execute("INSERT OR REPLACE INTO meta (key, value) VALUES ('last_vacuum', ?)",
+                                 (datetime.now().isoformat(),))
+        await self._conn.commit()
 
     async def add_entry_ping(self, scan_id: int, server_name: str, entry_type: str, ip: str, latency_ms: float, is_alive: bool, commit: bool = True):
         await self._conn.execute("""
@@ -278,8 +339,8 @@ class DatabaseManager:
     async def add_speedtest_result(self, result: Dict[str, Any], scan_id: Optional[int] = None):
         await self._conn.execute("""
             INSERT INTO speedtest_history 
-            (scan_id, server_name, server_country, vpn_server_name, vpn_country_code, vpn_port, vpn_entry, download_mbps, upload_mbps, ping_ms, timestamp, is_success, error_message)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            (scan_id, server_name, server_country, vpn_server_name, vpn_country_code, vpn_port, vpn_entry, download_mbps, upload_mbps, ping_ms, timestamp, is_success, error_message, deviation_score)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             scan_id,
             result.get("server_name") or "",  # Ookla server; column is NOT NULL
@@ -293,7 +354,8 @@ class DatabaseManager:
             result.get("ping_ms"),
             result.get("timestamp") or datetime.now().isoformat(),
             1 if result.get("is_success", True) and not result.get("error") else 0,
-            result.get("error") or result.get("error_message")
+            result.get("error") or result.get("error_message"),
+            result.get("deviation_score"),
         ))
         await self._conn.commit()
 

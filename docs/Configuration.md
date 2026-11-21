@@ -20,6 +20,7 @@ AirBL also reads your client identity (private key, address, preshared key) from
 - **Auto-scan, mode and timing:** either an interval (minutes) or a schedule (time + days). Schedules use the container's time zone (`TZ`).
 - **Speedtests:** test clean servers through the VPN after each scan.
 - **Tests per server:** how many speedtests to average per server (1-10).
+- **Blocked servers to test (seedbox):** also speedtest this many DroneBL-listed servers after the clean ones, lowest ping first, within your location filters (0 = off, the default). Each adds about 3-5 minutes to a scan; Settings shows an estimate and warns when it's longer than the scan interval. Their results feed the dashboard's **Fastest (any reputation)** table and a [second control target](Gluetun-Integration.md#second-control-target-seedbox). They never change the normal (clean-only) score, recommendations or the main Gluetun control. They use the separate seedbox thresholds below.
 - **VPN cooldown:** wait between servers (120 s or 180 s).
 
 ### Port & Entry Discovery
@@ -35,6 +36,12 @@ AirBL also reads your client identity (private key, address, preshared key) from
 
 ### Performance
 - **Download / upload thresholds and check count:** a server below either threshold for *N* consecutive speedtests is auto-disabled. Disabled servers are listed with a **Re-enable** button.
+- **Retest auto-disabled servers after (days):** default 7, 0 = never. Auto-disabled servers (main and seedbox lists) are scanned and tested again after this long.
+  - On the retest, one result below the thresholds disables a server again; a good result keeps it.
+  - Servers you disabled by hand are never retested.
+  - The disabled lists show when each server's retest is due.
+  - Results don't count towards auto-disable while your own connection (the no-VPN baseline) is below the thresholds.
+- **Seedbox thresholds:** DroneBL-listed servers tested for the seedbox ranking have their own thresholds (0 / 0 = never auto-disable them, the default), history and disabled list ("Seedbox" under Auto-Disabled Servers). A listed server never lands on the main list, so if it becomes clean later it is scanned and tested normally.
 - **Speedtest server blacklist:** Ookla servers that report themselves unavailable are skipped for a few days. Timeouts and tunnel problems don't count against them.
 
 ### Scoring

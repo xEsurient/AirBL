@@ -7,6 +7,6 @@ Whether you're struggling with Captchas on blacklisted endpoints, chasing the lo
 ## Contents
 1. [Installation](Installation.md): Docker setup, volumes and environment variables.
 2. [Configuration](Configuration.md): the Settings page, server states, port/entry discovery.
-3. [Gluetun Integration](Gluetun-Integration.md): server lists for Gluetun and switching servers via its control API.
+3. [Gluetun Integration](Gluetun-Integration.md): server lists for Gluetun and switching servers via its control API, plus a second (seedbox) target.
 4. [WireGuard Integration](WireGuard-Integration.md): generated `.conf` profiles.
 5. [Troubleshooting](Troubleshooting.md): common problems and fixes.

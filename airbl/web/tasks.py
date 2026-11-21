@@ -128,75 +128,139 @@ def _save_performance_history():
     if not _perf_history_unsaved:
         return
     config_manager.config.performance.history = state.server_performance_history
+    config_manager.config.performance.seedbox_history = state.seedbox_history
     if config_manager.save():
         _perf_history_unsaved = False
 
 
-async def _check_and_disable_underperforming_server(server_name: str, speedtest_result: dict):
+def _thresholds(blocked: bool):
+    """(history dict, download, upload, disabled-list field) for clean or DroneBL-listed servers.
+    Listed servers use the seedbox thresholds and list, so they never reach the main list."""
+    perf = config_manager.config.performance
+    if blocked:
+        return (state.seedbox_history, perf.seedbox_threshold_download, perf.seedbox_threshold_upload,
+                "seedbox_disabled_servers")
+    return state.server_performance_history, perf.threshold_download, perf.threshold_upload, "disabled_servers"
+
+
+def _disabled_since(name: str, seedbox: bool) -> Optional[datetime]:
+    """When a server was auto-disabled. Entries from before this was recorded count as
+    auto-disabled if their kept history is below the thresholds (time of the last result);
+    anything else (e.g. disabled by hand) has no time and is never retested."""
+    perf = config_manager.config.performance
+    if perf.disabled_at.get(name):
+        try:
+            return _parse_ts(perf.disabled_at[name])
+        except ValueError:
+            return None
+    histories, threshold_dl, threshold_ul, _ = _thresholds(seedbox)
+    history = histories.get(name) or []
+    if history and _all_below(history, threshold_dl, threshold_ul, min(perf.check_count, len(history))):
+        try:
+            return _parse_ts(history[-1].get("timestamp") or "")
+        except ValueError:
+            return None
+    return None
+
+
+def retest_disabled_servers(now: Optional[datetime] = None) -> list:
+    """Put auto-disabled servers whose time is up back in the scan, on probation, with a
+    fresh history. Runs at the start of each scan. Returns the names re-enabled."""
+    global _perf_history_unsaved
+    perf = config_manager.config.performance
+    days = perf.retest_after_days
+    if not days:
+        return []
+    now = now or datetime.now(timezone.utc)
+    back = []
+    for list_field, seedbox in (("disabled_servers", False), ("seedbox_disabled_servers", True)):
+        keep = []
+        for name in getattr(perf, list_field):
+            since = _disabled_since(name, seedbox)
+            if since is not None and (now - since).total_seconds() >= days * 86400:
+                back.append(name)
+                _thresholds(seedbox)[0].pop(name, None)  # fresh start: old results don't count
+                perf.disabled_at.pop(name, None)
+                if name not in perf.probation:
+                    perf.probation.append(name)
+            else:
+                keep.append(name)
+        setattr(perf, list_field, keep)
+    if back:
+        logger.info(f"Retesting {len(back)} auto-disabled server(s) after {days} days: {', '.join(back)}")
+        perf.history = state.server_performance_history
+        perf.seedbox_history = state.seedbox_history
+        if config_manager.save():
+            _perf_history_unsaved = False
+    return back
+
+
+def _all_below(history: list, threshold_dl: float, threshold_ul: float, count: int) -> bool:
+    if len(history) < count:
+        return False
+    return all(r.get("download", r.get("download_mbps", 0)) < threshold_dl or
+               r.get("upload", r.get("upload_mbps", 0)) < threshold_ul
+               for r in history[-count:])
+
+
+async def _check_and_disable_underperforming_server(server_name: str, speedtest_result: dict,
+                                                    blocked: bool = False):
     """
-    Check if server consistently underperforms and auto-disable if needed.
+    Check if server consistently underperforms and auto-disable if needed. DroneBL-listed
+    servers (blocked) use the seedbox thresholds and the seedbox disabled list (0/0 = off).
     """
     global _perf_history_unsaved
     # Skip if speedtest failed
     # to_dict() always has an "error" key (None on success), so test its value
     if not speedtest_result or speedtest_result.get("error"):
         return
-    
+    perf = config_manager.config.performance
+    histories, threshold_dl, threshold_ul, list_field = _thresholds(blocked)
+    if blocked and not (threshold_dl or threshold_ul):
+        return
+
+    base = state.baseline_speedtest or {}
+    base_dl, base_ul = base.get("download_mbps"), base.get("upload_mbps")
+    if (base_dl is not None and base_dl < threshold_dl) or (base_ul is not None and base_ul < threshold_ul):
+        # The connection itself (no VPN) is below the thresholds, e.g. a congested evening:
+        # every server would fail and get disabled for good. Don't count this result.
+        logger.info(f"Not counting {server_name} towards auto-disable: the baseline "
+                    f"(↓{base_dl} ↑{base_ul} Mbps) is itself below the thresholds")
+        return
+
     download = speedtest_result.get("download_mbps", 0)
     upload = speedtest_result.get("upload_mbps", 0)
-    
-    threshold_dl = config_manager.config.performance.threshold_download
-    threshold_ul = config_manager.config.performance.threshold_upload
-    
-    # Store history (persistently via SettingsManager for now/backward compat, 
-    # but runtime update happens in state.server_performance_history)
-    if server_name not in state.server_performance_history:
-        state.server_performance_history[server_name] = []
-        
-    state.server_performance_history[server_name].append({
-        "download": download,
-        "upload": upload,
-        "timestamp": datetime.now().isoformat()
-    })
-    
-    # Keep last N checks
-    # Use check_count * 2 to keep some context
-    max_history = config_manager.config.performance.check_count * 2
-    if len(state.server_performance_history[server_name]) > max_history:
-        state.server_performance_history[server_name] = state.server_performance_history[server_name][-max_history:]
+    history = histories.setdefault(server_name, [])
+    history.append({"download": download, "upload": upload, "timestamp": datetime.now().isoformat()})
+    # Keep last N checks (check_count * 2 for some context)
+    max_history = perf.check_count * 2
+    if len(history) > max_history:
+        histories[server_name] = history = history[-max_history:]
     _perf_history_unsaved = True
 
-    # Check if underperforming for N consecutive times
-    check_count = config_manager.config.performance.check_count
-    history = state.server_performance_history[server_name]
-    
-    if len(history) >= check_count:
-        recent = history[-check_count:]
-        consistently_bad = all(
-            entry["download"] < threshold_dl or entry["upload"] < threshold_ul
-            for entry in recent
-        )
-        
-        if consistently_bad and server_name not in state.disabled_servers:
-            logger.warning(f"Auto-disabling {server_name}: consistently underperforming (last {check_count} checks below threshold)")
-            
-            # Update config via SettingsManager
-            current_disabled = set(config_manager.config.performance.disabled_servers)
-            current_disabled.add(server_name)
-            
-            # Update history in config too 
-            # (Note: this is inefficient for every check, but matches previous logic behavior of saving state)
-            # In next phase with SQLite, this part vanishes.
-            
-            config_manager.config.performance.disabled_servers = sorted(list(current_disabled))
-            config_manager.config.performance.history = state.server_performance_history
-            if config_manager.save():
-                _perf_history_unsaved = False
-
-            await broadcast_update("server_disabled", {
-                "server": server_name,
-                "reason": "underperformance"
-            })
+    disabled = getattr(perf, list_field)
+    on_probation = server_name in perf.probation
+    if on_probation and not _all_below(history[-1:], threshold_dl, threshold_ul, 1):
+        perf.probation = [n for n in perf.probation if n != server_name]  # passed the retest
+        logger.info(f"{server_name} passed its retest and stays enabled")
+        _perf_history_unsaved = True
+    # On probation (re-enabled for a retest) one result below the thresholds is enough
+    needed = 1 if on_probation else perf.check_count
+    if _all_below(history, threshold_dl, threshold_ul, needed) and server_name not in disabled:
+        what = "seedbox list" if blocked else "disabled list"
+        logger.warning(f"Auto-disabling {server_name} ({what}): consistently underperforming "
+                       f"(last {perf.check_count} checks below threshold)")
+        setattr(perf, list_field, sorted(set(disabled) | {server_name}))
+        perf.disabled_at[server_name] = _utcnow_iso()
+        perf.probation = [n for n in perf.probation if n != server_name]
+        perf.history = state.server_performance_history
+        perf.seedbox_history = state.seedbox_history
+        if config_manager.save():
+            _perf_history_unsaved = False
+        payload = {"server": server_name, "reason": "underperformance"}
+        if blocked:
+            payload["list"] = "seedbox"
+        await broadcast_update("server_disabled", payload)
 
 
 def _average_speedtest_results(results: list[SpeedTestResult], server_name: str) -> SpeedTestResult:
@@ -319,6 +383,11 @@ async def run_scan_task():
         
             logger.info("Starting scheduled scan task")
         
+            # Auto-disabled servers whose retest time has come are scanned again (on probation)
+            retested = retest_disabled_servers()
+            if retested:
+                await broadcast_update("servers_retest", {"servers": retested})
+
             # Initialize scanner with disabled servers exclusion
             # We need to pass the excluded servers from config
             excluded = set(config_manager.config.performance.disabled_servers)
@@ -412,7 +481,9 @@ async def run_scan_task():
                 return
 
             # Scan complete: promote it to the results everything else reads
+            previous_scan = state.current_scan
             state.current_scan, state.live_scan = state.live_scan, None
+            _carry_over_blocked_results(previous_scan, state.current_scan)
             summary = state.current_scan
             logger.info(f"Scan completed. Found {summary.clean_servers_count} clean servers.")
 
@@ -504,37 +575,103 @@ async def run_scan_task():
             })
 
 
+def _apply_city_filter(servers: list) -> list:
+    """Keep servers whose city is enabled for their country (no city filter = all)."""
+    if not state.enabled_cities:
+        return servers
+    config_to_city = {
+        str(config.file_path): config.city.lower()
+        for config in get_scannable_configs(state.server_configs())
+    }
+    filtered = []
+    for server in servers:
+        server_city = config_to_city.get(str(server.config_file), "").lower()
+        country = server.country_code.upper()
+        if country in state.enabled_cities:
+            allowed_cities = {c.lower() for c in state.enabled_cities[country]}
+            if server_city not in allowed_cities:
+                continue
+        filtered.append(server)
+    return filtered
+
+
+def _best_ping_ms(server) -> Optional[float]:
+    """Lowest known latency of a server: entry pings, then exit pings (blocked IPs included)."""
+    pings = [p.avg_rtt_ms for p in (getattr(server, "entry1_ping", None), getattr(server, "entry3_ping", None),
+                                    getattr(server, "exit_ping", None))
+             if p is not None and p.is_alive and p.avg_rtt_ms is not None]
+    pings += [ip.latency_ms for ip in getattr(server, "scanned_ips", None) or []
+              if ip.is_responsive and ip.latency_ms is not None]
+    return min(pings) if pings else None
+
+
+def _blocked_speedtest_queue(servers: list, top_n: int, must_include: Optional[str] = None) -> list:
+    """The top_n lowest-ping blocked servers worth a speedtest for the seedbox ranking:
+    blocked, with a config, inside the location filter, not disabled/underperforming.
+    must_include: the second target's current server; always re-tested while it is listed,
+    so it can't drop out of the ranking (and force a switch) just because its ping jittered."""
+    if top_n <= 0:
+        return []
+    # Not verified clean: listed, or unknown (lookup failed). The seedbox ranking ignores reputation.
+    blocked = [s for s in servers if not s.is_clean and s.config_file]
+    blocked = [s for s in _apply_city_filter(blocked) if not _should_skip_server(s.server_name, blocked=True)]
+    blocked.sort(key=lambda s: (_best_ping_ms(s) is None, _best_ping_ms(s) or 0.0, s.server_name))
+    queue = blocked[:top_n]
+    if must_include:
+        want = must_include.replace("AirVPN ", "").strip().lower()
+        for s in blocked[top_n:]:
+            if s.server_name.replace("AirVPN ", "").strip().lower() == want:
+                queue.append(s)
+                break
+    return queue
+
+
+async def _secondary_current_server() -> Optional[str]:
+    """Server the second control target is on (None if off/unreachable). Bounded by its timeouts."""
+    from ..gluetun import _view, get_gluetun_status
+    v = _view("secondary")
+    if not v.enabled:
+        return None
+    try:
+        status = await get_gluetun_status(v.cfg)
+    except Exception:
+        return None
+    return status.get("server_name") if not status.get("error") else None
+
+
+def _carry_over_blocked_results(previous, current) -> None:
+    """Blocked servers aren't all re-tested every scan: keep a listed server's last good result
+    for one more scan (marked stale), so the seedbox ranking doesn't flicker. Clean servers are
+    re-tested each scan anyway. Results that are already stale are not carried again."""
+    if not previous or not current:
+        return
+    prev = {s.server_name: s.speedtest_result for s in previous.servers}
+    off = set(config_manager.config.performance.seedbox_disabled_servers)
+    for s in current.servers:
+        old = prev.get(s.server_name)
+        if (not s.is_clean and s.server_name not in off and not s.speedtest_result and old
+                and not old.get("error") and not old.get("stale")):
+            s.speedtest_result = {**old, "stale": True}
+
+
 async def _run_batch_speedtests():
     """Helper to run batch speedtests after scan."""
     # Logic extracted from app.py run_scan_task to keep it clean
     logger = logging.getLogger("airbl.web.scan")
     
-    # Get all clean servers with config files
-    clean_servers = [s for s in state.current_scan.servers if s.is_clean and s.config_file]
+    # Get all clean servers with config files, inside the city filter
+    clean_servers = _apply_city_filter(
+        [s for s in state.current_scan.servers if s.is_clean and s.config_file])
+    # Opt-in: also test the fastest-pinging blocked servers (seedbox ranking ignores DroneBL)
+    top_n = config_manager.config.scan.speedtest_blocked_top_n
+    blocked_servers = _blocked_speedtest_queue(
+        state.current_scan.servers, top_n,
+        must_include=await _secondary_current_server() if top_n > 0 else None)
     
-    # Apply city filter if set
-    if state.enabled_cities:
-        configs = state.server_configs()
-        scannable_configs = get_scannable_configs(configs)
-        config_to_city = {}
-        for config in scannable_configs:
-            config_to_city[str(config.file_path)] = config.city.lower()
-        
-        filtered_servers = []
-        for server in clean_servers:
-            server_city = config_to_city.get(str(server.config_file), "").lower()
-            country = server.country_code.upper()
-            if country in state.enabled_cities:
-                allowed_cities = {c.lower() for c in state.enabled_cities[country]}
-                if server_city not in allowed_cities:
-                    continue
-            filtered_servers.append(server)
-        
-        clean_servers = filtered_servers
-    
-    if clean_servers:
-        total_speedtests = len(clean_servers)
-        logger.info(f"Starting speedtests for {total_speedtests} clean servers")
+    if clean_servers or blocked_servers:
+        total_speedtests = len(clean_servers) + len(blocked_servers)
+        what = f"{len(clean_servers)} clean" + (f" + {len(blocked_servers)} blocked" if blocked_servers else "")
+        logger.info(f"Starting speedtests for {what} servers")
         
         state.scan_progress = {
             "phase": "speedtesting",
@@ -548,13 +685,14 @@ async def _run_batch_speedtests():
             "count": total_speedtests,
             "total": total_speedtests,
             "current": 0,
-            "message": f"Queueing speedtests for {total_speedtests} clean servers..."
+            "message": f"Queueing speedtests for {what} servers..."
         })
         
-        # Group servers by country
+        # Clean servers grouped by country, then the blocked queue (lowest ping first)
         servers_by_country = defaultdict(list)
         for server in clean_servers:
             servers_by_country[server.country_code].append(server)
+        queue = [s for group in servers_by_country.values() for s in group] + blocked_servers
         
         controller = WireGuardController(use_sudo=None)
         
@@ -564,9 +702,10 @@ async def _run_batch_speedtests():
         VPN_STABILIZATION_WAIT = 30
         POST_SERVER_WAIT = config_manager.config.scan.post_server_wait
         
-        # --- Run Discovery Phase (before standard speedtests) ---
+        # --- Run Discovery Phase (before standard speedtests; clean servers only) ---
         try:
-            await _run_discovery_phase(clean_servers, controller)
+            if clean_servers:
+                await _run_discovery_phase(clean_servers, controller)
         except Exception as e:
             logger.error(f"Discovery phase failed: {e}")
         
@@ -584,7 +723,7 @@ async def _run_batch_speedtests():
         server_index = 0
         
         try:
-            for country_code, country_servers in servers_by_country.items():
+            for server in queue:
                 if state.scan_cancelled: break
                 
                 # Check Pause
@@ -592,32 +731,24 @@ async def _run_batch_speedtests():
                     await asyncio.sleep(0.5)
                 if state.scan_cancelled: break
                 
-                for server in country_servers:
-                    if state.scan_cancelled: break
-                    
-                    # Check Pause
-                    while state.is_paused and not state.scan_cancelled:
-                        await asyncio.sleep(0.5)
-                    if state.scan_cancelled: break
-                    
-                    server_index += 1
-                    
-                    # Resolve config based on preferred port/entry settings
-                    config_override = await _resolve_server_config(server)
-                    
-                    # Run single server test
-                    await _run_single_server_speedtest(
-                        server, server_index, total_speedtests, 
-                        controller, TESTS_PER_SERVER, INTER_TEST_DELAY, VPN_STABILIZATION_WAIT,
-                        config_override=config_override, scan_id=state.current_scan_id,
-                    )
-                    if server_index % 10 == 0:
-                        _save_performance_history()  # a crash mid-batch loses at most 10 checks
+                server_index += 1
+                
+                # Resolve config based on preferred port/entry settings
+                config_override = await _resolve_server_config(server)
+                
+                # Run single server test
+                await _run_single_server_speedtest(
+                    server, server_index, total_speedtests, 
+                    controller, TESTS_PER_SERVER, INTER_TEST_DELAY, VPN_STABILIZATION_WAIT,
+                    config_override=config_override, scan_id=state.current_scan_id,
+                )
+                if server_index % 10 == 0:
+                    _save_performance_history()  # a crash mid-batch loses at most 10 checks
 
-                    # Post-server wait
-                    if server_index < total_speedtests and not state.scan_cancelled:
-                        await _smart_wait(POST_SERVER_WAIT)
-                        
+                # Post-server wait
+                if server_index < total_speedtests and not state.scan_cancelled:
+                    await _smart_wait(POST_SERVER_WAIT)
+                    
         finally:
             _save_performance_history()  # first: the teardown below may re-raise a cancel
             try:
@@ -1005,30 +1136,23 @@ async def _finalize_discovery():
     })
 
 
-def _should_skip_server(server_name: str) -> bool:
+def _should_skip_server(server_name: str, blocked: bool = False) -> bool:
     """
     Pre-check: should we skip this server based on performance history?
-    Returns True if the server is disabled or consistently underperforming.
+    Returns True if the server is disabled or consistently underperforming. Listed servers
+    are judged by the seedbox thresholds and list (plus a manual entry on the main list).
     """
-    perf_cfg = config_manager.config.performance
-    
-    # Check if explicitly disabled
-    if server_name in perf_cfg.disabled_servers:
+    perf = config_manager.config.performance
+    if server_name in perf.disabled_servers:
         return True
-    
-    # Check performance history
-    history = state.server_performance_history.get(server_name, [])
-    if len(history) >= perf_cfg.check_count:
-        recent = history[-perf_cfg.check_count:]
-        all_below = all(
-            r.get("download", r.get("download_mbps", 0)) < perf_cfg.threshold_download or
-            r.get("upload", r.get("upload_mbps", 0)) < perf_cfg.threshold_upload
-            for r in recent
-        )
-        if all_below:
-            logger.debug(f"Skipping {server_name}: consistently below threshold")
-            return True
-    
+    if blocked and server_name in perf.seedbox_disabled_servers:
+        return True
+    histories, threshold_dl, threshold_ul, _ = _thresholds(blocked)
+    if blocked and not (threshold_dl or threshold_ul):
+        return False
+    if _all_below(histories.get(server_name, []), threshold_dl, threshold_ul, perf.check_count):
+        logger.debug(f"Skipping {server_name}: consistently below threshold")
+        return True
     return False
 
 
@@ -1039,7 +1163,7 @@ async def _run_single_server_speedtest(server, index, total, controller, tests_p
     Returns None on success, otherwise a short reason (used for manual-run feedback).
     """
     # Pre-check: skip if underperforming
-    if _should_skip_server(server.server_name):
+    if _should_skip_server(server.server_name, blocked=not server.is_clean):
         logger.info(f"Skipping speedtest for {server.server_name} (below threshold / disabled)")
         return "Skipped: server is disabled or below performance thresholds"
 
@@ -1163,7 +1287,8 @@ async def _run_single_server_speedtest(server, index, total, controller, tests_p
                         s.speedtest_result = dct
                         break
             
-            await _check_and_disable_underperforming_server(server.server_name, dct)
+            # Not verified clean (listed or unknown): the seedbox thresholds and list
+            await _check_and_disable_underperforming_server(server.server_name, dct, blocked=not server.is_clean)
             
             # Persist to SQLite
             if state.db:

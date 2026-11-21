@@ -418,7 +418,8 @@ function handleMessage(msg) {
         }
         case 'server_disabled': {
             const d = msg.data || {};
-            showToast(`🚫 ${d.server || d.server_name || 'Server'} was disabled${d.reason ? ': ' + d.reason : ''}`, 'info');
+            const where = d.list === 'seedbox' ? ' (seedbox list)' : '';
+            showToast(`🚫 ${d.server || d.server_name || 'Server'} was disabled${where}${d.reason ? ': ' + d.reason : ''}`, 'info');
             break;
         }
         case 'settings_changed':
@@ -1114,11 +1115,13 @@ function escapeHtml(value) {
 // --- Auto-disabled servers (Settings and Metrics pages) ---
 
 // Load /api/servers/disabled into the element. onEnabled(name, disabledNames) runs after a re-enable.
-async function loadDisabledServers(containerId, onEnabled) {
+// list: 'main' or 'seedbox' (DroneBL-listed servers disabled by the seedbox thresholds).
+async function loadDisabledServers(containerId, onEnabled, list = 'main') {
     const el = document.getElementById(containerId);
     if (!el) return;
+    el.dataset.list = list;
     try {
-        const res = await fetch('/api/servers/disabled');
+        const res = await fetch('/api/servers/disabled' + (list === 'seedbox' ? '?list=seedbox' : ''));
         if (!res.ok) throw new Error('HTTP ' + res.status);
         renderDisabledServerList(el, await res.json(), onEnabled);
     } catch (e) {
@@ -1144,13 +1147,16 @@ function renderDisabledServerList(el, data, onEnabled) {
         return `<div class="disabled-row">
             <div>
                 <div class="disabled-name">${/^[A-Za-z]{2}$/.test(s.country_code || '') ? getFlagEmoji(s.country_code) + ' ' : ''}${escapeHtml(s.name)}</div>
-                <div class="disabled-meta">${escapeHtml(where)}${s.avg_download_mbps != null ? ` · avg ↓${mbps(s.avg_download_mbps)} ↑${mbps(s.avg_upload_mbps)} Mbps` : ''}</div>
+                <div class="disabled-meta">${escapeHtml(where)}${s.avg_download_mbps != null ? ` · avg ↓${mbps(s.avg_download_mbps)} ↑${mbps(s.avg_upload_mbps)} Mbps` : ''}${s.retest_at ? ` · retest from ${escapeHtml(new Date(s.retest_at).toLocaleDateString(undefined, { day: 'numeric', month: 'short' }))}` : ''}</div>
             </div>
             <div class="disabled-results">${results}</div>
             <button class="btn btn-secondary" data-server="${escapeHtml(s.name)}">Re-enable</button>
         </div>`;
     }).join('');
-    el.innerHTML = `<p class="setting-description" style="margin: 0 0 10px;">Disabled after ${escapeHtml(data.check_count)} results in a row below ${escapeHtml(thDl)} Mbps down or ${escapeHtml(thUl)} Mbps up (low values in red). Disabled servers are skipped by scans.</p>
+    const skipped = data.list === 'seedbox'
+        ? 'They are skipped by the blocked-server speedtests and the second control target; if one becomes clean it is tested normally.'
+        : 'Disabled servers are skipped by scans.';
+    el.innerHTML = `<p class="setting-description" style="margin: 0 0 10px;">Disabled after ${escapeHtml(data.check_count)} results in a row below ${escapeHtml(thDl)} Mbps down or ${escapeHtml(thUl)} Mbps up (low values in red). ${skipped}</p>
         <div class="disabled-list">${rows}</div>`;
     el.querySelectorAll('button[data-server]').forEach(btn => {
         btn.addEventListener('click', () => reEnableDisabledServer(btn.dataset.server, el, onEnabled));
@@ -1161,7 +1167,8 @@ async function reEnableDisabledServer(name, el, onEnabled) {
     if (!confirm(`Re-enable server "${name}"? It will be tested again in future scans.`)) return;
     try {
         // Dedicated endpoint: only this change is saved, other unsaved settings edits stay
-        const res = await fetch(`/api/servers/${encodeURIComponent(name)}/enable`, { method: 'POST' });
+        const list = (el && el.dataset.list === 'seedbox') ? '?list=seedbox' : '';
+        const res = await fetch(`/api/servers/${encodeURIComponent(name)}/enable${list}`, { method: 'POST' });
         const data = await res.json().catch(() => ({}));
         if (!res.ok || data.error || !Array.isArray(data.disabled_servers)) {
             showToast(`Failed to re-enable ${name}: ${data.error || data.detail || 'HTTP ' + res.status}`, 'error');
@@ -1169,7 +1176,7 @@ async function reEnableDisabledServer(name, el, onEnabled) {
         }
         showToast(`Server "${name}" re-enabled`, 'success');
         if (onEnabled) onEnabled(name, data.disabled_servers);
-        if (el && el.id) loadDisabledServers(el.id, onEnabled);
+        if (el && el.id) loadDisabledServers(el.id, onEnabled, el.dataset.list || 'main');
     } catch (e) {
         showToast('Failed to re-enable server: ' + e.message, 'error');
     }

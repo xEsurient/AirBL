@@ -68,6 +68,8 @@ class AppState:
         # Performance tracking history (in-memory cache for quick access)
         # Deep copy: shared per-server lists would make config and state half-alias each other
         self.server_performance_history: dict[str, list[dict]] = copy.deepcopy(config_manager.config.performance.history)
+        # Same for DroneBL-listed servers, kept apart (seedbox thresholds, own disabled list)
+        self.seedbox_history: dict[str, list[dict]] = copy.deepcopy(config_manager.config.performance.seedbox_history)
         
         # Ban frequency tracking: server_name -> total ban count across all scans
         self.ban_history: dict[str, int] = {}
@@ -289,6 +291,8 @@ class AppState:
                                       ping_ms=st.get("ping_ms") or 0.0, server_name=st.get("server_name"))
                 dct = res.to_dict()
                 dct["tested_at"] = st.get("timestamp")
+                if st.get("deviation_score") is not None:  # same scale as live results
+                    dct["deviation_score"] = st["deviation_score"]
             else:
                 dct = {"error": st.get("error_message") or "Speedtest failed"}
             dct.update(vpn_server_name=name, vpn_country_code=st.get("vpn_country_code"),

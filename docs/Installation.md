@@ -1,6 +1,6 @@
 # Installation
 
-AirBL runs in Docker. During speedtests it brings up a WireGuard tunnel inside its own container and changes the container's routing, so it needs `NET_ADMIN` but no privileged mode, and it never touches the host's routing.
+AirBL runs in Docker. During speedtests it brings up a WireGuard tunnel inside its own container and changes the container's routing, so it needs `NET_ADMIN` but no privileged mode, and it never touches the host's routing. The provided compose file drops every other capability except `NET_RAW` (ping) and `DAC_OVERRIDE` (folders owned by your host user), and sets `no-new-privileges`.
 
 Images build natively for amd64 and arm64 (e.g. Raspberry Pi 4/5 with a 64-bit OS). 32-bit ARM (armhf) is not supported: a dependency (pydantic-core) has no prebuilt package for it and would need a Rust toolchain.
 
@@ -15,11 +15,17 @@ services:
       context: ..
       dockerfile: docker/Dockerfile
     container_name: airbl
+    cap_drop:                        # least privilege: only what AirBL uses
+      - ALL
     cap_add:
-      - NET_ADMIN
+      - NET_ADMIN                    # WireGuard interface, routes, kill switch
+      - NET_RAW                      # ping
+      - DAC_OVERRIDE                 # use folders that belong to your host user
+    security_opt:
+      - no-new-privileges:true
+    stop_grace_period: 30s           # a stop mid-test tears the tunnel down cleanly
     sysctls:
       - net.ipv4.conf.all.src_valid_mark=1
-      - net.ipv4.ip_forward=1
       - net.ipv6.conf.all.disable_ipv6=1
     ports:
       - "5665:5665"
@@ -57,9 +63,11 @@ Instead of building from source, you can pull `ghcr.io/xesurient/airbl` (amd64 a
 ```bash
 docker run --detach \
     --name airbl \
-    --cap-add NET_ADMIN \
+    --cap-drop ALL \
+    --cap-add NET_ADMIN --cap-add NET_RAW --cap-add DAC_OVERRIDE \
+    --security-opt no-new-privileges:true \
+    --stop-timeout 30 \
     --sysctl net.ipv4.conf.all.src_valid_mark=1 \
-    --sysctl net.ipv4.ip_forward=1 \
     --sysctl net.ipv6.conf.all.disable_ipv6=1 \
     --publish 5665:5665 \
     --env TZ=Europe/London \
@@ -100,11 +108,14 @@ Tags: `latest` follows the main branch, `1.2.3` / `1.2` are releases, and `sha-<
 | `AUTO_SCAN` | (unset) | `true`/`false`; when set, overrides the saved auto-scan toggle on every start. |
 | `AIRBL_KILL_SWITCH` | 1 | Set to `0` to disable the speedtest kill switch. |
 | `HOST` | 0.0.0.0 | Bind address. |
+| `AIRBL_AUTH_TOKEN` | (unset) | Optional login. Set a long random string (e.g. in `docker/.env`). The browser then asks for it: any user name, the token as password. Scripts send `Authorization: Bearer <token>` or `X-AirBL-Token: <token>`. `/healthz` (Docker's healthcheck) stays open. Unset = no login. |
+| `AIRBL_ALLOWED_HOSTS` | (unset) | Extra host names the dashboard answers to, comma-separated (e.g. `airbl.example.com`). IP addresses, `localhost`, single-label names (`peach`) and LAN names (`.local`, `.lan`, `.home.arpa`, `.internal`) always work. Any other name gets "Unknown host name" until it's listed here; this blocks DNS-rebinding attacks from web pages. |
+| `AIRBL_ALLOW_HOST_NETWORK` | (unset) | AirBL refuses VPN tests in the host's network namespace (`network_mode: host`), because they would replace the host's own `wg0` / routing. Set to `1` only if you accept that risk. |
 | `AIRBL_ALLOWED_ORIGINS` | (unset) | Extra origins allowed to change settings, comma-separated (e.g. `https://airbl.example`). Only needed behind a reverse proxy that changes the host name and doesn't send `X-Forwarded-Host`. |
 
 ## Notes
 
-- **Network mode:** use the default bridge network. With `network_mode: host`, AirBL's routing rules would apply to the whole host, so the kill switch disables itself there and that mode is unsupported for VPN tests.
+- **Network mode:** use the default bridge network. With `network_mode: host`, AirBL's routing rules would apply to the whole host. There, AirBL leaves `wg0` and routing table 51820 alone at startup and refuses VPN tests, unless `AIRBL_ALLOW_HOST_NETWORK=1`.
 - **Persistence:** everything worth keeping is in `./data`: scan/speedtest history, settings (plus a `.bak` of the previous version) and the baseline speedtest. Recreating the container keeps it all.
 - **Updates:** rebuild with `docker compose up -d --build` (or `docker compose pull && docker compose up -d` with the prebuilt image). Browsers pick up new dashboard code automatically (no force-refresh needed).
 - **Init:** the image runs under `tini`, which reaps child processes (speedtests, pings) cleanly.

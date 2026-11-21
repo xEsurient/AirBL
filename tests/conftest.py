@@ -148,7 +148,7 @@ def make_summary():
 _STATE_FIELDS = (
     "current_scan", "live_scan", "is_scanning", "is_paused", "scan_cancelled",
     "scan_task", "port_discovery_results", "db", "current_scan_id", "baseline_speedtest",
-    "scan_history", "ban_history", "server_performance_history", "websocket_clients",
+    "scan_history", "ban_history", "server_performance_history", "seedbox_history", "websocket_clients",
     "_last_scan_servers", "_last_scan_entry_pings", "scan_progress", "next_scan_at",
     "settings_updated_event", "all_countries", "servers_by_country", "server_to_city_api",
 )

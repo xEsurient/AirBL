@@ -109,6 +109,27 @@
     <div id="serverDetailPanel" style="display:none; margin-top: 15px;"></div>
 </div>
 
+<!-- Seedbox ranking: fastest by speedtest, DroneBL reputation ignored -->
+<details id="speedRankingSection" class="settings-section" style="margin-top: 20px; padding: 15px 25px;" hidden>
+    <summary style="cursor: pointer; font-family: 'Outfit', sans-serif; font-size: 1.1rem; color: var(--text-primary);">
+        🚀 Fastest (any reputation)</summary>
+    <p class="setting-description" style="margin: 10px 0;">Ranked by speedtest only, including DroneBL-listed servers
+        (set "Seedbox: Listed Servers to Test" in Settings). For seedboxes where a listing doesn't matter; the main
+        recommendations above stay clean-only.</p>
+    <div style="overflow-x: auto;">
+        <table id="speedRankingTable" style="width: 100%; border-collapse: collapse; font-size: 0.9rem;">
+            <thead>
+                <tr style="text-align: left; color: var(--text-secondary);">
+                    <th style="padding: 6px;">#</th><th style="padding: 6px;">Server</th><th style="padding: 6px;">Reputation</th>
+                    <th style="padding: 6px;">⬇️ Mbps</th><th style="padding: 6px;">⬆️ Mbps</th><th style="padding: 6px;">Ping</th>
+                    <th style="padding: 6px;">Speed score</th><th style="padding: 6px;">Tested</th>
+                </tr>
+            </thead>
+            <tbody></tbody>
+        </table>
+    </div>
+</details>
+
 <div class="empty-state" id="emptyState" style="display: none; margin-top: 25px;">
     <p>Run a scan to start collecting metrics data.</p>
 </div>
@@ -329,14 +350,47 @@
         panel.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
     }
 
+    async function loadSpeedRanking() {
+        const section = document.getElementById('speedRankingSection');
+        try {
+            const data = await (await fetch('/api/ranking/speed?limit=20')).json();
+            const rows = data.servers || [];
+            // Only worth showing when it adds something: a blocked server was tested
+            section.hidden = !rows.some(r => r.reputation === 'blocked');
+            if (section.hidden) return;
+            const num = v => (typeof v === 'number' && isFinite(v)) ? v.toFixed(1) : '--';
+            document.querySelector('#speedRankingTable tbody').innerHTML = rows.map((r, i) => {
+                const rep = r.reputation === 'blocked'
+                    ? '<span style="color:#ef4444;">listed</span>' : '<span style="color:#22c55e;">clean</span>';
+                const when = (r.tested_at ? escapeHtml(new Date(r.tested_at).toLocaleString()) : '--')
+                    + (r.stale ? ' <span title="Not re-tested this scan; result from the previous scan">(previous scan)</span>' : '');
+                return `<tr style="border-top: 1px solid var(--border);">
+                    <td style="padding: 6px;">${i + 1}</td>
+                    <td style="padding: 6px;">${/^[A-Za-z]{2}$/.test(r.country_code || '') ? getFlagEmoji(r.country_code) : ''} ${escapeHtml((r.server_name || '').replace(/AirVPN /g, ''))}
+                        <span style="color: var(--text-secondary);">${escapeHtml(r.location || '')}</span></td>
+                    <td style="padding: 6px;">${rep}</td>
+                    <td style="padding: 6px;">${num(r.download_mbps)}</td>
+                    <td style="padding: 6px;">${num(r.upload_mbps)}</td>
+                    <td style="padding: 6px;">${r.ping_ms != null ? num(r.ping_ms) + ' ms' : '--'}</td>
+                    <td style="padding: 6px; color: var(--accent);">${num(r.speed_score)}</td>
+                    <td style="padding: 6px; color: var(--text-secondary);">${when}</td>
+                </tr>`;
+            }).join('');
+        } catch (e) {
+            console.error('Failed to load speed ranking:', e);
+        }
+    }
+
     // Load once on page load
     loadMetrics();
     loadTopServers();
+    loadSpeedRanking();
 
     // Refresh when a scan or speedtests finish (via WebSocket events from app.js)
     window.onScanComplete = function() {
         loadMetrics();
         loadTopServers();
+        loadSpeedRanking();
     };
     window.onSpeedtestsComplete = window.onScanComplete;
 </script>

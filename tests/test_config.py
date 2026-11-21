@@ -220,3 +220,27 @@ def test_old_regions_mode_and_ipv6_profile_still_load(mgr_factory):
     assert cfg.regions.countries == ["DE", "CH"] and not hasattr(cfg.regions, "mode")
     (p,) = cfg.wireguard.profiles
     assert (p.name, p.port, p.ip_protocol) == ("Six", 51820, "IPv4")  # profile kept, protocol fixed
+
+
+def test_secondary_target_and_blocked_top_n_roundtrip(mgr_factory):
+    from airbl.config import ControlTargetConfig
+    m = mgr_factory()
+    m.load()
+    m.config.scan.speedtest_blocked_top_n = 8
+    m.config.gluetun.secondary = ControlTargetConfig(enabled=True, control_server_host="192.168.1.20",
+                                                     api_key="k", top_n=2, rank_by="score",
+                                                     allow_blocked=False)
+    assert m.save()
+    saved = _user_file(m)
+    assert saved["scan"] == {"speedtest_blocked_top_n": 8}
+    assert saved["gluetun"]["secondary"]["control_server_host"] == "192.168.1.20"
+    cfg = mgr_factory().load()
+    sec = cfg.gluetun.secondary
+    assert (sec.enabled, sec.api_key, sec.top_n, sec.rank_by, sec.allow_blocked) == (True, "k", 2, "score", False)
+    assert cfg.scan.speedtest_blocked_top_n == 8
+
+
+def test_invalid_secondary_value_is_dropped(mgr_factory):
+    m = mgr_factory(user=json.dumps({"gluetun": {"secondary": {"enabled": True, "force_update_mode": "BOGUS"}}}))
+    cfg = m.load()
+    assert cfg.gluetun.secondary.force_update_mode == "NOT_TOPN"  # bad value dropped, default used

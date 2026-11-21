@@ -195,6 +195,7 @@ async def check_dronebl(ip: str, timeout: float = None) -> DroneBLResult:
 # DNSBL test entry (RFC 5782): 127.0.0.2 is always listed. A resolver that blocks or rewrites
 # dronebl.org answers NXDOMAIN for everything, which would make every IP look clean.
 CANARY_IP = "127.0.0.2"
+NEGATIVE_IP = "127.0.0.1"
 CANARY_TTL_SECONDS = 300
 _canary_checked_at: Optional[float] = None
 _canary_error: Optional[str] = None
@@ -210,6 +211,12 @@ async def dnsbl_resolver_error() -> Optional[str]:
     result = await check_dronebl(CANARY_IP)
     if result.is_listed:
         error = None
+        # RFC 5782 negative test: 127.0.0.1 is never listed. A sinkhole resolver answers
+        # 127.0.0.x for every name, which would make every server look blocked.
+        negative = await check_dronebl(NEGATIVE_IP)
+        if negative.is_listed:
+            error = ("The DNS resolver says 127.0.0.1 is listed on DroneBL, which is never true: it answers "
+                     "every lookup with a listing (sinkhole?). Set DNS_SERVERS to a plain resolver.")
     elif result.error:
         error = f"DroneBL test lookup failed ({result.error})"
     else:
